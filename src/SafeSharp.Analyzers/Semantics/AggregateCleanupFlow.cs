@@ -351,7 +351,9 @@ internal sealed class AggregateCleanupFlow
     {
         if (!state.Reachable) return;
         var finalizers = new List<int>(); var source = graph.Blocks[node.Ordinal].EnclosingRegion;
-        for (var current = source; current.EnclosingRegion is { } parent; current = parent)
+        // A nested function's root can retain its lexical parent's EnclosingRegion.
+        // That parent's block ordinals belong to a different CFG and are never local handlers.
+        for (var current = source; !ReferenceEquals(current, graph.Root) && current.EnclosingRegion is { } parent; current = parent)
         {
             if (current.Kind != ControlFlowRegionKind.Try) continue;
             if (parent.Kind == ControlFlowRegionKind.TryAndFinally)
@@ -378,9 +380,9 @@ internal sealed class AggregateCleanupFlow
         exceptionalExits.Add(state.Clone());
     }
 
-    private static bool InsideCurrentFinally(ControlFlowRegion region, int destination)
+    private bool InsideCurrentFinally(ControlFlowRegion region, int destination)
     {
-        for (var current = region; current is not null; current = current.EnclosingRegion)
+        for (var current = region; current is not null && !ReferenceEquals(current, graph.Root); current = current.EnclosingRegion)
             if (current.Kind == ControlFlowRegionKind.Finally && destination >= current.FirstBlockOrdinal && destination <= current.LastBlockOrdinal) return true;
         return false;
     }

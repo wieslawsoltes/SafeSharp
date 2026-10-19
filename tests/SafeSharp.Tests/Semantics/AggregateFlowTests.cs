@@ -116,6 +116,26 @@ public sealed class AggregateFlowTests
     public Task Constructed_generic_base_fields_keep_source_identity() => SemanticsAssert.NoDiagnosticAsync(
         "using System; using System.IO; using SafeSharp; class Base<T> : IDisposable where T : IDisposable { [Owned] protected T resource = default!; public void Dispose() => resource.Dispose(); } class Derived : Base<MemoryStream> { }");
 
+    [Theory]
+    [InlineData("public void Dispose() { using var temporary = new MemoryStream(); void Release() => resource.Dispose(); Release(); }")]
+    [InlineData("public void Dispose() { try { void Release() => resource.Dispose(); Release(); } catch { } }")]
+    [InlineData("public void Dispose() { try { void Work() { if(condition) throw new Exception(); } Work(); } finally { resource.Dispose(); } }")]
+    [InlineData("public void Dispose() { try { return; } finally { void Release() { try { throw new Exception(); } catch { resource.Dispose(); } } Release(); } }")]
+    public Task Nested_aggregate_helpers_keep_exception_regions_inside_their_graph(string methods) =>
+        SemanticsAssert.NoDiagnosticAsync(Prefix + methods + "}");
+
+    [Theory]
+    [InlineData("public void Dispose() { using var temporary = new MemoryStream(); void Release() { if(condition) resource.Dispose(); } Release(); }")]
+    [InlineData("public void Dispose() { try { using var temporary = new MemoryStream(); void Release() { if(condition) throw new Exception(); resource.Dispose(); } Release(); } catch { } }")]
+    [InlineData("public void Dispose() { try { return; } finally { void Release() { if(condition) resource.Dispose(); } Release(); } }")]
+    public Task Nested_aggregate_helpers_cannot_borrow_outer_cleanup_as_a_local_proof(string methods) =>
+        SemanticsAssert.DiagnosticAsync(Prefix.Replace("resource =", "[|resource|] =", StringComparison.Ordinal) + methods + "}", "SS0021");
+
+    [Fact]
+    public Task Nested_async_aggregate_helper_keeps_outer_await_using_regions_separate() => SemanticsAssert.NoDiagnosticAsync(
+        Prefix.Replace("IDisposable", "IAsyncDisposable", StringComparison.Ordinal) +
+        "public async ValueTask DisposeAsync() { await using var temporary = new MemoryStream(); async ValueTask ReleaseAsync() => await resource.DisposeAsync(); await ReleaseAsync(); } }");
+
     [Fact]
     public async Task Failed_entrypoints_and_normal_exit_evidence_are_preserved()
     {
