@@ -7,22 +7,24 @@
 
 SafeSharp combines a compiler-independent dataflow engine with Roslyn semantic analysis and explicit API contracts. It tracks resource identity across aliases, checks shared and exclusive loans, expires loans at their last use, follows ownership transfers, and explains violations with exact source locations and computed control-flow/state graphs.
 
-The initial implementation is **`0.1.0-preview.1`**. Its design is informed by Rust's MIR borrow checker and non-lexical lifetimes. It is an independent C# implementation, with a [pinned Rust source reference and explicit support matrix](docs/rust-design.md). It does **not** establish Rust-equivalent memory safety for arbitrary C#: reflection, unmodeled calls, native code, and unrestricted heap aliasing remain outside the proof boundary.
+The current implementation is **`0.2.0-preview.1`**. Its design is informed by Rust's MIR borrow checker and non-lexical lifetimes. It is an independent C# implementation, with a [pinned Rust source reference and explicit support matrix](docs/rust-design.md). It does **not** establish Rust-equivalent memory safety for arbitrary C#: reflection, unmodeled calls, native code, and unrestricted heap aliasing remain outside the proof boundary.
 
 ## What is implemented
 
 | Area | Analysis |
 | --- | --- |
 | Resource ownership | Use after disposal, repeated disposal, leaks, lost ownership on overwrite, owned results, consuming parameters, explicit moves, and aliases invalidated by moves. |
-| Borrowing | Shared/exclusive loans, mutation and disposal conflicts, reborrows, borrowed escapes, projected-field overlap, conservative array overlap, and loan expiry based on backward control-flow liveness. |
+| Borrowing | Shared/exclusive loans, two-phase implicit receiver/argument borrows, reborrows, mutation/disposal conflicts, borrowed escapes, projected overlap, and backward control-flow loan liveness. |
+| Named lifetimes | `[Lifetime]` and `[Outlives]`, bounded region solving, equivalent regions, shortest implication proofs, returned-value provenance, inherited promises, and multi-input returned-loan alternatives. |
 | Control flow | Forward fixed points over branches and loops; nullable guards; explicit throw/rethrow; typed catches and filters; implicit fault markers; finally and using cleanup continuations; return validation after cleanup. |
-| Async and views | Awaited disposal, `await using`, ignored asynchronous disposal, live borrows across suspension, `[NoSuspend]`, pooled-resource leases, and modeled `Memory`/`Span` views. |
-| API and aggregates | Owned/borrowed contracts, interface and override contract inheritance, incompatible parameter contracts, owned disposable fields, missing cleanup structure, copyable owned structs, and `[MustUse]`. |
+| Async and views | Deferred disposal completion obligations through aliases, branches and supported awaitable wrappers; `await using`; suspension restrictions; `[NoSuspend]`; pool leases and modeled `Memory`/`Span` views. |
+| API and aggregates | CFG origin summaries for factories and owned `out` results; inherited contracts; every-normal-exit aggregate cleanup with helper summaries, separate sync/async entrypoints, copyable owners, and `[MustUse]`. |
 | Services and callbacks | Scoped resource owners, scope escape/invalidation, singleton-to-scoped dependency paths, constructor/factory registration analysis, escaping callbacks, and declared thread-affinity checks. |
-| Evidence | Definite/possible certainty, source-related acquisition/loan/move/disposal evidence, instruction states, live places, CFGs, and dependency witnesses. |
+| Concurrency | Explicit `[Send]` / `[Sync]` composition, generic requirements, sharing and transfer callback boundaries, and declared thread affinity. |
+| Evidence | Definite/possible certainty, instruction states, live places, reservation/activation sites, pending/completed cleanup, CFGs, declared region graphs, and dependency witnesses. |
 | Integration | Compiler/IDE diagnostics, EditorConfig severity and budgets, six NuGet packages, an optional safe code fix, a standalone .NET tool, and CI/release workflows. |
 
-There are **31 diagnostic rules**. Their exact triggers, defaults, examples, remedies, and limitations are in the [diagnostic reference](docs/diagnostics.md). The engine reports budget exhaustion explicitly; an incomplete result does not count as a successful analysis.
+There are **39 diagnostic rules**. Their exact triggers, defaults, examples, remedies, and limitations are in the [diagnostic reference](docs/diagnostics.md). The engine reports budget exhaustion explicitly; an incomplete result does not count as a successful analysis.
 
 ## Add the analyzer
 
@@ -30,9 +32,9 @@ Build the packages locally or download the package artifact from [CI](https://gi
 
 ```xml
 <ItemGroup>
-  <PackageReference Include="SafeSharp.Analyzers" Version="0.1.0-preview.1" PrivateAssets="all" />
-  <PackageReference Include="SafeSharp.Contracts" Version="0.1.0-preview.1" />
-  <PackageReference Include="SafeSharp.CodeFixes" Version="0.1.0-preview.1" PrivateAssets="all" />
+  <PackageReference Include="SafeSharp.Analyzers" Version="0.2.0-preview.1" PrivateAssets="all" />
+  <PackageReference Include="SafeSharp.Contracts" Version="0.2.0-preview.1" />
+  <PackageReference Include="SafeSharp.CodeFixes" Version="0.2.0-preview.1" PrivateAssets="all" />
 </ItemGroup>
 ```
 
@@ -86,7 +88,7 @@ Console.WriteLine(exclusive.Length);
 
 The complete, compiling [`DocumentBuffer` example](samples/SafeSharp.Sample/Program.cs) marks its mutating operation with `[Mutates]` and its disposable field with `[Owned]`. Further [unsafe examples](samples/UnsafeExamples.cs.txt) illustrate reports. `Ownership.Move`, `Borrow`, and `BorrowMut` return their arguments unchanged: they add compile-time meaning and do not enforce access restrictions at runtime.
 
-Contracts include `[Owned]`, `[Consumes]`, `[Borrowed]`, `[BorrowedMut]`, `[ReturnsOwned]`, `[ReturnsBorrowed]`, `[Mutates]`, `[DoesNotEscape]`, `[MustUse]`, `[NoSuspend]`, `[ThreadAffine]`, `[ThreadSafe]`, and `[ServiceLifetime]`. See [contracts and semantic analysis](docs/contracts-and-semantics.md) for supported positions and semantics.
+Contracts include `[Owned]`, `[Consumes]`, `[Borrowed]`, `[BorrowedMut]`, `[ReturnsOwned]`, `[ReturnsBorrowed]`, `[Mutates]`, `[DoesNotEscape]`, `[MustUse]`, `[NoSuspend]`, `[Lifetime]`, `[Outlives]`, `[Send]`, `[Sync]`, `[TransfersToThread]`, `[SharesAcrossThreads]`, `[ThreadAffine]`, `[ThreadSafe]`, and `[ServiceLifetime]`. See [contracts and semantic analysis](docs/contracts-and-semantics.md) for supported positions and semantics.
 
 ## Inspect the analysis
 
@@ -94,7 +96,7 @@ The compiler analyzer performs no report-file I/O. The separate tool uses the sa
 
 ```sh
 dotnet tool install SafeSharp.Tool --tool-path .tools \
-  --version 0.1.0-preview.1 --add-source artifacts/packages
+  --version 0.2.0-preview.1 --add-source artifacts/packages
 
 .tools/safesharp --project samples/SafeSharp.Sample/SafeSharp.Sample.csproj \
   --format html --output artifacts/ownership.html
@@ -105,15 +107,15 @@ dotnet tool install SafeSharp.Tool --tool-path .tools \
 
 | Format | Output |
 | --- | --- |
-| HTML | Self-contained interactive CFG/state inspector with SVG graphs, method selection, issue filtering, liveness, and source evidence. |
+| HTML | Self-contained interactive CFG/state inspector with SVG graphs, method selection, issue filtering, lifetime constraints, loan phases, and source evidence. |
 | JSON | Machine-readable diagnostics, resource/loan facts, graph edges, and instruction snapshots. |
 | SARIF 2.1.0 | Source locations, rule metadata, related locations, and abstract provenance for analysis integrations. |
-| DOT | Control-flow and service-dependency witness diagrams for Graphviz. |
-| Mermaid | Portable graph text for Markdown documentation and review. |
+| DOT | Control-flow, declared region, and service-dependency witness diagrams for Graphviz. |
+| Mermaid | The same graph relationships as portable text for Markdown documentation and review. |
 
 Report edges and states come from the computed analysis. Evidence is abstract provenance, not a fabricated executable path. Project-mode reports honor analyzer configuration. CLI exit codes distinguish findings (`1`), errors/incomplete analysis (`2`), and cancellation (`130`); `--fail-on none` does not hide incomplete analysis. See the [reporting guide](docs/reporting.md).
 
-Download and open the generated [example HTML report](docs/examples/ownership.html) for seven method graphs, four ownership diagnostics, and per-instruction state inspection from the included unsafe examples. The reporting guide includes the regeneration command.
+Download and open the generated [example HTML report](docs/examples/ownership.html) for computed method graphs, ownership and lifetime diagnostics, and per-instruction state inspection from the included unsafe examples. The reporting guide includes the regeneration command.
 
 ## Architecture and packages
 
@@ -150,7 +152,7 @@ dotnet test tests/SafeSharp.Tests/SafeSharp.Tests.csproj -c Release --no-build
 python tests/cli/verify.py --tool src/SafeSharp.Tool/bin/Release/net10.0/SafeSharp.Tool.dll
 dotnet pack SafeSharp.sln -c Release --no-build -o artifacts/packages
 python eng/verify-packages.py artifacts/packages
-python eng/smoke-consumer.py artifacts/packages --version 0.1.0-preview.1
+python eng/smoke-consumer.py artifacts/packages --version 0.2.0-preview.1
 ```
 
 The regression suites exercise real Roslyn compilations and reject invalid test fixtures or analyzer crashes. Coverage includes core lattice/liveness behavior, positive and negative analyzer cases, exceptional control flow, contracts, service graphs, code-fix results, deterministic/escaped reports, and configured CLI behavior. Package tests restore a clean external consumer, verify both a safe build and a failing unsafe build, and install and invoke the packaged tool. CI runs the build/test/package pipeline on Linux, Windows, and macOS.
@@ -159,15 +161,20 @@ All six packages include README/license/repository metadata and portable symbol 
 
 ## Analysis boundaries and future work
 
-SafeSharp is a preview analysis system. The implemented rules require the documented effects and contracts to describe actual runtime behavior. A recognized disposal invocation discharges the modeled obligation even if the disposer throws; it does not prove successful physical cleanup. Unhandled implicit faults are a labeled boundary with a separate exception-safety advisory. Aggregate field cleanup checks are structural rather than complete interprocedural all-path proofs.
+SafeSharp is a preview analysis system. The implemented rules require the documented effects and contracts to describe actual runtime behavior. A recognized disposal invocation discharges the modeled obligation even if the disposer throws; it does not prove successful physical cleanup. Unhandled implicit faults are a labeled boundary with a separate exception-safety advisory. Aggregate cleanup is checked on every modeled normal exit, with bounded source-helper summaries. This excludes a claim about successful physical cleanup after arbitrary exceptional termination.
 
-Full Rust lifetime quantification, higher-ranked regions, generic trait solving, `Send`/`Sync`, `Pin`, two-phase borrows, unsafe pointer provenance, symbolic heap/index reasoning, and whole-program verification are not implemented. C# definite-assignment and ref-safety rules remain the C# compiler's responsibility. The [Rust comparison](docs/rust-design.md#semantic-differences-and-unsupported-rust-guarantees) records these limits alongside implemented capabilities and pinned source links.
+Named lifetime solving, two-phase borrowing, and explicit `Send`/`Sync` conventions are implemented. Full Rust lifetime quantification, higher-ranked regions, general trait solving, `Pin`, unsafe pointer provenance, symbolic heap/index reasoning, and whole-program verification remain outside this model. C# definite-assignment and ref-safety rules remain the C# compiler's responsibility. The [Rust comparison](docs/rust-design.md#semantic-differences-and-unsupported-rust-guarantees) records these limits alongside implemented capabilities and pinned source links.
 
 Contributions should define the effect being added, include both valid and invalid regression cases, and update the diagnostic/support documentation. Broader guarantees should follow demonstrated analysis coverage.
 
 ## Documentation
 
+- [Changes in the 0.2 preview](CHANGELOG.md)
+- [Implementation status and remaining boundaries](docs/implementation-status.md)
 - [Diagnostic reference](docs/diagnostics.md)
+- [Two-phase borrowing and async completion protocols](docs/advanced-engine.md)
+- [Named lifetime regions and returned borrows](docs/lifetime-regions.md)
+- [Aggregate cleanup and concurrency contracts](docs/aggregate-concurrency.md)
 - [Contracts, aggregates, callbacks, and services](docs/contracts-and-semantics.md)
 - [Engine and Roslyn architecture](docs/architecture.md)
 - [Rust source references and feature comparison](docs/rust-design.md)

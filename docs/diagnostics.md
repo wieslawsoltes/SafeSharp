@@ -1,12 +1,12 @@
 # Diagnostic reference
 
-SafeSharp implements 31 Roslyn diagnostics for ownership, borrowing, disposal, asynchronous lifetime boundaries, and dependency injection. They run during compiler and IDE analysis. The ownership engine computes effects over Roslyn control-flow graphs; the semantic analyzer checks declarations and service relationships; the boundary analyzer identifies contracts and operations requiring additional attention.
+SafeSharp implements **39 Roslyn diagnostics across five analyzers** for ownership, borrowing, disposal, explicit lifetime regions, concurrency contracts, and dependency injection. They run during compiler and IDE analysis. The ownership engine computes effects over Roslyn control-flow graphs; separate semantic, boundary, lifetime, and concurrency analyzers check their corresponding declarations, implementation obligations, and call boundaries.
 
-Every rule below is implemented. “Implemented” describes the stated check within the documented model, not equivalence to Rust's language-level guarantees. `Ownership.Move`, `Borrow`, and `BorrowMut` are metadata-bearing passthrough methods; C# still permits aliasing and value-type copies at runtime. See [architecture](architecture.md), [contracts](contracts-and-semantics.md), and [Rust design references](rust-design.md) for the analysis domain and its limits.
+Every rule below is implemented. “Implemented” describes the stated check within the documented model, not equivalence to Rust's language-level guarantees. `Ownership.Move`, `Borrow`, and `BorrowMut` are metadata-bearing passthrough methods; C# still permits aliasing and value-type copies at runtime. See [implementation status](implementation-status.md), [architecture](architecture.md), [contracts](contracts-and-semantics.md), and [Rust design references](rust-design.md) for the analysis domain and its limits.
 
 ## Rule matrix
 
-“Info” appears as a suggestion in typical IDE configurations. Every diagnostic can be configured with `dotnet_diagnostic.<ID>.severity`. SS0017–SS0019 are unassigned.
+“Info” appears as a suggestion in typical IDE configurations. Every diagnostic can be configured with `dotnet_diagnostic.<ID>.severity`. Within SS0001–SS0046, only SS0018–SS0019 and SS0035–SS0039 are unassigned.
 
 | ID | Implemented check | Analyzer | Default | Enabled |
 | --- | --- | --- | --- | --- |
@@ -26,8 +26,9 @@ Every rule below is implemented. “Implemented” describes the stated check wi
 | [SS0014](#ss0014) | Owner disposal conflicts with active loan | Ownership | Warning | Yes |
 | [SS0015](#ss0015) | Analysis budget exhausted | Ownership | Warning | Yes |
 | [SS0016](#ss0016) | `NoSuspend` value crosses suspension | Ownership | Warning | Yes |
+| [SS0017](#ss0017) | Tracked async disposal completion remains pending | Ownership | Warning | Yes |
 | [SS0020](#ss0020) | Aggregate lacks a disposal contract | Semantic | Warning | Yes |
-| [SS0021](#ss0021) | Owned member lacks a reachable release | Semantic | Warning | Yes |
+| [SS0021](#ss0021) | Owned member is not released on every normal disposal exit | Semantic | Warning | Yes |
 | [SS0022](#ss0022) | Ownership-bearing struct remains copyable | Semantic | Warning | Yes |
 | [SS0023](#ss0023) | Contradictory or invalid contract | Semantic | Warning | Yes |
 | [SS0024](#ss0024) | Required result is ignored | Semantic | Warning | Yes |
@@ -37,20 +38,37 @@ Every rule below is implemented. “Implemented” describes the stated check wi
 | [SS0028](#ss0028) | Escaping callback captures a using resource | Semantic | Warning | Yes |
 | [SS0029](#ss0029) | Service graph exploration incomplete | Semantic | Info | Yes |
 | [SS0030](#ss0030) | Exception can bypass later manual cleanup | Boundary | Info | Yes |
-| [SS0031](#ss0031) | Asynchronous disposal result is dropped | Boundary | Warning | Yes |
+| [SS0031](#ss0031) | Asynchronous disposal result is syntactically dropped | Boundary | Warning | Yes |
 | [SS0032](#ss0032) | Dynamic/pointer operation crosses model boundary | Boundary | Info | No |
 | [SS0033](#ss0033) | Resource-returning API lacks a known contract | Boundary | Info | No |
 | [SS0034](#ss0034) | Implementation changes inherited ownership mode | Boundary | Warning | Yes |
+| [SS0040](#ss0040) | Invalid explicit lifetime declaration | Lifetime | Warning | Yes |
+| [SS0041](#ss0041) | Returned provenance does not satisfy a lifetime/source promise | Lifetime | Warning | Yes |
+| [SS0042](#ss0042) | Incompatible inherited lifetime or return contract | Lifetime | Warning | Yes |
+| [SS0043](#ss0043) | Lifetime-region analysis is incomplete | Lifetime | Warning | Yes |
+| [SS0044](#ss0044) | Invalid Send/Sync declaration or generic composition | Concurrency | Warning | Yes |
+| [SS0045](#ss0045) | Captured value does not satisfy its concurrency boundary | Concurrency | Warning | Yes |
+| [SS0046](#ss0046) | Aggregate cleanup or concurrency analysis is incomplete | Semantic / Concurrency | Info | Yes |
 
-The public analyzer classes are `SafeSharp.Analyzers.OwnershipAnalyzer`, `SafeSharp.Analyzers.Semantics.SafeSharpSemanticAnalyzer`, and `SafeSharp.Analyzers.BoundarySafetyAnalyzer`. Their descriptors use categories `Ownership` and `SafeSharp.Ownership`; configure individual IDs when a policy spans both categories.
+The public analyzer classes and descriptor categories are:
+
+| Analyzer | Public class | Category |
+| --- | --- | --- |
+| Ownership | `SafeSharp.Analyzers.OwnershipAnalyzer` | `Ownership` |
+| Semantic | `SafeSharp.Analyzers.Semantics.SafeSharpSemanticAnalyzer` | `SafeSharp.Ownership` |
+| Boundary | `SafeSharp.Analyzers.BoundarySafetyAnalyzer` | `Ownership` |
+| Lifetime | `SafeSharp.Analyzers.Semantics.LifetimeContractAnalyzer` | `SafeSharp.Lifetimes` |
+| Concurrency | `SafeSharp.Analyzers.Semantics.ConcurrencyContractAnalyzer` | `SafeSharp.Ownership` |
+
+`SafeSharpAnalyzerCatalog.Create()` supplies the complete set for custom Roslyn hosts. Configure individual IDs when a policy spans categories.
 
 ## Reading certainty, related locations, and graphs
 
 Ownership diagnostics include `SafeSharp.Certainty`, `SafeSharp.ResourceId`, and `SafeSharp.Evidence` properties. `Definite` means the modeled alternatives reaching that check violate the rule; `Possible` means the abstract state also admits a nonviolating alternative. At a conditional merge, a resource disposed only on one branch typically yields a possible use-after-disposal. These labels describe the abstract model, including its conservative joins, trusted contracts, and recognized library effects. They are not proof that a particular execution reaches the issue.
 
-Related locations identify acquisition, transfers, conflicting loans, releases, or relevant exits. JSON, SARIF, HTML, Mermaid, and DOT reports retain analysis evidence; see [reporting](reporting.md). Graph states are computed facts, and a displayed control-flow path is not an automatically solved concrete counterexample. Declaration and boundary diagnostics do not carry the core's certainty property unless their analysis produces it. Service diagnostics carry their own dependency-path properties.
+Related locations identify acquisition, transfers, conflicting loans, releases, or relevant exits. JSON, SARIF, HTML, Mermaid, and DOT reports retain analysis evidence; see [reporting](reporting.md). Graph states are computed facts, and a displayed control-flow path is not an automatically solved concrete counterexample. Declaration and boundary diagnostics do not carry the core's certainty property unless their analysis produces it. Service diagnostics carry dependency paths; SS0021 records cleanup entrypoints and normal-exit proof scope; lifetime diagnostics record declared regions, constraints, and return provenance; concurrency diagnostics record the required capability and failing component path.
 
-The core runs forward ownership analysis to a fixed point and backward place liveness to determine loan ends. Consequently, a loan can end at its last use before its lexical block closes. This borrows the control-flow approach described by the [Rust compiler borrow-checker guide](https://rustc-dev-guide.rust-lang.org/borrow-check.html); SafeSharp does not implement Rust's complete region type system.
+The core runs forward ownership analysis to a fixed point and backward place liveness to determine loan ends. Consequently, a loan can end at its last use before its lexical block closes. This borrows the control-flow approach described by the [Rust compiler borrow-checker guide](https://rustc-dev-guide.rust-lang.org/borrow-check.html). SafeSharp also solves [explicit named lifetime regions](lifetime-regions.md), while Rust's complete region and type system remains outside the implementation. See [advanced protocols](advanced-engine.md) for reserved/active loans and first-class async completion states.
 
 Examples use the following illustrative type unless a framework type is shown:
 
@@ -118,7 +136,7 @@ original.Read(); // SS0004
 next.Dispose();
 ```
 
-Use `next` after the move. If the callee only inspects the object, give its parameter a borrowing contract instead of a consuming contract. Passing through an interface or override inherits the declared parameter ownership by ordinal even when the implementation renames its parameter.
+Use `next` after the move. If the callee only inspects the object, give its parameter a borrowing contract instead of a consuming contract. Passing through an interface or override inherits the declared parameter ownership by ordinal even when the implementation renames its parameter. A supported TransfersToThread callback boundary also moves its tracked captures, so the caller must stop using those references and their aliases. Conditional callback targets retain possible-transfer alternatives.
 
 Move helpers return the same CLR reference. The diagnostic is the enforcement mechanism; runtime access through the old reference is not physically disabled.
 
@@ -283,6 +301,8 @@ First inspect the method for generated repetition or unnecessary complexity. Inc
 
 The engine returns an explicit budget result instead of silently presenting a partial fixed point as a clean analysis. Suppressing SS0015 removes the notification, not the limit.
 
+The frontend also uses SS0015 when its transferred-callback ownership adapter exhausts fixed collection bounds: 20,000 capture steps, 20,000 scope operations, 256 transfer calls per scope, or 128 visible callback targets. These limits are independent of the structural Send/Sync budget in SS0046 and the region-solving budget in SS0043.
+
 ## SS0016
 
 **Resource must not cross suspension.** A live value of a type annotated `NoSuspend` spans a modeled suspension point, including through an inherited type annotation.
@@ -301,6 +321,26 @@ async Task Work()
 
 Finish the handle-dependent operation before suspension or acquire a new handle afterwards. This can describe an application lock guard or context-bound token whose lifetime must remain synchronous. The annotation does not implement cleanup; pair it with a disposal contract when cleanup is also required. A final use before the await can end liveness even though the C# local remains in scope.
 
+## SS0017
+
+**Asynchronous disposal completion remains pending.** A recognized `DisposeAsync` call successfully returns an awaitable, but the resulting tracked completion reaches a modeled exit without observation or transfer, loses its last usable handle at an overwrite, or is replaced by another still-pending initiation at the same repeated allocation site.
+
+```csharp
+async Task Close([Consumes] IAsyncDisposable owner, bool finish)
+{
+    var pending = owner.DisposeAsync();
+    if (finish)
+        await pending;
+    // SS0017: the other normal path still owns a pending completion.
+}
+```
+
+Await the completion on every path, use `await using`, or forward it through a return or accurately declared consuming boundary. Local aliases and recognized `ConfigureAwait`, `AsTask`, and `GetAwaiter` wrappers preserve identity. A parameterless framework `GetResult()` or `Task.Wait()` observes completion; timeout/cancellation overloads, `IsCompleted`, an explicit discard, and disposing the Task itself do not establish unconditional observation.
+
+The primary exit diagnostic identifies the initiating async disposal; an overwrite diagnostic identifies the lost handle and retains the initiation as related evidence. Conditional observation can produce a possible finding. The resource's disposal invocation and the completion obligation are distinct: a synchronous throw before an awaitable is returned creates no completion, while awaiting a faulted operation still observes it. This is an invocation/observation protocol, not proof that a failing disposer released every physical resource.
+
+SS0031 checks a directly dropped disposal expression. SS0017 follows the deferred obligation through modeled aliases, joins, transfers, and loops, so assigning the result to an unused local does not hide it. Both rules can describe the same dropped operation. See [async completion analysis](advanced-engine.md#asynchronous-disposal-completion) for the complete protocol and its interprocedural limits.
+
 ## SS0020
 
 **An aggregate owner must provide disposal.** A type owns a disposable instance field/property but implements neither `IDisposable` nor `IAsyncDisposable`.
@@ -318,19 +358,28 @@ The check is declaration-based. Static resource ownership and arbitrary unannota
 
 ## SS0021
 
-**Owned member has no reachable release.** An aggregate exposes a disposal interface, but the analyzer finds no recognized release of an owned member reachable from its actual disposal implementation.
+**Owned member is not released on every normal disposal exit.** An aggregate exposes a disposal interface, but at least one modeled normal exit leaves an owned member's resource or asynchronous completion obligation outstanding.
 
 ```csharp
 sealed class Reader : IDisposable
 {
     [Owned] private readonly MemoryStream stream = new(); // SS0021
-    public void Dispose() { }
+    private readonly bool leaveOpen;
+    public Reader(bool leaveOpen) => this.leaveOpen = leaveOpen;
+    public void Dispose()
+    {
+        if (leaveOpen)
+            return; // This normal path omits cleanup.
+        stream.Dispose();
+    }
 }
 ```
 
-Release the member directly or through a recognized instance helper called by `Dispose`/`DisposeAsync`. The walker follows actual interface implementations, directly invoked local functions, and inherited virtual disposal helpers. An async release must be observed by awaiting or returning the awaitable; recognized framework wrappers are supported.
+Release the member on every normal path, usually with a `finally`, a using scope, or an unconditional proven helper. The CFG analysis follows branches, early returns, loops, exact local aliases, replacements, using/finally continuations, directly called source helpers, and local functions. It resolves inherited owned fields, actual disposal implementations, virtual `Dispose(bool)` helpers, and `base` calls. Constant `Dispose(true)` arguments permit the ordinary managed-cleanup branch to be proved. Each exposed disposal interface is checked independently.
 
-This establishes structural reachability of a release, not release on every execution path. A conditional release in the usual `Dispose(bool)` pattern is accepted. Uninvoked lambdas, unrelated overloads, arbitrary external cleanup helpers, and local alias indirection do not count as proof. If both disposal interfaces are exposed, a reachable release from one entry point satisfies this rule; equivalence of the two APIs is not established.
+Starting asynchronous cleanup is insufficient when its completion is never observed or returned. Replacing or clearing a live field does not release the previous resource. A derived override that omits inherited cleanup is reported at the derived type, with the base member as related evidence. SS0021 properties include `SafeSharp.CleanupOwner`, `SafeSharp.CleanupEntrypoints`, and `SafeSharp.CleanupProof=normalExitMustRelease`.
+
+The proof concerns modeled normal exits, including recovered exceptions. Unhandled exceptions, successful physical cleanup inside a throwing disposer, arbitrary heap aliases, unknown helper effects, and constructor-to-dispose invariants remain boundaries. Recursive helper reentry supplies no assumed release; ordinary `_disposed` flag invariants can lose precision. SS0046 reports exhausted analysis budgets. See [aggregate cleanup](aggregate-concurrency.md#aggregate-cleanup-ss0020ss0022-and-ss0046) for supported flow and limits.
 
 ## SS0022
 
@@ -498,7 +547,7 @@ await owner.DisposeAsync();                   // Observed
 
 Await the disposal, return its awaitable from an API whose caller owns completion, or use `await using`. The [.NET async disposal guidance](https://learn.microsoft.com/en-us/dotnet/standard/garbage-collection/implementing-disposeasync) describes `ValueTask` as the disposal operation's completion.
 
-This rule distinguishes actual disposal-interface/pattern methods from unrelated namesake methods. Assigning the awaitable to a local for later use is not itself a dropped-expression warning, but SafeSharp does not prove general task-local completion/ownership handoff through arbitrary wrappers. Keep disposal observation direct when possible so the core can relate completion to the resource lifetime.
+This rule distinguishes actual disposal-interface/pattern methods from unrelated namesake methods. It is a syntactic dropped-result check: assigning the awaitable to a local for later use does not trigger SS0031 by itself. The separate [SS0017](#ss0017) flow rule tracks that completion through supported aliases, branches, overwrites, and handoffs and reports it if still pending. Arbitrary external awaiter wrappers and unmodeled helpers still require an accurate contract or model.
 
 ## SS0032
 
@@ -555,7 +604,142 @@ sealed class Reader : IReader
 
 Keep the implementation compatible with the interface/base contract. Omitted annotations inherit the declared mode; repeating the same mode is valid. Parameter matching uses ordinal position, so renaming a parameter does not change its contract. `Owned` and `Consumes` are treated as the same consuming mode. Named returned-borrow sources inherited by methods are remapped to the implementation parameter at that ordinal.
 
-This check compares explicit parameter ownership modes. It does not implement a complete behavioral-subtyping proof for arbitrary mutation, exception, return-lifetime, or thread capabilities, and multiple inherited declarations can require separate compatibility work. Inherited contracts are trusted summaries at call sites while supported implementation effects are checked by the ownership engine.
+This check compares explicit parameter ownership modes. The separate [SS0042](#ss0042) rule checks inherited returned ownership, lifetime, and source promises; [SS0044](#ss0044) checks concurrency composition. These checks do not implement a complete behavioral-subtyping proof for arbitrary mutation, exceptions, or synchronization. Inherited contracts are trusted summaries at call sites while supported implementation effects are checked by the ownership engine.
+
+## SS0040
+
+**Explicit lifetime declaration is invalid.** A lifetime name is not a supported identifier, an outlives endpoint is absent from the signature, `this` is used by a static method, a void result carries a lifetime, or ownership and borrowing contracts contradict the stated region. Conflicting returned loan mutability also fails declaration validation.
+
+```csharp
+[Outlives("input", "missing")] // SS0040: missing is not introduced.
+static void Inspect([Lifetime("input")] Resource value) { }
+```
+
+Introduce each region on an actual parameter or result, correct a misspelled endpoint, and use the reserved `this` region only for an instance receiver. Lifetime names are scoped to a method signature. `Outlives("a", "b")` requires `a` to remain valid at least as long as `b`; it does not introduce either name. Equal names share a region, transitive constraints compose, and cycles establish equivalent regions rather than an automatic contradiction.
+
+A parameter with a borrowed lifetime cannot also consume ownership. Use `ReturnsOwned` for a newly owned result and reserve returned `Lifetime` annotations for loans. Resolve conflicting `Borrowed`/`BorrowedMut` return annotations and inconsistent `ReturnsBorrowed` mutability. Invalid declarations are diagnosed before body provenance is used as a proof. See [explicit lifetime declarations](lifetime-regions.md#ss0040).
+
+## SS0041
+
+**Returned provenance does not satisfy its lifetime or source promise.** At least one modeled returned origin fails to outlive the promised region, comes from a fresh local owner, remains unknown, or violates a particular `ReturnsBorrowed` source restriction.
+
+```csharp
+[return: Lifetime("first")]
+static Resource Choose(
+    [Borrowed, Lifetime("first")] Resource first,
+    [Borrowed, Lifetime("second")] Resource second,
+    bool selectFirst) => selectFirst ? first : second; // SS0041
+```
+
+Return a source that satisfies the promised lifetime on every path. If both inputs are legitimate, declare a result region and accurate outlives relations from each supplying input, or give them the same intended region. Add a relation only when callers can uphold it. A stronger named-source promise still restricts origin even when another input has a sufficiently long lifetime.
+
+The checker follows actual CFG assignments, aliases, branches, loops, supported source/call summaries, and conservative `ref`/`out` and captured-storage invalidation. A valid branch cannot erase an unknown alternative. Returning a null creates no resource-lifetime obligation. Contracts on external calls remain trusted; an unknown helper or arbitrary property does not establish provenance by its name. Use an owned-return contract when returning a new owner rather than extending a local loan artificially.
+
+Diagnostic properties preserve the required/source regions, original declared constraints, components, and available proof paths. Reports can render the declaration graph without inventing missing relations. Region proofs do not authorize disposal or use after move; the ordinary ownership rules still apply. See [return provenance](lifetime-regions.md#what-the-body-checker-follows) and [region reporting](advanced-engine.md#declared-lifetime-region-graphs).
+
+## SS0042
+
+**Implementation changes an inherited lifetime or return promise.** An override or interface implementation imposes an additional input outlives requirement, changes owned and borrowed return modes, redirects a named returned source, changes result mutability, or permits return origins that cannot satisfy the inherited promise.
+
+```csharp
+interface ISelector
+{
+    [return: Lifetime("a")]
+    Resource Select([Lifetime("a")] Resource first,
+                    [Lifetime("b")] Resource second);
+}
+
+sealed class Selector : ISelector
+{
+    [Outlives("b", "a")] // A new requirement on the caller's inputs.
+    [return: Lifetime("a")]
+    public Resource Select([Lifetime("a")] Resource first,
+                           [Lifetime("b")] Resource second) => first; // SS0042
+}
+```
+
+Keep the implementation's requirements and returned promise compatible with the interface/base API. Omitted annotations inherit the declaration, parameters are matched by ordinal, and consistent lifetime-name renaming is supported. Restating a relation already implied transitively does not introduce a new requirement. Change the public contract and its callers together when a genuinely stronger precondition is necessary.
+
+SS0034 covers incompatible parameter ownership modes; SS0042 covers the explicit lifetime/return comparison. It does not prove full generic variance, arbitrary exception effects, synchronization, or higher-ranked lifetime polymorphism. See [inherited lifetime compatibility](lifetime-regions.md#interface-and-override-compatibility).
+
+## SS0043
+
+**Lifetime analysis is incomplete.** A named-region solve, inherited-contract comparison, or returned-origin flow analysis reaches its configured bound. A missing violation after this diagnostic is not an established lifetime proof.
+
+```editorconfig
+[*.cs]
+safesharp_max_regions = 256
+safesharp_max_region_constraints = 4096
+safesharp_max_region_steps = 100000
+```
+
+Reduce an unnecessarily complex signature or method, inspect expanding relationships, or raise the relevant bound after measuring analysis cost. The displayed values are defaults. The analyzer caps effective values at 4,096 regions, 100,000 constraints, and 10,000,000 steps; invalid/nonpositive values use defaults. These limits are independent of SS0015's ownership iteration/resource limits and SS0046's aggregate/concurrency budgets.
+
+The reusable solver returns an incomplete solution without partial components or proofs. Suppressing SS0043 suppresses the notification, not the missing proof. See [the reusable region solver](lifetime-regions.md#reusable-region-solver).
+
+## SS0044
+
+**Concurrency declaration or composition is invalid.** A declared/inherited Send or Sync contract fails its structural conditions, a generic argument does not meet a required capability, or a callback boundary is attached to a non-delegate parameter or declares contradictory transfer and sharing modes.
+
+```csharp
+[Sync]
+sealed class Counter // SS0044
+{
+    public int Value; // Mutable shared storage has no synchronization contract.
+}
+
+sealed class Snapshot<[Sync] T> { }
+sealed class Consumer
+{
+    Snapshot<object> snapshot = new(); // SS0044: object has no Sync contract.
+}
+```
+
+For Sync, make source-visible storage readonly or init-only and ensure each component also supports sharing. A readonly reference slot does not make a mutable array or unknown object shareable. Use ThreadSafe only when the implementation actually upholds the trusted synchronization promise. ThreadSafe cannot erase known ThreadAffine state, including state nested in base fields, tuples, nullable values, and constrained generic components.
+
+For Send, require Send components and declare ownership of mutable reference fields unless their component type also supports Sync. Send and Sync are independent; adding one does not infer the other. State generic requirements with `[Send]`/`[Sync]` type-parameter annotations or suitable annotated constraints, and satisfy them at type construction and generic calls, including inferred calls. Metadata-only annotations remain trusted external contracts.
+
+Related locations and `SafeSharp.ConcurrencyCapability`, `SafeSharp.ConcurrencyPath`, and `SafeSharp.ConcurrencyReason` identify the failing composition. This is structural contract validation rather than a proof of arbitrary race freedom. See [concurrency contracts](aggregate-concurrency.md#explicit-concurrency-ss0044ss0046) for the intrinsic type list and trust boundaries.
+
+## SS0045
+
+**Captured value does not satisfy a concurrency boundary.** A visible capture fails Send at a TransfersToThread boundary or Sync at a SharesAcrossThreads boundary; a captured cell or shared static slot is writable; or an explicit boundary receives an opaque delegate whose captured values cannot be established.
+
+```csharp
+[Send]
+sealed class WorkItem
+{
+    public int Attempts;
+}
+
+void Schedule(WorkItem item)
+{
+    Task.Run(() => item.Attempts++); // SS0045: ordinary capture requires Sync.
+}
+```
+
+For a shared callback, capture stable independent data or a type with a valid Sync contract. For exclusive work, use an API whose TransfersToThread contract actually transfers ownership, and honor that contract in its implementation and callers. A writable captured `int` cell can still be unsafe even though the value type is intrinsically shareable; make the captured variable stable instead of relying only on its type annotation. Static storage remains shared at a transfer boundary.
+
+The new Task.Run sharing check applies to captured values with explicit Send, Sync, or ThreadSafe contracts; SS0025 separately checks ThreadAffine captures. The checker resolves visible lambdas, local functions, bound method groups, conditional/coalesced callbacks, and local delegate aliases conservatively. An incoming callback with the same checked parameter contract can be forwarded. External scheduler behavior, opaque delegate internals, arbitrary heap aliases, and synchronization implementations remain trusted or unsupported boundaries.
+
+At a supported TransfersToThread call, the ownership adapter moves tracked captures before the scheduling invocation's exception boundary. Caller aliases become stale, and visible lambda/local-function targets receive their own cleanup and async-completion obligations. A capture present in only some resolved targets receives a conditional move. Shared/static storage remains shared. Ordinary method-group receivers transfer at the caller, while cleanup inside those ordinary methods remains a trusted boundary; opaque delegates receive SS0045 when the explicit structural boundary cannot establish their captures.
+
+The primary diagnostic points to the capture; related locations retain the scheduling call and relevant declarations. Capability/path/reason properties are preserved in reports. See [capture and cell analysis](aggregate-concurrency.md#callback-captures-and-cells).
+
+## SS0046
+
+**Aggregate cleanup or concurrency analysis is incomplete.** Cleanup summaries, CFG continuation exploration, structural type composition, generic checking, or callback resolution exceeds an analysis bound. The required cleanup or concurrency property has not been established.
+
+```editorconfig
+[*.cs]
+safesharp_max_contract_steps = 20000
+```
+
+Inspect recursive helpers, deeply expanding structures, or complex callback aliases. Simplify the model or raise the step budget after measuring compiler cost. This key uses per-file configuration before global configuration, defaults to 20,000, and caps positive effective values at 1,000,000. Invalid values use the default.
+
+Aggregate checks additionally bound tracked members to 512, active summaries to 32, cached summaries to 256, and CFG continuation contexts to 8,192. Concurrency checks bound recursive type and delegate alias depth to 128 and each source-visible affinity traversal to 128 distinct types. Their budgets are separate from ownership fixed-point and lifetime-region limits. Existing SS0021 findings may accompany an incomplete aggregate result.
+
+SS0046 is informational and enabled by default. The CLI treats it as incomplete analysis even if its visible diagnostic is suppressed. See [aggregate limits](aggregate-concurrency.md#analysis-limits) and [concurrency limits](aggregate-concurrency.md#what-these-contracts-establish).
 
 ## Configuration and adoption
 
@@ -573,8 +757,12 @@ safesharp_report_possible_issues = true
 safesharp_check_suspension = true
 safesharp_max_iterations = 10000
 safesharp_max_tracked_resources = 2048
+safesharp_max_regions = 256
+safesharp_max_region_constraints = 4096
+safesharp_max_region_steps = 100000
+safesharp_max_contract_steps = 20000
 ```
 
 `safesharp_report_possible_issues = false` filters possible core findings; it does not strengthen definite findings or disable declaration/service checks. `safesharp_check_suspension = false` changes the core suspension policy. Use standard `#pragma warning disable SSxxxx` or a targeted severity setting only after reviewing the stated boundary and related evidence.
 
-Generated code is skipped by the analyzers. Cancellation is observed during compiler work and graph exploration. Test fixtures run real Roslyn compilations and fail on malformed source or analyzer exceptions; positive and negative cases cover exact spans, aliases, symbol shadows, inherited contracts, disposal patterns, callback joins, DI alternatives, and analysis budgets. See [integration](integration.md) for compiler/IDE package installation and CI use.
+Generated code is skipped by the analyzers. Cancellation is observed during compiler work and graph exploration. Test fixtures run real Roslyn compilations and fail on malformed source or analyzer exceptions; positive and negative cases cover exact spans, aliases, symbol shadows, inherited contracts, disposal patterns, completion protocols, callback boundaries, region provenance, concurrency composition, DI alternatives, and analysis budgets. See [integration](integration.md) for compiler/IDE package installation and CI use, and [implementation status](implementation-status.md) for the supported model and remaining boundaries.

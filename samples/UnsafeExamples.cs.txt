@@ -9,6 +9,18 @@ sealed class Handle : IDisposable
     public void Dispose() { }
 }
 
+sealed class AsyncHandle : IAsyncDisposable
+{
+    public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+}
+
+[Send]
+sealed class Parcel : IDisposable
+{
+    public void Read() { }
+    public void Dispose() { }
+}
+
 static class UnsafeExamples
 {
     static void AliasAfterDisposal()
@@ -40,4 +52,25 @@ static class UnsafeExamples
         using var owner = new Handle();
         return owner; // SS0001 after implicit finally cleanup.
     }
+
+    static void PendingCleanup()
+    {
+        var owner = new AsyncHandle();
+        var completion = owner.DisposeAsync(); // SS0017: retained but never observed.
+    }
+
+    [return: Lifetime("result")]
+    [Outlives("input", "result")]
+    static Handle WrongRegion([Lifetime("input")] Handle first,
+        [Lifetime("other")] Handle second, [Lifetime("result")] Handle fallback)
+        => second; // SS0041: other has no declared outlives relation to result.
+
+    static void TransferredCapture()
+    {
+        var parcel = new Parcel();
+        Send(() => parcel.Dispose());
+        parcel.Read(); // SS0004: the callback received the cleanup obligation.
+    }
+
+    static void Send([TransfersToThread] Action callback) => Task.Run(callback);
 }

@@ -1,0 +1,42 @@
+# Implementation status
+
+The `0.2.0-preview.1` implementation contains 39 diagnostics, five compiler analyzers, a reusable Core engine, five report formats, and six NuGet packages. This page records the implemented mechanism and the boundary of each claim. It describes the current source and package payloads; ordinary C# retains its own language and runtime semantics.
+
+## Implemented mechanisms
+
+| Mechanism | What is checked | Principal implementation and regression coverage |
+| --- | --- | --- |
+| Ownership and explicit moves | Resource obligations, aliases, availability, repeated release, overwrite, transfer, and projected moves. | `Core/Analysis`, `OwnershipAnalyzer`, Core and Ownership tests. |
+| Non-lexical loans | Backward place liveness, shared/exclusive conflict rules, reborrow ancestry, last-use expiry, field overlap, and conservative unknown-index overlap. | `PlaceLiveness`, `OwnershipTransfer`, Core borrow/liveness regressions. |
+| Two-phase implicit borrows | Mutable receiver and `[BorrowedMut]` argument reservation during argument evaluation, activation at the call, and all argument values kept live through the call. Explicit `BorrowMut` and explicit `ref` loans remain immediate. | `BorrowPhase`, `ReserveExclusiveBorrow`, `ActivateBorrow`, `TwoPhaseBorrowTests`, `CallProtocolTests`. |
+| Asynchronous cleanup | Disposal invocation and returned completion are separate obligations. Pending completions follow aliases, joins, transfer, overwrite and supported awaitable wrappers. SS0017 identifies an unobserved obligation. | `BeginAsyncDispose`, `CompleteAsyncDispose`, `AsyncDisposalCompletionTests`, `CallProtocolTests`. |
+| Named lifetime regions | Signature names, explicit outlives edges, reflexivity, transitive implications, strongly connected equivalence classes, deterministic shortest proofs, and bounded/cancelable solving. | Public `Core.Regions` API and `RegionConstraintSolverTests`. |
+| Borrowed return provenance | Return values are checked against declared input/receiver regions through aliases, branches, loops and supported summaries. Multiple possible inputs remain alternatives at the caller. Overrides/interfaces preserve promises by parameter ordinal, allowing alpha-renamed region names. | `LifetimeContractAnalyzer`, `LifetimeReturnFlow`, `LifetimeContractAnalyzerTests`, `LifetimeCallTests`. |
+| Source boundary summaries | Finite may-origin analysis infers fresh returned resources, aliases of input parameters/receiver, multi-source returns, and fresh owned `out` values. Explicit contracts take precedence; recursive and opaque effects do not establish a fresh ownership proof. | `MethodSummaryProvider`, `MethodOriginAnalysis`, `MethodSummaryTests`, `AsyncFactoryTests`. |
+| Aggregate cleanup | Each disposal entrypoint must release each declared owned member on every modeled normal exit. Boolean specialization, local aliases, finally continuations, inherited members, source helpers, replacements, and completion observation participate in the proof. | `AggregateCleanupFlow`, `AggregateCleanupSummary`, `AggregateFlowTests`; see the aggregate guide for exact limits. |
+| Service lifetimes | Scope ownership, use after scope disposal, scope escape, constructor/registration dependency paths, and captive singleton/scoped relationships. | `ServiceLifetimeAnalysis`, Core scope rules, service semantic tests. |
+| Concurrency conventions | Explicit Send/Sync structure, generic composition, supported sharing/transfer callbacks, and thread-affinity constraints. These contracts describe developer intent and structural compatibility. | `ConcurrencyContractAnalyzer`, concurrency contract tests, callback ownership tests. |
+| Explanations | Actual CFG edges and states, resource alternatives, loan phases, activation sites, completion provenance, related source locations, dependency witnesses and declared region graphs. | Reporting writers, protocol/region/report escaping tests, CLI integration tests. |
+| Tooling and packages | Compiler and IDE diagnostics; configuration and budget markers; clean consumer validation; deterministic packages/symbols; MSBuild/source-mode CLI; CI on Linux, Windows and macOS; NuGet trusted-publishing workflow. | `eng`, `.github/workflows`, `tests/cli`, six package projects. |
+
+Full algorithms and source references are in [architecture](architecture.md), [Rust design](rust-design.md), [advanced protocols](advanced-engine.md), [lifetime regions](lifetime-regions.md), and [aggregate/concurrency analysis](aggregate-concurrency.md). The [diagnostic reference](diagnostics.md) documents all IDs and remedies.
+
+## Deliberate precision boundaries
+
+These are material limitations of the current implementation. They must remain visible when extending the analyzer or assessing a clean report.
+
+- **C# runtime semantics:** assignments can copy structs or alias references; annotations do not revoke runtime access. `Owned` does not create a move-only CLR type. The C# compiler remains responsible for definite assignment, ref safety and language restrictions.
+- **External behavior:** an unknown virtual/native/reflection/dynamic call can introduce aliases or effects absent from the model. Contracts are trusted at those boundaries. No whole-program or arbitrary heap-separation proof is claimed.
+- **Summary inference:** source origin inference does not establish ownership from bodies with exception handlers or ref-local storage aliases. It retains unknown origins after ref/out calls and initializer side effects instead of guessing a fresh return. General ref-slot postconditions, arbitrary callback effects and recursive virtual dispatch require a richer interprocedural model.
+- **Async result factories:** direct awaited owned `Task<T>`/`ValueTask<T>` factories, including supported configuration wrappers, acquire `T` after suspension. General deferred factory-result ownership through arbitrary task storage/combinators is separate from the implemented deferred **disposal** completion protocol. Custom awaitables need explicit modeling.
+- **Cleanup and faults:** recognized invocation discharges the original release obligation; observed completion discharges the asynchronous observation obligation. Neither proves successful physical cleanup by a throwing implementation. Aggregate checks cover modeled normal exits, not all exceptional termination or cross-call object invariants.
+- **Regions:** explicit named first-order signature constraints are supported. Rust's higher-ranked lifetimes, variance, implied type bounds, universal-region machinery and full trait solving are not reproduced. Unknown returned provenance cannot satisfy a lifetime promise.
+- **Concurrency:** Send/Sync are explicit C# contracts, with structural checks and recognized boundaries. They do not provide Rust auto traits, prove arbitrary synchronization or races, or establish CLR memory-ordering and native-pointer properties.
+- **Unsafe/address behavior:** pinning, self-referential state-machine validity, raw-pointer provenance, `UnsafeCell`, stacked/tree borrowing and atomic order proofs are outside the analysis.
+- **Abstract allocation identities:** distinct fields can remain independent, but general symbolic array inequalities, heap shape, collection element ownership and concrete per-iteration allocation counts are not solved.
+
+## Incompleteness is observable
+
+SS0015 identifies ownership-flow limits; SS0029 identifies service exploration limits; SS0043 identifies lifetime solving/provenance limits; SS0046 identifies cleanup/concurrency contract limits. The CLI returns exit code 2 for an incomplete configured analysis even when these diagnostics are suppressed or `--fail-on none` is used. A solver budget is not a successful verification.
+
+Adding another mechanism requires a defined transfer or contract rule, valid and invalid C# regressions, evidence/report support where applicable, and an update to this support boundary. Broader safety claims need demonstrated coverage and an explicit account of remaining approximations.
