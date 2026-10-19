@@ -424,13 +424,13 @@ internal sealed class OwnershipTransfer
         {
             var ancestors = allowAncestors ? LoanAncestors(state, reference.LoanId) : new HashSet<string>(StringComparer.Ordinal);
             var loans = state.Loans.Values.Where(loan => loan.ResourceId == reference.ResourceId && PlaceRelations.Overlaps(loan.Projection, reference.Projection)
-                && conflicts(loan) && (!ancestors.Contains(loan.Id) || allowOwnExclusive && loan.Id == reference.LoanId &&
+                && conflicts(loan) && (!ancestors.Contains(loan.Id) || allowOwnExclusive &&
                     (loan.Kind == BorrowKind.Shared || (loan.Phase & BorrowPhase.Reserved) != 0))).ToArray();
             if (loans.Length == 0) { definite = false; continue; }
             invalid.Add(reference);
             conflictingLoans.AddRange(loans);
             definite &= !reference.MayBeAbsent && loans.Any(loan => !loan.MayBeAbsent && (definitelyConflicts?.Invoke(loan) ?? true) &&
-                (!allowOwnExclusive || loan.Id != reference.LoanId || loan.Kind == BorrowKind.Shared || loan.Phase == BorrowPhase.Reserved));
+                (!allowOwnExclusive || !ancestors.Contains(loan.Id) || loan.Kind == BorrowKind.Shared || loan.Phase == BorrowPhase.Reserved));
         }
         if (invalid.Count == 0) return;
         issues.Add(id, message, instruction.Site, Certainty(definite && invalid.Count == references.Length, instruction), invalid[0].ResourceId,

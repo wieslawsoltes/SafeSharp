@@ -243,6 +243,27 @@ public sealed class TwoPhaseBorrowTests
     }
 
     [Theory]
+    [InlineData(InstructionKind.BorrowShared, true)]
+    [InlineData(InstructionKind.ReserveExclusiveBorrow, true)]
+    [InlineData(InstructionKind.BorrowExclusive, false)]
+    public void MutationThroughChildRequiresActiveExclusivePermissionFromEveryAncestor(InstructionKind parentKind, bool violation)
+    {
+        var result = Analyze(New(), Op(parentKind, 1, "owner", "parent"),
+            Op(InstructionKind.BorrowExclusive, 2, "parent", "child"), Op(InstructionKind.Write, 3, "child"),
+            Op(InstructionKind.Dispose, 4, "owner"));
+        Assert.Equal(violation, result.Issues.Any(issue => issue.Id == "SS0007" && issue.Site.Start == 3));
+        if (!violation) Assert.Empty(result.Issues);
+    }
+
+    [Fact]
+    public void ActivatingInvalidReservationDoesNotGrantMutationThroughSharedAncestor()
+    {
+        var result = Analyze(New(), Op(InstructionKind.BorrowShared, 1, "owner", "shared"), Reserve(2, "shared"),
+            Activate(3), Op(InstructionKind.Write, 4, "reservation"), Op(InstructionKind.Dispose, 5, "owner"));
+        Assert.Equal(IssueCertainty.Definite, IssueAt(result, "SS0007", 4).Certainty);
+    }
+
+    [Theory]
     [InlineData(InstructionKind.ReserveExclusiveBorrow, null, "reservation")]
     [InlineData(InstructionKind.ReserveExclusiveBorrow, "owner", null)]
     [InlineData(InstructionKind.ActivateBorrow, null, null)]
