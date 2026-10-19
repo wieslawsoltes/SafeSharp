@@ -156,7 +156,7 @@ internal static class MethodOriginAnalysis
 
     private static string? Address(IOperation operation)
     {
-        operation = SymbolFacts.Unwrap(operation);
+        operation = UnwrapParentheses(operation);
         return operation switch
         {
             IParameterReferenceOperation parameter => ParameterSlot(parameter.Parameter),
@@ -165,6 +165,12 @@ internal static class MethodOriginAnalysis
             IDeclarationExpressionOperation declaration => Address(declaration.Expression),
             _ => null
         };
+    }
+
+    private static IOperation UnwrapParentheses(IOperation operation)
+    {
+        while (operation is IParenthesizedOperation parenthesized) operation = parenthesized.Operand;
+        return operation;
     }
 
     private sealed class OperationBudget
@@ -179,13 +185,29 @@ internal static class MethodOriginAnalysis
     {
         cancellationToken.ThrowIfCancellationRequested();
         if (!budget.Visit(depth)) return ImmutableHashSet.Create(StringComparer.Ordinal, Unknown);
-        operation = SymbolFacts.Unwrap(operation);
+        operation = UnwrapParentheses(operation);
         ImmutableHashSet<string> One(string value) => ImmutableHashSet.Create(StringComparer.Ordinal, value);
         if (operation.ConstantValue is { HasValue: true, Value: null }) return One(Null);
         if (Address(operation) is { } address)
             return state.TryGetValue(address, out var known) ? known : One(Unknown);
         switch (operation)
         {
+            case IConversionOperation conversion:
+            {
+                var operand = Evaluate(conversion.Operand, state, summary, cancellationToken, budget, depth + 1);
+                if (conversion.OperatorMethod is { } method)
+                {
+                    // A user-defined conversion executes a method. Its returned value can be a
+                    // different object, so the operand's origin is not its result postcondition.
+                    var effect = summary(method);
+                    if (effect.ReturnsOwned) return One(Fresh);
+                    return effect.BorrowedSources.Length == 1 && method.Parameters.Length == 1 &&
+                        effect.BorrowedFrom == method.Parameters[0].Name ? operand : One(Unknown);
+                }
+                if (conversion.Conversion.IsIdentity || conversion.Conversion.IsReference)
+                    return conversion.IsTryCast ? operand.Add(Null) : operand;
+                return One(Unknown);
+            }
             case IInstanceReferenceOperation: return One(Receiver);
             case IObjectCreationOperation creation:
             {

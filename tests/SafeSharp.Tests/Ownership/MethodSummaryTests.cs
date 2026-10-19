@@ -177,4 +177,89 @@ public sealed class MethodSummaryTests
         var diagnostics = await AnalyzerTestHost.GetDiagnosticsAsync(source);
         Assert.DoesNotContain(diagnostics, diagnostic => diagnostic.Id == "SS0003" && diagnostic.Location.SourceSpan.Start == call);
     }
+
+    [Theory]
+    [InlineData("Resource Factory() => (Resource)new Convertible();")]
+    [InlineData("void Create(out Resource result) { result = (Resource)new Convertible(); } Resource Factory() { Create(out var result); return result; }")]
+    public async Task UserDefinedConversionDoesNotPreserveTheOperandOwnershipOrigin(string members)
+    {
+        var source = Prelude + """
+            sealed class Convertible : IDisposable {
+                public static Resource Existing = null!;
+                public void Dispose() { }
+                public static explicit operator Resource(Convertible value) => Existing;
+            }
+            """ + "class Example { " + members + " void M() { var result = Factory(); } }";
+        var call = source.LastIndexOf("Factory()", StringComparison.Ordinal);
+        var diagnostics = await AnalyzerTestHost.GetDiagnosticsAsync(source);
+        Assert.DoesNotContain(diagnostics, diagnostic => diagnostic.Id == "SS0003" && diagnostic.Location.SourceSpan.Start == call);
+    }
+
+    [Fact]
+    public async Task ProvenFreshUserDefinedConversionRetainsItsOwnResultPostcondition()
+    {
+        var source = Prelude + """
+            sealed class Convertible {
+                public static explicit operator Resource(Convertible value) => new Resource();
+            }
+            class Example {
+                Resource Factory() => (Resource)new Convertible();
+                void M() { var result = Factory(); }
+            }
+            """;
+        var call = source.LastIndexOf("Factory()", StringComparison.Ordinal);
+        var diagnostics = await AnalyzerTestHost.GetDiagnosticsAsync(source);
+        Assert.Contains(diagnostics, diagnostic => diagnostic.Id == "SS0003" && diagnostic.Location.SourceSpan.Start == call);
+    }
+
+    [Fact]
+    public async Task CapturedOuterDisposalDoesNotDisposeAnUnrelatedLocalFunctionParameter()
+    {
+        var source = Prelude + """
+            class Example {
+                void M(Resource captured) {
+                    void Close(Resource input) { captured.Dispose(); }
+                    var owner = new Resource(); Close(owner); owner.Read();
+                }
+            }
+            """;
+        var read = source.LastIndexOf("owner.Read()", StringComparison.Ordinal);
+        var allocation = source.LastIndexOf("new Resource()", StringComparison.Ordinal);
+        var diagnostics = await AnalyzerTestHost.GetDiagnosticsAsync(source);
+        Assert.DoesNotContain(diagnostics, diagnostic => diagnostic.Id == "SS0001" && diagnostic.Location.SourceSpan.Start == read);
+        Assert.Contains(diagnostics, diagnostic => diagnostic.Id == "SS0003" && diagnostic.Location.SourceSpan.Start == allocation);
+    }
+
+    [Theory]
+    [InlineData("Ignore(input = other); input.Dispose();")]
+    [InlineData("Invoke(() => input = other); input.Dispose();")]
+    public async Task OpaquePrefixDoesNotEstablishDisposalOfTheOriginalParameter(string body)
+    {
+        var source = Prelude + "class Example { void Ignore(Resource value) { } void Invoke(Action action) { action(); } " +
+            "void Close(Resource input, Resource other) { " + body + " } " +
+            "void M(Resource external) { var owner = new Resource(); Close(owner, external); owner.Read(); } }";
+        var read = source.LastIndexOf("owner.Read()", StringComparison.Ordinal);
+        var allocation = source.LastIndexOf("new Resource()", StringComparison.Ordinal);
+        var diagnostics = await AnalyzerTestHost.GetDiagnosticsAsync(source);
+        Assert.DoesNotContain(diagnostics, diagnostic => diagnostic.Id == "SS0001" && diagnostic.Location.SourceSpan.Start == read);
+        Assert.Contains(diagnostics, diagnostic => diagnostic.Id == "SS0003" && diagnostic.Location.SourceSpan.Start == allocation);
+    }
+
+    [Fact]
+    public async Task IteratorInvocationDoesNotEagerlyDisposeAnInput()
+    {
+        var source = Prelude + """
+            class Example {
+                System.Collections.Generic.IEnumerable<int> Close(Resource input) {
+                    input.Dispose(); yield return 1;
+                }
+                void M() { var owner = new Resource(); var iterator = Close(owner); owner.Read(); }
+            }
+            """;
+        var read = source.LastIndexOf("owner.Read()", StringComparison.Ordinal);
+        var allocation = source.LastIndexOf("new Resource()", StringComparison.Ordinal);
+        var diagnostics = await AnalyzerTestHost.GetDiagnosticsAsync(source);
+        Assert.DoesNotContain(diagnostics, diagnostic => diagnostic.Id == "SS0001" && diagnostic.Location.SourceSpan.Start == read);
+        Assert.Contains(diagnostics, diagnostic => diagnostic.Id == "SS0003" && diagnostic.Location.SourceSpan.Start == allocation);
+    }
 }

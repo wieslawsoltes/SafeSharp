@@ -226,6 +226,147 @@ public sealed class CallProtocolTests
         AssertDiagnosticAt(await AnalyzerTestHost.GetDiagnosticsAsync(source), "SS0017", span);
     }
 
+    [Fact]
+    public async Task UserDefinedConversionAcquiresItsOwnReturnedOwner()
+    {
+        var (source, span) = ExtractMarker(Prelude + """
+            sealed class Convertible {
+                public static explicit operator Resource(Convertible value) => new Resource();
+            }
+            class Example {
+                void M() { var input = new Convertible(); var result = [|(Resource)input|]; }
+            }
+            """);
+        AssertDiagnosticAt(await AnalyzerTestHost.GetDiagnosticsAsync(source), "SS0003", span);
+    }
+
+    [Fact]
+    public async Task UserDefinedConversionDoesNotInventAnAliasOfItsOperand()
+    {
+        var source = Prelude + """
+            sealed class Converted : IDisposable {
+                public static Converted Existing = null!;
+                public void Read() { }
+                public void Dispose() { }
+                public static explicit operator Converted(Resource value) => Existing;
+            }
+            class Example {
+                void M() {
+                    var input = new Resource(); var result = (Converted)input;
+                    input.Dispose(); result.Read();
+                }
+            }
+            """;
+        var diagnostics = await AnalyzerTestHost.GetDiagnosticsAsync(source);
+        Assert.DoesNotContain(diagnostics, diagnostic => diagnostic.Id == "SS0001" && diagnostic.Location.SourceSpan.Start ==
+            source.LastIndexOf("result.Read()", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task UserDefinedConversionAppliesItsInputTransferContract()
+    {
+        var (source, span) = ExtractMarker(Prelude + """
+            sealed class Converted : IDisposable {
+                public void Dispose() { }
+                public static explicit operator Converted([Consumes] Resource value) {
+                    value.Dispose(); return new Converted();
+                }
+            }
+            class Example {
+                void M() {
+                    var input = new Resource(); using var result = (Converted)input; [|input.Read()|];
+                }
+            }
+            """);
+        AssertDiagnosticAt(await AnalyzerTestHost.GetDiagnosticsAsync(source), "SS0004", span);
+    }
+
+    [Theory]
+    [InlineData("Close(first, second)")]
+    [InlineData("Close(later: second, earlier: first)")]
+    public async Task AnEarlierCleanupExceptionRetainsTheLaterInputObligation(string call)
+    {
+        var source = Source("void Close(Resource earlier, Resource later) { earlier.Dispose(); later.Dispose(); } " +
+            "void M() { var first = new Resource(); var second = new Resource(); try { " + call + "; } catch { } }");
+        var diagnostics = await AnalyzerTestHost.GetDiagnosticsAsync(source);
+        var allocation = source.LastIndexOf("new Resource()", StringComparison.Ordinal);
+        var leak = Assert.Single(diagnostics, diagnostic => diagnostic.Id == "SS0003" && diagnostic.Location.SourceSpan.Start == allocation);
+        Assert.Equal("Possible", leak.Properties["SafeSharp.Certainty"]);
+        Assert.DoesNotContain(diagnostics, diagnostic => diagnostic.Id == "SS0003" && diagnostic.Location.SourceSpan.Start != allocation);
+    }
+
+    [Fact]
+    public async Task AllDirectCleanupInputsAreReleasedOnTheSuccessfulCallPath()
+    {
+        var diagnostics = await AnalyzerTestHost.GetDiagnosticsAsync(Source("void Close(Resource earlier, Resource later) { earlier.Dispose(); later.Dispose(); } " +
+            "void M() { var first = new Resource(); var second = new Resource(); Close(later: second, earlier: first); }"));
+        Assert.Empty(diagnostics);
+    }
+
+    [Fact]
+    public async Task RepeatedCalleeDisposalIsNotCollapsedIntoOneEffect()
+    {
+        var (source, span) = ExtractMarker(Source("void Close(Resource value) { value.Dispose(); value.Dispose(); } " +
+            "void M() { var value = new Resource(); Close([|value|]); }"));
+        AssertDiagnosticAt(await AnalyzerTestHost.GetDiagnosticsAsync(source), "SS0002", span);
+    }
+
+    [Fact]
+    public async Task AnUncontractedMemoryTypedGetterDoesNotInventAReceiverLoan()
+    {
+        var source = Prelude + """
+            sealed class ViewProvider : IDisposable {
+                public Memory<int> Independent => new int[4];
+                public void Dispose() { }
+            }
+            class Example {
+                void M() {
+                    var provider = new ViewProvider(); var view = provider.Independent;
+                    provider.Dispose(); _ = view.Length;
+                }
+            }
+            """;
+        Assert.Empty(await AnalyzerTestHost.GetDiagnosticsAsync(source));
+    }
+
+    [Theory]
+    [InlineData("var")]
+    [InlineData("System.Buffers.IMemoryOwner<int>")]
+    public async Task TheActualMemoryOwnerPropertyRetainsItsReceiverLoan(string declaration)
+    {
+        var source = Prelude + """
+            sealed class ViewProvider : System.Buffers.IMemoryOwner<int> {
+                public Memory<int> Memory => new int[4];
+                public void Dispose() { }
+            }
+            """ + "class Example { void M() { " + declaration + " provider = new ViewProvider(); var view = provider.Memory; " +
+            "provider.Dispose(); _ = view.Length; } }";
+        var diagnostics = await AnalyzerTestHost.GetDiagnosticsAsync(source);
+        Assert.Contains(diagnostics, diagnostic => diagnostic.Id == "SS0014" && diagnostic.Location.SourceSpan.Start ==
+            source.LastIndexOf("provider.Dispose()", StringComparison.Ordinal));
+        Assert.Contains(diagnostics, diagnostic => diagnostic.Id == "SS0001" && diagnostic.Location.SourceSpan.Start ==
+            source.LastIndexOf("view.Length", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task AHidingMemoryPropertyDoesNotInheritTheInterfaceImplementationLoan()
+    {
+        var source = Prelude + """
+            class Owner : System.Buffers.IMemoryOwner<int> {
+                public Memory<int> Memory => new int[4];
+                public void Dispose() { }
+            }
+            sealed class ViewProvider : Owner { public new Memory<int> Memory => new int[4]; }
+            class Example {
+                void M() {
+                    var provider = new ViewProvider(); var view = provider.Memory;
+                    provider.Dispose(); _ = view.Length;
+                }
+            }
+            """;
+        Assert.Empty(await AnalyzerTestHost.GetDiagnosticsAsync(source));
+    }
+
     private static AnalysisResult AnalyzeMethod(string source)
     {
         var compilation = AnalyzerTestHost.CreateCompilation(source);

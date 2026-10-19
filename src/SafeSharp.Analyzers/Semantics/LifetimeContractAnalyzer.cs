@@ -119,24 +119,31 @@ public sealed class LifetimeContractAnalyzer : DiagnosticAnalyzer
         if ((promised.BorrowedSource is not null || promised.ReturnRegion is not null) && actual.MutableBorrow != promised.MutableBorrow)
             return "the returned loan's mutability changed";
         var count = Math.Min(actual.ParameterRegions.Length, promised.ParameterRegions.Length);
-        for (var longer = 0; longer < count; longer++)
-        for (var shorter = 0; shorter < count; shorter++)
+        // The receiver is a universally supplied input as well. Ignoring its edges would allow
+        // overrides to strengthen a : this or this : a without checking the base precondition.
+        var inputCount = count + (!actual.Method.IsStatic && !promised.Method.IsStatic ? 1 : 0);
+        string? ActualInput(int ordinal) => ordinal == count ? "this" : actual.ParameterRegions[ordinal];
+        string? PromisedInput(int ordinal) => ordinal == count ? "this" : promised.ParameterRegions[ordinal];
+        for (var longer = 0; longer < inputCount; longer++)
+        for (var shorter = 0; shorter < inputCount; shorter++)
         {
             ComparisonStep(ref remainingSteps, cancellationToken);
-            if (longer == shorter || actual.ParameterRegions[longer] is not { } a || actual.ParameterRegions[shorter] is not { } b || !actualSolution.Outlives(a, b)) continue;
-            if (promised.ParameterRegions[longer] is not { } x || promised.ParameterRegions[shorter] is not { } y || !promisedSolution.Outlives(x, y))
-                return "an additional outlives requirement was imposed on input parameters";
+            if (longer == shorter || ActualInput(longer) is not { } a || ActualInput(shorter) is not { } b || !actualSolution.Outlives(a, b)) continue;
+            if (PromisedInput(longer) is not { } x || PromisedInput(shorter) is not { } y || !promisedSolution.Outlives(x, y))
+                return "an additional outlives requirement was imposed on input parameters or the receiver";
         }
         if (promised.ReturnRegion is not { } inheritedReturn) return null;
         if (actual.ReturnRegion is not { } actualReturn) return "the returned lifetime promise was removed";
         for (var parameter = 0; parameter < count; parameter++)
         {
             ComparisonStep(ref remainingSteps, cancellationToken);
+            if (actual.BorrowedSource is { } explicitSource && SourceOrdinal(actual, explicitSource) != parameter) continue;
             if (actual.ParameterRegions[parameter] is not { } source || !actualSolution.Outlives(source, actualReturn)) continue;
             if (promised.ParameterRegions[parameter] is not { } inheritedInput || !promisedSolution.Outlives(inheritedInput, inheritedReturn))
                 return "the result may borrow from an input which does not satisfy the inherited return region";
         }
-        if (!actual.Method.IsStatic && actualSolution.Outlives("this", actualReturn) && !promisedSolution.Outlives("this", inheritedReturn))
+        if (!actual.Method.IsStatic && (actual.BorrowedSource is null or "this") &&
+            actualSolution.Outlives("this", actualReturn) && !promisedSolution.Outlives("this", inheritedReturn))
             return "the result may borrow from the receiver beyond its inherited promise";
         return null;
     }

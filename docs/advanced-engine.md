@@ -28,11 +28,29 @@ The Roslyn adapter reserves a `[Mutates]` receiver before evaluating its argumen
 
 Explicit `Ownership.BorrowMut` and ordinary `ref` argument borrows remain immediately active. All passed loan values stay live through the call, including explicit borrows supplied to unannotated parameters, so evaluating a later argument cannot silently end an earlier explicit loan. Returned borrow contracts derive their result from the applicable call loan before the caller releases the temporary parameter or receiver holder. This preserves parent ancestry without keeping an otherwise dead loan alive for the remainder of the lexical scope.
 
+Property and indexer getters follow the same protocol. Getter arguments carry their declared input loans, a `[Mutates]` getter reserves and activates its receiver, and a returned borrow can be bounded by the receiver or several index arguments. Input sources are mapped through getter parameter ordinals, including inherited interface contracts with renamed implementation parameters. The result derives from those temporary loans before their holders are released.
+
+Built-in receiver view inference recognizes `Memory<T>.Span`, `ReadOnlyMemory<T>.Span`, and the actual `IMemoryOwner<T>.Memory` member or implementation. A hiding property does not inherit the interface member's lifetime relation. Other memory-typed getters need an explicit or inferred contract to establish a receiver loan. An opaque getter produces an independent external result at its call site, rather than inventing a receiver dependency from the property's name or return type.
+
 ### Relationship to Rust
 
 The design follows Rust's distinction between reserving an implicit mutable borrow and activating it at use. Rust applies this to selected compiler-created borrows, including mutable method receivers; explicit mutable references remain immediate. See the [Rust Compiler Development Guide on two-phase borrows](https://rustc-dev-guide.rust-lang.org/borrow-check/two-phase-borrows.html) and the pinned [Rust 1.91.0 borrow-set implementation](https://github.com/rust-lang/rust/blob/f8297e351a40c1439a467bbbb6879088047f50b3/compiler/rustc_borrowck/src/borrow_set.rs).
 
 SafeSharp computes possible phases through its abstract CFG state. It does not import Rust MIR, use Rust's exact dominance query for activation, or claim that arbitrary C# method calls satisfy Rust's lifetime guarantees. The frontend must emit reservation and activation only for operations whose contracts justify those effects.
+
+## Source summaries and executable conversions
+
+Source return and `out` postconditions use a finite may-origin analysis over Roslyn control-flow graphs. Origins distinguish fresh allocations, each method input, the receiver, null, and unknown values. A result is inferred to be owned only when every non-null alternative is fresh; a borrowed result must be bounded by known input or receiver origins. Unknown branches, recursion without a proven summary, reference-storage aliases, and exception-handler bodies do not establish a new ownership postcondition. Explicit contracts remain available for those boundaries.
+
+Parameter storage identity includes its declaring method as well as its ordinal. An outer parameter captured by a local function cannot be confused with that local function's independent parameter zero. Compound assignments, replacement operators, deconstruction, `ref`/`out` calls, receiver evaluation, and object initializers invalidate the affected source origins when they may replace storage. A postfix replacement can still return its independently proven pre-update value.
+
+User-defined conversions are calls. The frontend evaluates the operand, applies the conversion operator's input ownership and borrowing contracts, records its exception boundary, and derives the returned owner or borrow from the operator's own summary. It does not assume that `(Target)source` returns the same resource merely because both types are tracked. A conversion which provably creates a fresh disposable transfers that new obligation to its caller; an opaque conversion result remains external. Built-in reference-preserving conversions retain their source origin in summary inference.
+
+Direct disposal inference is deliberately narrow: only an initial sequence of synchronous calls disposing the method's own parameters is recognized. Inference stops at an opaque intervening statement, since argument evaluation or a synchronously executed callback may replace a captured parameter before a later disposal. A disposal performed through a user-defined or potentially throwing explicit conversion is not attributed to the unconverted input. Captured outer parameters likewise never establish disposal postconditions for unrelated local-function inputs. Iterator methods have no eager disposal summary because invoking them does not start their bodies.
+
+Inferred cleanups retain their original body order, including repeated disposal of one input. The caller graph places an exception boundary after each cleanup. If the first cleanup throws, a later input can still carry a possible leak through the caller's catch block; successful calls discharge every proven cleanup. Named arguments do not change the order of effects inside the callee. Collapsing the sequence to a set or applying all effects before one exception boundary would lose these distinctions.
+
+The [source summary tests](../tests/SafeSharp.Tests/Ownership/MethodSummaryTests.cs) cover positive origin proofs and invalidated postconditions. The [call protocol tests](../tests/SafeSharp.Tests/Ownership/CallProtocolTests.cs) also verify conversion result identity, fresh conversion ownership, and consuming operator parameters.
 
 ## Asynchronous disposal completion
 

@@ -69,13 +69,14 @@ Implemented provenance includes:
 - Conditional and coalescing values, including multiple explicit return paths.
 - Ordinary local loops and recognized local reference aliases/rebinding.
 - Distinct symbol-based storage for captured outer parameters and a nested function's own parameters; an unknown capture cannot acquire an input lifetime merely because their parameter ordinals match.
-- Calls with explicit borrowed-source or lifetime contracts, and source summaries accepted by the method-origin analysis.
+- Calls, property/indexer getters, and user-defined conversions with explicit borrowed-source or lifetime contracts, and source summaries accepted by the method-origin analysis. Ordinary reference casts preserve provenance; an executable conversion operator requires its own returned-source proof.
 - Unions of several borrowed input candidates, including inferred multi-source summaries.
 - Known ownership helpers, `Memory<T>.Span`, `ReadOnlyMemory<T>.Span`, and the actual `IMemoryOwner<T>.Memory` interface member/implementation. An arbitrary property returning a memory-view type does not establish an owner relation.
 - Owned instance fields whose ownership relates them to their receiver.
 - Explicitly unknown results from arbitrary calls, properties, fields, or unsupported value operations.
-- Conservative invalidation of arguments that a `ref`/`out` call or constructor can replace.
-- Conservative invalidation after compound/deconstruction updates and calls which may overwrite captured caller storage, including non-static local functions, delegate invocation, and callback arguments. Static local-function summaries remain usable without that capture invalidation.
+- C# evaluation order for assignment receivers/indexes and argument expressions. A call or constructor's `ref`/`out` postconditions apply after all arguments have been evaluated; by-value argument snapshots retain the value passed to the callee.
+- Conservative invalidation of arguments that a `ref`/`out` call or constructor can replace, including ambiguous conditional-reference targets.
+- Conservative invalidation after compound/deconstruction updates and calls which may overwrite captured caller storage, including non-static local functions, delegate invocation, and statically typed delegate arguments to methods, constructors, getters, and conversion operators. Static local-function summaries remain usable without that capture invalidation.
 
 For example, the following overwrite is checked using the final alias value:
 
@@ -93,7 +94,35 @@ static Resource Invalid(
 
 Fresh local construction, an owned factory result, or a newly allocated array cannot establish an external borrowed lifetime merely because the result is returned. A returned null carries no resource-lifetime obligation. An unknown origin remains unknown at a merge; a valid branch cannot erase an unverified alternative.
 
+Explicit return contracts are resolved before attempting source-body summary inference. This avoids repeating body work when the callee signature already determines the applicable input/receiver origins, and keeps named-region solves subject to the caller's configured analysis budget.
+
 The region checker and disposal checker have distinct responsibilities. Named-region proofs relate source and result lifetimes. The ownership engine checks moves, loans, cleanup, and use after disposal. A region relation does not authorize releasing a borrowed object or returning an already disposed owner.
+
+## Awaited result provenance
+
+For `Task<T>` and `ValueTask<T>` return contracts, the promised borrowed lifetime describes the effective result `T`. An asynchronous body must establish that promise for each returned `T`; a synchronous body returning a task must establish the provenance of the task's payload.
+
+```csharp
+[return: Lifetime("a")]
+static Task<Resource> ViewAsync([Lifetime("a")] Resource source)
+{
+    var pending = Task.FromResult(source);
+    return pending;
+}
+```
+
+The region checker retains explicit payload provenance through local aliases and branch joins. Modeled producers include explicit returned-source/lifetime contracts, `Task.FromResult`, `ValueTask.FromResult`, and the `ValueTask<T>` constructors taking a result or a `Task<T>`. `ConfigureAwait` and `ValueTask<T>.AsTask` preserve that relationship. Nested modeled wrappers retain one layer per payload, so successive awaits remove the corresponding layers.
+
+Annotating a task parameter alone does not establish the origin of its result:
+
+```csharp
+[return: Lifetime("a")]
+static async Task<Resource> Unverified(
+    [Lifetime("a")] Task<Resource> pending)
+    => await pending; // SS0041: the payload's lifetime is not established.
+```
+
+An arbitrary custom awaitable's `GetResult` may return a separately created or unrelated value. It remains unknown without a dedicated awaiter model. Unknown task payloads remain unknown through configured awaits and mixed branch joins; sharing a named region with a valid candidate does not remove the unknown alternative. Payload nesting is bounded at 256 and its propagation contributes to the return-provenance step budget.
 
 ## Interface and override compatibility
 
@@ -113,9 +142,9 @@ sealed class ViewProvider : IView
 }
 ```
 
-The contract resolver maps inherited region relationships into the implementation signature. Omitted parameter, return, and outlives annotations inherit the applicable declarations. A method's inherited `ReturnsBorrowed` parameter name is also remapped by ordinal.
+The contract resolver maps inherited region relationships into the implementation signature. Omitted parameter, return, and outlives annotations inherit the applicable declarations, including across intermediate overrides that rename only part of the signature. The nearest overridden virtual slot takes precedence over more distant declarations. A method's inherited `ReturnsBorrowed` parameter name is also remapped by ordinal, while the reserved receiver name `this` keeps its receiver meaning. Interface property-getter lifetime promises are resolved and checked on their implementing getters.
 
-Compatibility checks reject an implementation that introduces additional input outlives requirements, changes an owned result into a borrowed result or vice versa, redirects a named returned loan to another parameter/receiver, changes its declared mutability, or adds return-source candidates that cannot satisfy the inherited lifetime promise. Transitive implications are considered, so merely restating an already implied relation does not introduce a new requirement.
+Compatibility checks reject an implementation that introduces additional input outlives requirements, changes an owned result into a borrowed result or vice versa, redirects a named returned loan to another parameter/receiver, changes its declared mutability, or adds return-source candidates that cannot satisfy the inherited lifetime promise. Input requirements include relationships to and from the receiver. Transitive implications are considered, so merely restating an already implied relation does not introduce a new requirement. An explicit `ReturnsBorrowed` source narrows the candidate origins used by this comparison as well as those propagated to callers.
 
 This is an explicit-contract compatibility check. It does not prove every aspect of behavioral subtyping, such as arbitrary exception effects, synchronization, generic variance, or higher-ranked lifetime quantification. Contracts at external and virtual call boundaries remain trusted descriptions of behavior.
 
@@ -270,11 +299,13 @@ Reduce unnecessary signature/body complexity or increase a measured, appropriate
 | Bounded/cancelable reusable solver | Implemented. |
 | Parameters, receivers, aliases, ordinary branches/loops, multiple return sources | Implemented with conservative unknown origins. |
 | Trusted call summaries and multi-source return propagation | Implemented. |
+| Explicit framework async-result contracts and payload provenance through aliases/joins | Implemented for the modeled `Task<T>`/`ValueTask<T>` producers and wrappers. |
 | Omitted inherited contracts and positional region/parameter renaming | Implemented. |
 | Basic inherited input and returned-lifetime compatibility | Implemented. |
 | Full type-level region inference, higher-ranked binders/universes/placeholders | Not implemented. |
 | Complete generic variance, nested type-lifetime tests, automatic closure lifetime generalization | Not implemented. |
 | Arbitrary heap/container/native aliases and every external library effect | Require models/contracts; unknown origins are not accepted as proofs. |
+| Arbitrary custom awaiters/builders and unmodeled task combinators | Payload origins remain unknown. |
 | Full region-state reconstruction across exceptional handler entries | Conservative: unchanged parameters remain known; parameters that may have been replaced and missing local facts become unknown. |
 | Exact path feasibility from arbitrary correlated conditions | Not implemented; joins retain possible alternatives. |
 | Runtime enforcement or a proof of arbitrary C# memory safety | Not provided. |

@@ -74,6 +74,24 @@ internal static class SymbolFacts
 
     public static bool IsReadOnlyView(ITypeSymbol? type) => type?.Name is "ReadOnlyMemory" or "ReadOnlySpan";
 
+    public static bool IsKnownReceiverView(IPropertySymbol property, Action? inspectMember = null)
+    {
+        var type = property.ContainingType.OriginalDefinition;
+        if (type.Arity == 1 && type.ContainingNamespace.ToDisplayString() == "System" &&
+            type.Name is "Memory" or "ReadOnlyMemory" && property.Name == "Span") return true;
+        static bool IsOwner(INamedTypeSymbol candidate) => candidate.Name == "IMemoryOwner" && candidate.Arity == 1 &&
+            candidate.ContainingNamespace.ToDisplayString() == "System.Buffers";
+        if (IsOwner(type) && property.Name == "Memory") return true;
+        foreach (var implemented in property.ContainingType.AllInterfaces.Where(IsOwner))
+        foreach (var member in implemented.GetMembers("Memory").OfType<IPropertySymbol>())
+        {
+            inspectMember?.Invoke();
+            if (property.ContainingType.FindImplementationForInterfaceMember(member) is IPropertySymbol actual &&
+                OverridesOrEquals(property, actual)) return true;
+        }
+        return false;
+    }
+
     public static IOperation Unwrap(IOperation operation)
     {
         while (true)

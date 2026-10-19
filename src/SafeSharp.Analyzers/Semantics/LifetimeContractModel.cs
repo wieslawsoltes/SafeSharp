@@ -83,11 +83,23 @@ internal sealed class LifetimeContractProvider
     internal LifetimeContractModel GetDeclared(IMethodSymbol method, CancellationToken cancellationToken) =>
         Build(method, inherit: false, cancellationToken);
 
-    internal IEnumerable<IMethodSymbol> Bases(IMethodSymbol method) =>
-        SymbolFacts.ContractSources(method).OfType<IMethodSymbol>()
-            .Where(source => !SymbolEqualityComparer.Default.Equals(source, method))
-            .Distinct<IMethodSymbol>(SymbolEqualityComparer.Default)
-            .OrderBy(source => source.ToDisplayString(), StringComparer.Ordinal);
+    internal IEnumerable<IMethodSymbol> Bases(IMethodSymbol method)
+    {
+        var seen = new HashSet<IMethodSymbol>(SymbolEqualityComparer.Default) { method };
+        // Inheritance follows the virtual slot, not alphabetical type names. A nearer override
+        // can legally weaken an input requirement established by a more distant ancestor.
+        for (var overridden = method.OverriddenMethod; overridden is not null; overridden = overridden.OverriddenMethod)
+            if (seen.Add(overridden)) yield return overridden;
+        var sources = SymbolFacts.ContractSources(method).Select(source => source switch
+        {
+            IMethodSymbol declaration => declaration,
+            IPropertySymbol property when method.MethodKind == MethodKind.PropertyGet => property.GetMethod,
+            IPropertySymbol property when method.MethodKind == MethodKind.PropertySet => property.SetMethod,
+            _ => null,
+        }).OfType<IMethodSymbol>().OrderBy(source => source.ToDisplayString(), StringComparer.Ordinal);
+        foreach (var source in sources)
+            if (seen.Add(source)) yield return source;
+    }
 
     internal AttributeData? Lifetime(ISymbol symbol) => symbol.GetAttributes().FirstOrDefault(attribute => Is(attribute, lifetimeAttribute));
     internal AttributeData? ReturnLifetime(IMethodSymbol method) => method.GetReturnTypeAttributes().FirstOrDefault(attribute => Is(attribute, lifetimeAttribute));
@@ -110,6 +122,18 @@ internal sealed class LifetimeContractProvider
         var locations = ImmutableArray.CreateBuilder<Location>();
         var direct = method.Parameters.Select(parameter => Lifetime(parameter)).ToArray();
         var directReturn = ReturnLifetime(method);
+        var parameterAttributes = new AttributeData?[method.Parameters.Length];
+        var parameterSources = new IMethodSymbol[method.Parameters.Length];
+        for (var index = 0; index < method.Parameters.Length; index++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            parameterAttributes[index] = direct[index];
+            parameterSources[index] = method;
+            if (direct[index] is not null) continue;
+            foreach (var declaration in inherited)
+                if (index < declaration.Parameters.Length && Lifetime(declaration.Parameters[index]) is { } candidate)
+                { parameterAttributes[index] = candidate; parameterSources[index] = declaration; break; }
+        }
         var translations = new Dictionary<IMethodSymbol, Dictionary<string, string>>(SymbolEqualityComparer.Default);
 
         string? Translate(string? name, IMethodSymbol declaration)
@@ -119,14 +143,16 @@ internal sealed class LifetimeContractProvider
             {
                 renamedRegions = new Dictionary<string, string>(StringComparer.Ordinal);
                 var inputNames = new HashSet<string>(StringComparer.Ordinal);
+                var inheritedContract = Get(declaration, cancellationToken);
                 for (var index = 0; index < Math.Min(declaration.Parameters.Length, method.Parameters.Length); index++)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
-                    if (Name(Lifetime(declaration.Parameters[index])) is not { } original) continue;
+                    if (inheritedContract.ParameterRegions[index] is not { } original) continue;
                     inputNames.Add(original);
-                    if (!renamedRegions.ContainsKey(original) && Name(direct[index]) is { } renamed) renamedRegions.Add(original, renamed);
+                    if (original != "this" && !renamedRegions.ContainsKey(original) && Name(parameterAttributes[index]) is { } renamed)
+                        renamedRegions.Add(original, renamed);
                 }
-                if (Name(ReturnLifetime(declaration)) is { } originalReturn && !inputNames.Contains(originalReturn) && Name(directReturn) is { } returnName)
+                if (inheritedContract.ReturnRegion is { } originalReturn && originalReturn != "this" && !inputNames.Contains(originalReturn) && Name(directReturn) is { } returnName)
                     renamedRegions[originalReturn] = returnName;
                 translations.Add(declaration, renamedRegions);
             }
@@ -136,12 +162,8 @@ internal sealed class LifetimeContractProvider
         for (var index = 0; index < method.Parameters.Length; index++)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var attribute = direct[index];
-            var source = method;
-            if (attribute is null)
-                foreach (var declaration in inherited)
-                    if (index < declaration.Parameters.Length && Lifetime(declaration.Parameters[index]) is { } candidate)
-                    { attribute = candidate; source = declaration; break; }
+            var attribute = parameterAttributes[index];
+            var source = parameterSources[index];
             var name = Translate(Name(attribute), source);
             parameters.Add(name);
             if (attribute is not null)

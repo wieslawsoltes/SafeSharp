@@ -10,7 +10,7 @@ namespace SafeSharp.Analyzers.Analysis;
 
 /// <summary>
 /// Compilation-scoped boundary summaries. Explicit contracts take precedence; source inference is
-/// uses a finite may-origin dataflow analysis for returns/out slots and limited parameter disposal effects.
+/// a finite may-origin dataflow analysis proves returns/out slots and limited parameter disposal effects.
 /// Rust likewise separates signature constraints from body checking: https://rustc-dev-guide.rust-lang.org/borrow-check/region-inference.html.
 /// </summary>
 internal sealed class MethodSummaryProvider
@@ -61,7 +61,7 @@ internal sealed class MethodSummaryProvider
                     mutable = lifetime.MutableBorrow;
                 }
             }
-            var disposed = ImmutableHashSet.CreateBuilder<int>();
+            var disposed = ImmutableArray.CreateBuilder<int>();
             var outputs = ImmutableDictionary.CreateBuilder<int, bool>();
             foreach (var parameter in method.Parameters.Where(parameter => parameter.RefKind == RefKind.Out && SymbolFacts.HasAttribute(parameter, "Owned")))
                 outputs[parameter.Ordinal] = parameter.Type.NullableAnnotation == NullableAnnotation.Annotated;
@@ -101,16 +101,17 @@ internal sealed class MethodSummaryProvider
                     LocalFunctionStatementSyntax l => l.Body,
                     _ => null
                 };
-                if (!method.IsVirtual && !method.IsAbstract && !method.IsOverride && body is not null)
+                if (!method.IsVirtual && !method.IsAbstract && !method.IsOverride && body is not null &&
+                    !body.DescendantNodes().Any(node => node is YieldStatementSyntax))
                 {
                     foreach (var statement in body.Statements)
                     {
                         if (statement is not ExpressionStatementSyntax expression || model.GetOperation(expression.Expression, cancellationToken) is not IInvocationOperation invocation)
                             break;
-                        if (SymbolFacts.IsDispose(invocation.TargetMethod) && invocation.Instance is { } instance && SymbolFacts.Unwrap(instance) is IParameterReferenceOperation parameter)
+                        if (SymbolFacts.IsDispose(invocation.TargetMethod) && invocation.Instance is { } instance && DirectParameter(instance) is { } parameter &&
+                            SymbolEqualityComparer.Default.Equals(parameter.Parameter.ContainingSymbol.OriginalDefinition, method.OriginalDefinition))
                             disposed.Add(parameter.Parameter.Ordinal);
-                        else if (invocation.Arguments.Any(argument => argument.Parameter?.RefKind is RefKind.Ref or RefKind.Out) ||
-                            statement.DescendantNodes().Any(n => n is AwaitExpressionSyntax)) break;
+                        else break;
                     }
                 }
             }
@@ -118,20 +119,32 @@ internal sealed class MethodSummaryProvider
         }
         finally { path.Remove(method.OriginalDefinition); }
     }
+
+    private static IParameterReferenceOperation? DirectParameter(IOperation operation)
+    {
+        while (true)
+        {
+            if (operation is IParenthesizedOperation parenthesized) operation = parenthesized.Operand;
+            else if (operation is IConversionOperation { OperatorMethod: null, IsTryCast: false } conversion &&
+                     (conversion.Conversion.IsIdentity || conversion.IsImplicit && conversion.Conversion.IsReference)) operation = conversion.Operand;
+            else return operation as IParameterReferenceOperation;
+        }
+    }
 }
 
 internal sealed class MethodSummary
 {
     internal static readonly MethodSummary Unknown = new(false, ImmutableArray<string>.Empty, false,
-        ImmutableHashSet<int>.Empty, ImmutableDictionary<int, bool>.Empty);
+        ImmutableArray<int>.Empty, ImmutableDictionary<int, bool>.Empty);
 
     public MethodSummary(bool returnsOwned, ImmutableArray<string> borrowedSources, bool mutableBorrow,
-        ImmutableHashSet<int> disposedParameters, ImmutableDictionary<int, bool> ownedOutputParameters)
+        ImmutableArray<int> parameterDisposalOrder, ImmutableDictionary<int, bool> ownedOutputParameters)
     {
         ReturnsOwned = returnsOwned;
         BorrowedSources = borrowedSources;
         MutableBorrow = mutableBorrow;
-        DisposedParameters = disposedParameters;
+        ParameterDisposalOrder = parameterDisposalOrder;
+        DisposedParameters = parameterDisposalOrder.ToImmutableHashSet();
         OwnedOutputParameters = ownedOutputParameters;
     }
 
@@ -141,5 +154,6 @@ internal sealed class MethodSummary
     public bool HasBorrowedReturn => !BorrowedSources.IsEmpty;
     public bool MutableBorrow { get; }
     public ImmutableHashSet<int> DisposedParameters { get; }
+    public ImmutableArray<int> ParameterDisposalOrder { get; }
     public ImmutableDictionary<int, bool> OwnedOutputParameters { get; }
 }

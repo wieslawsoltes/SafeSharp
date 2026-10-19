@@ -94,6 +94,8 @@ internal sealed class LifetimeReturnFlow
                 if (block.BranchValue is not { } returned) continue;
                 var origins = Evaluate(returned, state, 0);
                 if (block.FallThroughSuccessor?.Semantics != ControlFlowBranchSemantics.Return && block.ConditionalSuccessor?.Semantics != ControlFlowBranchSemantics.Return) continue;
+                if (!contract.Method.IsAsync && IsFrameworkAwaitable(contract.Method.ReturnType))
+                    origins = AwaitedOrigins(origins, returned);
                 var location = ReturnLocation(returned);
                 Step(origins.Count);
                 var invalid = origins.Where(origin => !Satisfies(origin)).OrderBy(origin => origin.Key, StringComparer.Ordinal).ToArray();
@@ -137,7 +139,16 @@ internal sealed class LifetimeReturnFlow
         if (depth > 256) throw new LifetimeFlowBudgetException();
         switch (operation)
         {
-            case IConversionOperation conversion: return Evaluate(conversion.Operand, state, depth + 1);
+            case IConversionOperation conversion:
+            {
+                var operand = Evaluate(conversion.Operand, state, depth + 1);
+                if (conversion.OperatorMethod is not { } operatorMethod) return operand;
+                // User-defined conversion executes arbitrary code. Only its declared/inferred
+                // returned-source summary can establish the result's lifetime, never the cast syntax.
+                if (conversion.Operand.Type?.TypeKind == TypeKind.Delegate) InvalidateCapturedStorage(state, conversion);
+                return ResolveCall(conversion, operatorMethod, Unknown(conversion, "static conversion"),
+                    new Dictionary<int, ImmutableHashSet<RegionOrigin>> { [0] = operand });
+            }
             case IParenthesizedOperation parenthesized: return Evaluate(parenthesized.Operand, state, depth + 1);
             case IParameterReferenceOperation parameter: return Read(state, ParameterKey(parameter.Parameter), operation);
             case ILocalReferenceOperation local: return Read(state, LocalKey(local.Local), operation);
@@ -159,13 +170,17 @@ internal sealed class LifetimeReturnFlow
             }
             case ISimpleAssignmentOperation assignment:
             {
+                var key = Key(assignment.Target);
+                // Receiver/index expressions designate the storage before the RHS executes.
+                // They may themselves assign locals or invoke callbacks with observable effects.
+                if (key is null)
+                    foreach (var child in assignment.Target.ChildOperations) Evaluate(child, state, depth + 1);
                 var origins = Evaluate(assignment.Value, state, depth + 1);
-                if (Key(assignment.Target) is { } key)
+                if (key is not null)
                 {
                     if (assignment.IsRef) BindReference(state, key, Key(assignment.Value));
                     else Store(state, key, origins);
                 }
-                else foreach (var child in assignment.Target.ChildOperations) Evaluate(child, state, depth + 1);
                 return origins;
             }
             case IAssignmentOperation assignment:
@@ -187,14 +202,16 @@ internal sealed class LifetimeReturnFlow
             case IPropertyReferenceOperation property:
             {
                 var receiver = property.Instance is null ? Unknown(operation, "static property") : Evaluate(property.Instance, state, depth + 1);
-                foreach (var argument in property.Arguments) Evaluate(argument.Value, state, depth + 1);
+                var arguments = new Dictionary<int, ImmutableHashSet<RegionOrigin>>();
+                foreach (var argument in property.Arguments)
+                {
+                    var value = Evaluate(argument.Value, state, depth + 1);
+                    if (argument.Parameter is { } parameter) arguments[parameter.Ordinal] = value;
+                }
+                if (property.Arguments.Any(argument => argument.Value.Type?.TypeKind == TypeKind.Delegate)) InvalidateCapturedStorage(state, property);
                 if (IsKnownReceiverView(property.Property)) return receiver;
                 if (property.Property.GetMethod is { } getter)
-                {
-                    var summary = contracts.Get(getter, cancellationToken);
-                    if (summary.ReturnsOwned) return Local(operation, "owned property result");
-                    if (summary.BorrowedSource == "this" || summary.ReturnRegion == "this") return receiver;
-                }
+                    return ResolveCall(property, getter, receiver, arguments);
                 return Unknown(operation, "property has no trusted borrowing relation");
             }
             case IFieldReferenceOperation field:
@@ -219,16 +236,40 @@ internal sealed class LifetimeReturnFlow
                 return MergeOrigins(result, One(RegionOrigin.Null));
             }
             case IConditionalAccessInstanceOperation: return conditionalReceiver ?? Unknown(operation, "unknown conditional receiver");
-            case IAwaitOperation awaited: return Evaluate(awaited.Operation, state, depth + 1);
+            case IAwaitOperation awaited:
+            {
+                var value = Evaluate(awaited.Operation, state, depth + 1);
+                // Carrier lifetime does not establish GetResult's payload lifetime. The marker
+                // comes only from a modeled producer or an explicit effective-result promise.
+                return IsFrameworkAwaitable(awaited.Operation.Type, includeConfigured: true)
+                    ? AwaitedOrigins(value, awaited) : Unknown(awaited, "custom awaiter has no modeled result lifetime");
+            }
             case IObjectCreationOperation creation:
+            {
+                var replacements = new List<(ImmutableHashSet<string> Targets, IOperation Argument)>();
+                ImmutableHashSet<RegionOrigin>? singleArgument = null;
                 foreach (var argument in creation.Arguments)
                 {
-                    Evaluate(argument.Value, state, depth + 1);
-                    if (argument.Parameter?.RefKind is RefKind.Ref or RefKind.Out && Key(argument.Value) is { } key)
-                        Store(state, key, Unknown(argument, "constructor ref/out argument may replace the value"));
+                    var value = Evaluate(argument.Value, state, depth + 1);
+                    if (creation.Arguments.Length == 1) singleArgument = value;
+                    if (argument.Parameter?.RefKind is RefKind.Ref or RefKind.Out)
+                        replacements.Add((ArgumentTargets(state, argument.Value), argument));
                 }
+                foreach (var replacement in replacements)
+                    Store(state, replacement.Targets, Unknown(replacement.Argument, "constructor ref/out argument may replace the value"));
+                if (creation.Arguments.Any(argument => argument.Value.Type?.TypeKind == TypeKind.Delegate))
+                    InvalidateCapturedStorage(state, creation);
                 if (creation.Initializer is { } objectInitializer) Evaluate(objectInitializer, state, depth + 1);
+                if (creation.Type is INamedTypeSymbol { Name: "ValueTask", Arity: 1 } valueTask &&
+                    valueTask.ContainingNamespace.ToDisplayString() == "System.Threading.Tasks" && singleArgument is not null &&
+                    creation.Constructor is { Parameters.Length: 1 } constructor)
+                {
+                    if (SymbolEqualityComparer.Default.Equals(constructor.Parameters[0].Type, valueTask.TypeArguments[0]))
+                        return WrapAwaitable(singleArgument);
+                    if (IsFrameworkAwaitable(constructor.Parameters[0].Type)) return singleArgument;
+                }
                 return Local(operation, "locally created owner");
+            }
             case IArrayCreationOperation array:
                 foreach (var child in array.ChildOperations) Evaluate(child, state, depth + 1);
                 return Local(operation, "locally created array");
@@ -247,6 +288,7 @@ internal sealed class LifetimeReturnFlow
         var method = invocation.TargetMethod.ReducedFrom ?? invocation.TargetMethod;
         var receiver = invocation.Instance is null ? Unknown(invocation, "no receiver") : Evaluate(invocation.Instance, state, depth + 1);
         var arguments = new Dictionary<int, ImmutableHashSet<RegionOrigin>>();
+        var replacements = new List<(ImmutableHashSet<string> Targets, IOperation Argument, int? Ordinal)>();
         var offset = invocation.TargetMethod.ReducedFrom is null ? 0 : 1;
         if (offset == 1) arguments[0] = receiver;
         foreach (var argument in invocation.Arguments)
@@ -254,36 +296,37 @@ internal sealed class LifetimeReturnFlow
             var value = Evaluate(argument.Value, state, depth + 1);
             if (argument.Parameter is { } parameter) arguments[parameter.Ordinal + offset] = value;
             if (argument.Parameter?.RefKind is RefKind.Out or RefKind.Ref)
-            {
-                var replaced = Unknown(argument, "ref/out call may replace the value");
-                if (argument.Parameter is { } outputParameter) arguments[outputParameter.Ordinal + offset] = replaced;
-                if (Key(argument.Value) is { } key) Store(state, key, replaced);
-            }
+                replacements.Add((ArgumentTargets(state, argument.Value), argument, argument.Parameter.Ordinal + offset));
         }
-        if (MayRunCapturedCode(invocation))
+        // C# evaluates every argument before entering the callee. A later argument assignment
+        // must not overwrite the unknown postcondition of an earlier ref/out argument.
+        foreach (var replacement in replacements)
         {
-            Step(state.Values.Count);
-            foreach (var key in state.Values.Keys.ToArray())
-            {
-                Step();
-                state.Values[key] = Unknown(invocation, "captured storage may be replaced by invoked code");
-            }
+            var replaced = Unknown(replacement.Argument, "ref/out call may replace the value");
+            if (replacement.Ordinal is { } ordinal) arguments[ordinal] = replaced;
+            Store(state, replacement.Targets, replaced);
         }
+        if (MayRunCapturedCode(invocation)) InvalidateCapturedStorage(state, invocation);
         if (method.ContainingType.ToDisplayString() == "SafeSharp.Ownership" && method.Name is "Borrow" or "BorrowMut" && arguments.TryGetValue(0, out var borrowed)) return borrowed;
+        if (method.Name == "FromResult" && method.ContainingNamespace.ToDisplayString() == "System.Threading.Tasks" &&
+            method.ContainingType is { Arity: 0, Name: "Task" or "ValueTask" } && IsFrameworkAwaitable(method.ReturnType) &&
+            arguments.Count == 1 && arguments.TryGetValue(0, out var payload)) return WrapAwaitable(payload);
+        if ((method.Name is "ConfigureAwait" or "AsTask") && IsFrameworkAwaitable(method.ContainingType) && invocation.Instance is not null)
+            return receiver;
+        return ResolveCall(invocation, method, receiver, arguments);
+    }
+
+    private ImmutableHashSet<RegionOrigin> ResolveCall(IOperation operation, IMethodSymbol method,
+        ImmutableHashSet<RegionOrigin> receiver, IReadOnlyDictionary<int, ImmutableHashSet<RegionOrigin>> arguments)
+    {
         var called = contracts.Get(method, cancellationToken);
-        var summary = summaries.Get(method, cancellationToken);
-        if (called.ReturnsOwned || summary.ReturnsOwned) return Local(invocation, "owned factory result");
-        if (!called.DeclarationIssues.IsEmpty) return Unknown(invocation, "callee lifetime declaration is invalid");
+        if (called.ReturnsOwned) return Local(operation, "owned factory result");
+        if (!called.DeclarationIssues.IsEmpty) return Unknown(operation, "callee lifetime declaration is invalid");
         var source = called.BorrowedSource;
-        if (source == "this") return receiver;
-        if (source is not null && method.Parameters.FirstOrDefault(parameter => parameter.Name == source) is { } input && arguments.TryGetValue(input.Ordinal, out var origins)) return origins;
-        if (!summary.BorrowedSources.IsEmpty)
-        {
-            var candidates = summary.BorrowedSources.Select(candidate => candidate == "this" ? receiver :
-                method.Parameters.FirstOrDefault(parameter => parameter.Name == candidate) is { } parameter && arguments.TryGetValue(parameter.Ordinal, out var value)
-                    ? value : Unknown(invocation, "returned source could not be mapped to an argument"));
-            return Union(candidates, invocation);
-        }
+        ImmutableHashSet<RegionOrigin> ExplicitResult(ImmutableHashSet<RegionOrigin> value) =>
+            IsFrameworkAwaitable(method.ReturnType) ? WrapAwaitable(value) : value;
+        if (source == "this") return ExplicitResult(receiver);
+        if (source is not null && method.Parameters.FirstOrDefault(parameter => parameter.Name == source) is { } input && arguments.TryGetValue(input.Ordinal, out var origins)) return ExplicitResult(origins);
         if (called.ReturnRegion is { } returned)
         {
             var relation = called.Solve(options, cancellationToken);
@@ -292,9 +335,50 @@ internal sealed class LifetimeReturnFlow
             for (var parameter = 0; parameter < called.ParameterRegions.Length; parameter++)
                 if (called.ParameterRegions[parameter] is { } region && relation.Outlives(region, returned) && arguments.TryGetValue(parameter, out var value)) candidates.Add(value);
             if (!method.IsStatic && relation.Outlives("this", returned)) candidates.Add(receiver);
-            return Union(candidates, invocation);
+            return ExplicitResult(Union(candidates, operation));
         }
-        return Unknown(invocation, "call has no trusted returned-source contract");
+        // Explicit signatures already determine provenance. Source-body summary inference is
+        // needed only for boundaries without a returned-source/lifetime contract.
+        var summary = summaries.Get(method, cancellationToken);
+        if (summary.ReturnsOwned) return Local(operation, "owned factory result");
+        if (!summary.BorrowedSources.IsEmpty)
+        {
+            var candidates = summary.BorrowedSources.Select(candidate => candidate == "this" ? receiver :
+                method.Parameters.FirstOrDefault(parameter => parameter.Name == candidate) is { } parameter && arguments.TryGetValue(parameter.Ordinal, out var value)
+                    ? value : Unknown(operation, "returned source could not be mapped to an argument"));
+            return Union(candidates, operation);
+        }
+        return Unknown(operation, "call has no trusted returned-source contract");
+    }
+
+    private static bool IsFrameworkAwaitable(ITypeSymbol? type, bool includeConfigured = false) => type is INamedTypeSymbol { Arity: 1 } named &&
+        (named.ContainingNamespace.ToDisplayString() == "System.Threading.Tasks" && (named.Name is "Task" or "ValueTask") ||
+         includeConfigured && named.ContainingNamespace.ToDisplayString() == "System.Runtime.CompilerServices" &&
+             (named.Name is "ConfiguredTaskAwaitable" or "ConfiguredValueTaskAwaitable"));
+
+    private ImmutableHashSet<RegionOrigin> WrapAwaitable(ImmutableHashSet<RegionOrigin> origins)
+    {
+        Step(origins.Count);
+        var wrapped = ImmutableHashSet.CreateBuilder<RegionOrigin>();
+        foreach (var origin in origins)
+        {
+            if (origin.AwaitableDepth >= 256) throw new LifetimeFlowBudgetException();
+            wrapped.Add(origin.WithAwaitableDepth(origin.AwaitableDepth + 1));
+        }
+        return wrapped.ToImmutable();
+    }
+
+    private ImmutableHashSet<RegionOrigin> AwaitedOrigins(ImmutableHashSet<RegionOrigin> origins, IOperation operation)
+    {
+        Step(origins.Count);
+        var result = ImmutableHashSet.CreateBuilder<RegionOrigin>();
+        foreach (var origin in origins)
+        {
+            if (origin.AwaitableDepth > 0) result.Add(origin.WithAwaitableDepth(origin.AwaitableDepth - 1));
+            else if (origin.Kind == OriginKind.Null) result.Add(origin);
+            else result.UnionWith(Unknown(operation, "awaitable payload has no proven result lifetime"));
+        }
+        return result.ToImmutable();
     }
 
     private bool Satisfies(RegionOrigin origin)
@@ -378,6 +462,13 @@ internal sealed class LifetimeReturnFlow
                     break;
                 case IObjectCreationOperation creation:
                     foreach (var argument in creation.Arguments.Where(argument => argument.Parameter?.RefKind is RefKind.Ref or RefKind.Out)) Mark(argument.Value);
+                    mayWriteThroughAliases |= creation.Arguments.Any(argument => argument.Value.Type?.TypeKind == TypeKind.Delegate);
+                    break;
+                case IConversionOperation { OperatorMethod: not null } conversion:
+                    mayWriteThroughAliases |= conversion.Operand.Type?.TypeKind == TypeKind.Delegate;
+                    break;
+                case IPropertyReferenceOperation property:
+                    mayWriteThroughAliases |= property.Arguments.Any(argument => argument.Value.Type?.TypeKind == TypeKind.Delegate);
                     break;
                 case IAnonymousFunctionOperation or IFlowAnonymousFunctionOperation or ILocalFunctionOperation: continue;
             }
@@ -401,6 +492,16 @@ internal sealed class LifetimeReturnFlow
         return method.MethodKind == MethodKind.DelegateInvoke ||
             method.MethodKind == MethodKind.LocalFunction && !method.IsStatic ||
             invocation.Arguments.Any(argument => argument.Value.Type?.TypeKind == TypeKind.Delegate);
+    }
+
+    private void InvalidateCapturedStorage(OriginState state, IOperation operation)
+    {
+        Step(state.Values.Count);
+        foreach (var key in state.Values.Keys.ToArray())
+        {
+            Step();
+            state.Values[key] = Unknown(operation, "captured storage may be replaced by invoked code");
+        }
     }
 
     private void StoreTargets(OriginState state, IOperation target, ImmutableHashSet<RegionOrigin> origins)
@@ -473,9 +574,17 @@ internal sealed class LifetimeReturnFlow
         state.RefTargets[target] = source is null || source.StartsWith("capture:", StringComparison.Ordinal) && !state.RefTargets.ContainsKey(source)
             ? ImmutableHashSet.Create(StringComparer.Ordinal, UnknownTarget) : Targets(state, source);
 
-    private void Store(OriginState state, string key, ImmutableHashSet<RegionOrigin> origins)
+    private ImmutableHashSet<string> ArgumentTargets(OriginState state, IOperation argument)
     {
-        var targets = Targets(state, key);
+        var key = Key(argument);
+        return key is null || key.StartsWith("capture:", StringComparison.Ordinal) && !state.RefTargets.ContainsKey(key)
+            ? ImmutableHashSet.Create(StringComparer.Ordinal, UnknownTarget) : Targets(state, key);
+    }
+
+    private void Store(OriginState state, string key, ImmutableHashSet<RegionOrigin> origins) => Store(state, Targets(state, key), origins);
+
+    private void Store(OriginState state, ImmutableHashSet<string> targets, ImmutableHashSet<RegionOrigin> origins)
+    {
         if (targets.Contains(UnknownTarget))
         {
             Step(state.Values.Count);
@@ -528,23 +637,7 @@ internal sealed class LifetimeReturnFlow
         return first.Equals(second);
     }
 
-    private bool IsKnownReceiverView(IPropertySymbol property)
-    {
-        var type = property.ContainingType.OriginalDefinition;
-        if (type.Arity == 1 && type.ContainingNamespace.ToDisplayString() == "System" &&
-            (type.Name is "Memory" or "ReadOnlyMemory") && property.Name == "Span") return true;
-        static bool IsOwner(INamedTypeSymbol candidate) => candidate.Name == "IMemoryOwner" && candidate.Arity == 1 &&
-            candidate.ContainingNamespace.ToDisplayString() == "System.Buffers";
-        if (IsOwner(type) && property.Name == "Memory") return true;
-        foreach (var implemented in property.ContainingType.AllInterfaces.Where(IsOwner))
-        foreach (var member in implemented.GetMembers("Memory").OfType<IPropertySymbol>())
-        {
-            Step();
-            if (property.ContainingType.FindImplementationForInterfaceMember(member) is IPropertySymbol actual &&
-                SymbolEqualityComparer.Default.Equals(actual.OriginalDefinition, property.OriginalDefinition)) return true;
-        }
-        return false;
-    }
+    private bool IsKnownReceiverView(IPropertySymbol property) => SymbolFacts.IsKnownReceiverView(property, () => Step());
 
     private sealed class OriginState : IEquatable<OriginState>
     {
@@ -568,17 +661,19 @@ internal sealed class LifetimeReturnFlow
     {
         internal static readonly RegionOrigin Null = new(OriginKind.Null, "null", -2, null, Location.None, "null");
         internal static readonly RegionOrigin Missing = new(OriginKind.Unknown, "missing", -2, null, Location.None, "a value missing from one incoming path");
-        internal RegionOrigin(OriginKind kind, string key, int parameterOrdinal, string? region, Location location, string description)
-        { Kind = kind; Key = key; ParameterOrdinal = parameterOrdinal; Region = region; Location = location; Description = description; }
+        internal RegionOrigin(OriginKind kind, string key, int parameterOrdinal, string? region, Location location, string description, int awaitableDepth = 0)
+        { Kind = kind; Key = key; ParameterOrdinal = parameterOrdinal; Region = region; Location = location; Description = description; AwaitableDepth = awaitableDepth; }
         internal OriginKind Kind { get; }
         internal string Key { get; }
         internal int ParameterOrdinal { get; }
         internal string? Region { get; }
         internal Location Location { get; }
         internal string Description { get; }
-        public bool Equals(RegionOrigin? other) => other is not null && Key == other.Key;
+        internal int AwaitableDepth { get; }
+        internal RegionOrigin WithAwaitableDepth(int depth) => new(Kind, Key, ParameterOrdinal, Region, Location, Description, depth);
+        public bool Equals(RegionOrigin? other) => other is not null && Key == other.Key && AwaitableDepth == other.AwaitableDepth;
         public override bool Equals(object? obj) => obj is RegionOrigin other && Equals(other);
-        public override int GetHashCode() => StringComparer.Ordinal.GetHashCode(Key);
+        public override int GetHashCode() => unchecked(StringComparer.Ordinal.GetHashCode(Key) * 397 ^ AwaitableDepth);
     }
 
     private sealed class LifetimeFlowBudgetException : Exception { }
