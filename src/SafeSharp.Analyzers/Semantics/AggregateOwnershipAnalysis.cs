@@ -1,170 +1,90 @@
+using System;
 using System.Collections.Generic;
+using System.Collections.Immutable;
+using System.Globalization;
 using System.Linq;
-using System.Threading;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Diagnostics;
-using Microsoft.CodeAnalysis.Operations;
 
 namespace SafeSharp.Analyzers.Semantics;
 
-/// <summary>
-/// Separates aggregate destruction obligations from intraprocedural loan analysis.
-/// Rust Drop cannot be implemented for Copy types; C# has no equivalent negative capability:
-/// https://doc.rust-lang.org/std/ops/trait.Drop.html#copy-and-drop-are-exclusive.
-/// </summary>
+/// <summary>Checks aggregate release obligations at every modeled normal disposal exit.</summary>
 internal static class AggregateOwnershipAnalysis
 {
     public static void Analyze(SymbolAnalysisContext context, INamedTypeSymbol type, ContractSymbols symbols)
     {
-        if (type.IsImplicitlyDeclared || (type.TypeKind != TypeKind.Class && type.TypeKind != TypeKind.Struct)) return;
-        var owned = new List<ISymbol>();
-        foreach (var member in type.GetMembers())
-        {
-            context.CancellationToken.ThrowIfCancellationRequested();
-            if (member.IsStatic || member.IsImplicitlyDeclared) continue;
-            var memberType = GetMemberType(member);
-            if (memberType is not null && (symbols.Has(member, "Owned") || symbols.Has(memberType, "Owned"))) owned.Add(member);
-        }
-        var typeLocation = type.Locations.FirstOrDefault(l => l.IsInSource);
-        if (type.TypeKind == TypeKind.Struct && (owned.Count > 0 || symbols.Has(type, "Owned")) && typeLocation is not null)
+        if (type.IsImplicitlyDeclared || type.TypeKind is not (TypeKind.Class or TypeKind.Struct)) return;
+        var owned = Hierarchy(type).SelectMany(current => current.GetMembers()).Where(member => !member.IsStatic && !member.IsImplicitlyDeclared &&
+            MemberType(member) is { } memberType && (symbols.Has(member, "Owned") || symbols.Has(memberType, "Owned"))).ToArray();
+        var typeLocation = type.Locations.FirstOrDefault(location => location.IsInSource);
+        if (type.TypeKind == TypeKind.Struct && (owned.Length != 0 || symbols.Has(type, "Owned")) && typeLocation is not null)
             context.ReportDiagnostic(Diagnostic.Create(SemanticDiagnostics.CopyableOwner, typeLocation, type.Name));
-
-        var disposableMembers = owned.Where(m => symbols.IsDisposable(GetMemberType(m))).ToArray();
-        if (disposableMembers.Length == 0) return;
+        var disposable = owned.Where(member => symbols.IsDisposable(MemberType(member))).Select(member => member.OriginalDefinition)
+            .Distinct(SymbolEqualityComparer.Default).ToArray();
+        if (disposable.Length == 0) return;
         if (!symbols.IsDisposable(type))
         {
-            foreach (var member in disposableMembers)
-            {
-                var location = member.Locations.FirstOrDefault(l => l.IsInSource);
-                if (location is not null) context.ReportDiagnostic(Diagnostic.Create(SemanticDiagnostics.MissingDisposalContract, location, type.Name, member.Name));
-            }
+            foreach (var member in disposable)
+                if (member.Locations.FirstOrDefault(location => location.IsInSource) is { } location)
+                    context.ReportDiagnostic(Diagnostic.Create(SemanticDiagnostics.MissingDisposalContract, location, type.Name, member.Name));
             return;
         }
-
-        var released = new HashSet<ISymbol>(SymbolEqualityComparer.Default);
-        var visited = new HashSet<ISymbol>(SymbolEqualityComparer.Default);
+        // An abstract disposal contract is checked at each concrete implementing owner.
+        if (type.IsAbstract) return;
+        if (disposable.Length > 512)
+        {
+            if (typeLocation is not null) context.ReportDiagnostic(Diagnostic.Create(ConcurrencyDiagnostics.IncompleteContractAnalysis,
+                typeLocation, type.Name, "owned-member count"));
+            return;
+        }
+        var maximumSteps = 20000;
+        var options = typeLocation?.SourceTree is { } tree ? context.Options.AnalyzerConfigOptionsProvider.GetOptions(tree)
+            : context.Options.AnalyzerConfigOptionsProvider.GlobalOptions;
+        if ((options.TryGetValue("safesharp_max_contract_steps", out var configured) || context.Options.AnalyzerConfigOptionsProvider.GlobalOptions
+                .TryGetValue("safesharp_max_contract_steps", out configured)) && int.TryParse(configured, NumberStyles.Integer,
+                CultureInfo.InvariantCulture, out var parsed) && parsed > 0) maximumSteps = Math.Min(parsed, 1000000);
+        var session = new AggregateCleanupSummary(type, disposable, symbols, maximumSteps, context.CancellationToken);
+        var entrypoints = new HashSet<IMethodSymbol>(SymbolEqualityComparer.Default);
         foreach (var contract in new[] { symbols.Disposable, symbols.AsyncDisposable })
         {
             if (contract is null) continue;
             foreach (var contractMember in contract.GetMembers().OfType<IMethodSymbol>())
-                if (type.FindImplementationForInterfaceMember(contractMember) is IMethodSymbol implementation)
-                    VisitMethod(implementation, type, symbols, released, visited, context.CancellationToken);
+                if (type.FindImplementationForInterfaceMember(contractMember) is IMethodSymbol implementation) entrypoints.Add(session.ResolveOverride(implementation));
         }
-        foreach (var member in disposableMembers)
+        var failures = new Dictionary<ISymbol, List<KeyValuePair<IMethodSymbol, CleanupMethodSummary>>>(SymbolEqualityComparer.Default);
+        foreach (var entrypoint in entrypoints.OrderBy(method => method.ToDisplayString(), StringComparer.Ordinal))
         {
-            if (released.Contains(member)) continue;
-            var location = member.Locations.FirstOrDefault(l => l.IsInSource);
-            if (location is not null) context.ReportDiagnostic(Diagnostic.Create(SemanticDiagnostics.OwnedFieldNotDisposed, location, member.Name));
-        }
-    }
-
-    private static void VisitMethod(IMethodSymbol method, INamedTypeSymbol owner, ContractSymbols symbols, HashSet<ISymbol> released, HashSet<ISymbol> visited, CancellationToken cancellationToken)
-    {
-        var pending = new Stack<IMethodSymbol>();
-        pending.Push(method);
-        while (pending.Count != 0)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            var currentMethod = pending.Pop();
-            if (!visited.Add(currentMethod.OriginalDefinition)) continue;
-            foreach (var reference in currentMethod.DeclaringSyntaxReferences)
+            context.CancellationToken.ThrowIfCancellationRequested();
+            var summary = session.Analyze(entrypoint);
+            foreach (var member in disposable)
             {
-                var syntax = reference.GetSyntax(cancellationToken);
-                var operation = symbols.Compilation.GetSemanticModel(syntax.SyntaxTree).GetOperation(syntax, cancellationToken);
-                if (operation is null) continue;
-                foreach (var item in ContractSymbols.Walk(operation))
-                {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    if (item is not IInvocationOperation invocation) continue;
-                    var instance = ResolveConditionalReceiver(invocation);
-                    var member = instance switch
-                    {
-                        IFieldReferenceOperation field => (ISymbol)field.Field,
-                        IPropertyReferenceOperation property => property.Property,
-                        _ => null,
-                    };
-                    if (member is not null && IsDisposalCall(invocation, instance?.Type, symbols, out var asynchronous)
-                        && (!asynchronous || IsObservedAsyncDisposal(invocation)))
-                        released.Add(member);
-                    if (invocation.TargetMethod.MethodKind == MethodKind.LocalFunction
-                        || (instance is IInstanceReferenceOperation && IsInHierarchy(owner, invocation.TargetMethod.ContainingType)))
-                        pending.Push(ResolveVirtualTarget(invocation, owner));
-                }
+                if (summary.Released.Contains(member) && !summary.OutstandingNewMembers.Contains(member) && !summary.PendingMembers.Contains(member)) continue;
+                if (!failures.TryGetValue(member, out var missing)) failures.Add(member, missing = new());
+                missing.Add(new KeyValuePair<IMethodSymbol, CleanupMethodSummary>(entrypoint, summary));
             }
         }
-    }
-
-    private static bool IsDisposalCall(IInvocationOperation invocation, ITypeSymbol? receiverType, ContractSymbols symbols, out bool asynchronous)
-    {
-        asynchronous = false;
-        if (invocation.Arguments.Length != 0 || receiverType is null) return false;
-        var method = invocation.TargetMethod;
-        foreach (var contract in new[] { symbols.Disposable, symbols.AsyncDisposable })
+        foreach (var failure in failures)
         {
-            if (contract is null || !symbols.Implements(receiverType, contract)) continue;
-            foreach (var member in contract.GetMembers().OfType<IMethodSymbol>())
-            {
-                var implementation = (receiverType as INamedTypeSymbol)?.FindImplementationForInterfaceMember(member);
-                if (ContractSymbols.Equal(method.OriginalDefinition, member.OriginalDefinition)
-                    || ContractSymbols.Equal(method.OriginalDefinition, implementation?.OriginalDefinition))
-                {
-                    asynchronous = ContractSymbols.Equal(contract, symbols.AsyncDisposable);
-                    return true;
-                }
-            }
+            var location = ContractSymbols.Equal(failure.Key.ContainingType.OriginalDefinition, type.OriginalDefinition)
+                ? failure.Key.Locations.FirstOrDefault(candidate => candidate.IsInSource) : typeLocation;
+            if (location is null) continue;
+            var properties = ImmutableDictionary<string, string?>.Empty
+                .Add("SafeSharp.CleanupEntrypoints", string.Join("; ", failure.Value.Select(pair => pair.Key.ToDisplayString())))
+                .Add("SafeSharp.CleanupOwner", type.ToDisplayString())
+                .Add("SafeSharp.CleanupProof", "normalExitMustRelease");
+            context.ReportDiagnostic(Diagnostic.Create(SemanticDiagnostics.OwnedFieldNotDisposed, location,
+                additionalLocations: failure.Value.SelectMany(pair => pair.Value.Exits).Concat(failure.Key.Locations.Where(candidate => candidate.IsInSource)).Distinct(), properties: properties,
+                messageArgs: new object[] { failure.Key.Name }));
         }
-        return false;
+        if (session.BudgetExceeded && typeLocation is not null)
+            context.ReportDiagnostic(Diagnostic.Create(ConcurrencyDiagnostics.IncompleteContractAnalysis, typeLocation,
+                type.Name, "aggregate cleanup summary"));
     }
-
-    private static bool IsObservedAsyncDisposal(IInvocationOperation invocation)
+    private static IEnumerable<INamedTypeSymbol> Hierarchy(INamedTypeSymbol type)
     {
-        IOperation current = invocation;
-        while (current.Parent is { } parent)
-        {
-            if (parent is IAwaitOperation || parent is IReturnOperation) return true;
-            if (parent is IConversionOperation || parent is IParenthesizedOperation || parent is IConditionalAccessOperation)
-            {
-                current = parent;
-                continue;
-            }
-            if (parent is IInvocationOperation wrapper && ReferenceEquals(wrapper.Instance, current)
-                && wrapper.TargetMethod.ContainingNamespace.ToDisplayString() == "System.Threading.Tasks"
-                && (wrapper.TargetMethod.Name == "ConfigureAwait" || wrapper.TargetMethod.Name == "AsTask"))
-            {
-                current = parent;
-                continue;
-            }
-            return false;
-        }
-        return false;
+        for (INamedTypeSymbol? current = type; current is not null; current = current.BaseType) yield return current;
     }
-
-    private static IOperation? ResolveConditionalReceiver(IInvocationOperation invocation)
-    {
-        var instance = invocation.Instance is null ? null : ContractSymbols.Unwrap(invocation.Instance);
-        if (instance is not IConditionalAccessInstanceOperation) return instance;
-        for (var current = invocation.Parent; current is not null; current = current.Parent)
-            if (current is IConditionalAccessOperation conditional) return ContractSymbols.Unwrap(conditional.Operation);
-        return null;
-    }
-
-    private static IMethodSymbol ResolveVirtualTarget(IInvocationOperation invocation, INamedTypeSymbol owner)
-    {
-        if (!invocation.IsVirtual) return invocation.TargetMethod;
-        foreach (var candidate in owner.GetMembers(invocation.TargetMethod.Name).OfType<IMethodSymbol>())
-            for (var overridden = candidate.OverriddenMethod; overridden is not null; overridden = overridden.OverriddenMethod)
-                if (ContractSymbols.Equal(overridden.OriginalDefinition, invocation.TargetMethod.OriginalDefinition)) return candidate;
-        return invocation.TargetMethod;
-    }
-
-    private static bool IsInHierarchy(INamedTypeSymbol type, INamedTypeSymbol candidate)
-    {
-        for (INamedTypeSymbol? current = type; current is not null; current = current.BaseType)
-            if (ContractSymbols.Equal(current, candidate)) return true;
-        return false;
-    }
-
-    private static ITypeSymbol? GetMemberType(ISymbol member) => member switch
+    private static ITypeSymbol? MemberType(ISymbol member) => member switch
     {
         IFieldSymbol field => field.Type,
         IPropertySymbol property when property.GetMethod is not null => property.Type,

@@ -22,7 +22,7 @@ SS0015 | Ownership | Warning | Ownership analysis budget exceeded
 SS0016 | Ownership | Warning | NoSuspend contract
 SS0017 | Ownership | Warning | Asynchronous disposal completion is not observed
 SS0020 | SafeSharp.Ownership | Warning | Aggregate ownership requires a disposal contract
-SS0021 | SafeSharp.Ownership | Warning | Owned member has no release reachable from disposal
+SS0021 | SafeSharp.Ownership | Warning | Owned member is not released on every normal disposal exit
 SS0022 | SafeSharp.Ownership | Warning | Ownership-bearing structs remain copyable
 SS0023 | SafeSharp.Ownership | Warning | Inconsistent ownership contract
 SS0024 | SafeSharp.Ownership | Warning | Ignored MustUse result
@@ -36,3 +36,6 @@ SS0031 | Ownership | Warning | Unobserved asynchronous disposal
 SS0032 | Ownership | Disabled | Unsafe or dynamic boundary
 SS0033 | Ownership | Disabled | Missing ownership return contract
 SS0034 | Ownership | Warning | Ownership contract changes across implementation boundaries
+SS0044 | SafeSharp.Ownership | Warning | Invalid concurrency contract
+SS0045 | SafeSharp.Ownership | Warning | Unsafe concurrent capture
+SS0046 | SafeSharp.Ownership | Info | Concurrency or cleanup analysis incomplete

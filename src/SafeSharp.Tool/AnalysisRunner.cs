@@ -159,7 +159,7 @@ internal static class AnalysisRunner
             else diagnostics.Add(new ReportDiagnostic(diagnostic.Id, diagnostic.GetMessage(), site, severity,
                 diagnostic.Descriptor.Title.ToString(), relatedLocations: related, properties: diagnostic.Properties));
         }
-        return !analyzerDiagnostics.Any(diagnostic => diagnostic.Id is "SS0015" or "SS0029");
+        return !analyzerDiagnostics.Any(diagnostic => diagnostic.Id is "SS0015" or "SS0029" or "SS0043" or "SS0046");
     }
 
     private static string DiagnosticKey(string id, SourceSite site, string? resourceId) =>

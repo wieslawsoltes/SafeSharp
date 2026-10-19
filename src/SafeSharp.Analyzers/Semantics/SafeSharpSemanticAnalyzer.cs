@@ -18,7 +18,8 @@ public sealed class SafeSharpSemanticAnalyzer : DiagnosticAnalyzer
         SemanticDiagnostics.CaptiveScopedService,
         SemanticDiagnostics.StoredBorrowedParameter,
         SemanticDiagnostics.EscapingUsingCapture,
-        SemanticDiagnostics.IncompleteServiceAnalysis);
+        SemanticDiagnostics.IncompleteServiceAnalysis,
+        ConcurrencyDiagnostics.IncompleteContractAnalysis);
 
     public override void Initialize(AnalysisContext context)
     {
