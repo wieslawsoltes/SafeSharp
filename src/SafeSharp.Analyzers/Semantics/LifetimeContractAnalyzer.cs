@@ -20,9 +20,11 @@ public sealed class LifetimeContractAnalyzer : DiagnosticAnalyzer
         "Implementation '{0}' is incompatible with inherited contract '{1}': {2}");
     public static readonly DiagnosticDescriptor BudgetExceeded = Rule("SS0043", "Lifetime region analysis reached its budget",
         "Lifetime analysis for '{0}' stopped at the {1} budget; its return promise is not established");
+    public static readonly DiagnosticDescriptor DelegateContract = Rule("SS0047", "Callback does not satisfy the delegate lifetime contract",
+        "Callback '{0}' is incompatible with delegate '{1}': {2}");
 
     public override ImmutableArray<DiagnosticDescriptor> SupportedDiagnostics =>
-        ImmutableArray.Create(InvalidDeclaration, ReturnViolation, InheritedContract, BudgetExceeded);
+        ImmutableArray.Create(InvalidDeclaration, ReturnViolation, InheritedContract, BudgetExceeded, DelegateContract);
 
     public override void Initialize(AnalysisContext context)
     {
@@ -43,6 +45,15 @@ public sealed class LifetimeContractAnalyzer : DiagnosticAnalyzer
                 AnalyzeDeclaration(method, contracts, LifetimeContractProvider.Options(symbolContext.Options.AnalyzerConfigOptionsProvider.GetOptions(tree)),
                     symbolContext.ReportDiagnostic, symbolContext.CancellationToken);
             }, SymbolKind.Method);
+            start.RegisterSymbolAction(symbolContext =>
+            {
+                if (symbolContext.Symbol is not INamedTypeSymbol { TypeKind: TypeKind.Delegate, DelegateInvokeMethod: { } method }) return;
+                var tree = method.Locations.FirstOrDefault(location => location.IsInSource)?.SourceTree;
+                if (tree is null || !declarations.TryAdd(method, 0)) return;
+                AnalyzeDeclaration(method, contracts, LifetimeContractProvider.Options(symbolContext.Options.AnalyzerConfigOptionsProvider.GetOptions(tree)),
+                    symbolContext.ReportDiagnostic, symbolContext.CancellationToken);
+            }, SymbolKind.NamedType);
+            start.RegisterOperationAction(operationContext => LifetimeDelegateAnalysis.Analyze(operationContext, contracts, summaries), OperationKind.DelegateCreation);
             start.RegisterOperationBlockAction(blockContext =>
             {
                 if (blockContext.OwningSymbol is not IMethodSymbol method) return;
@@ -174,6 +185,6 @@ public sealed class LifetimeContractAnalyzer : DiagnosticAnalyzer
 
     private static DiagnosticDescriptor Rule(string id, string title, string message) => new(id, title, message,
         "SafeSharp.Lifetimes", DiagnosticSeverity.Warning, isEnabledByDefault: true,
-        description: "Checks explicit named lifetime regions, outlives implications, and borrowed return provenance. This does not implement higher-ranked lifetime polymorphism or a full Rust type system.",
+        description: "Checks explicit named lifetime regions, borrowed provenance, and one-binder universal outlives obligations at annotated delegate conversions. This is not a full Rust type or trait system.",
         helpLinkUri: "https://github.com/wieslawsoltes/SafeSharp/blob/main/docs/lifetime-regions.md#" + id.ToLowerInvariant());
 }

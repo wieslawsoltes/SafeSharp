@@ -27,7 +27,7 @@ internal sealed class LifetimeContractModel
         ReturnsOwned = returnsOwned;
         var names = parameters.Where(name => name is not null).Select(name => name!).ToList();
         if (returned is not null) names.Add(returned);
-        if (!method.IsStatic) names.Add("this");
+        if (HasReceiver(method)) names.Add("this");
         RegionNames = names.Distinct(StringComparer.Ordinal).OrderBy(name => name, StringComparer.Ordinal).ToImmutableArray();
     }
 
@@ -42,6 +42,7 @@ internal sealed class LifetimeContractModel
     internal bool MutableBorrow { get; }
     internal bool ReturnsOwned { get; }
     internal bool HasRegions => ReturnRegion is not null || ParameterRegions.Any(name => name is not null) || !Constraints.IsEmpty;
+    internal static bool HasReceiver(IMethodSymbol method) => !method.IsStatic && method.MethodKind != MethodKind.DelegateInvoke;
 
     internal RegionSolution Solve(RegionSolverOptions options, CancellationToken cancellationToken)
     {
@@ -103,7 +104,9 @@ internal sealed class LifetimeContractProvider
 
     internal AttributeData? Lifetime(ISymbol symbol) => symbol.GetAttributes().FirstOrDefault(attribute => Is(attribute, lifetimeAttribute));
     internal AttributeData? ReturnLifetime(IMethodSymbol method) => method.GetReturnTypeAttributes().FirstOrDefault(attribute => Is(attribute, lifetimeAttribute));
-    internal IEnumerable<AttributeData> Outlives(IMethodSymbol method) => method.GetAttributes().Where(attribute => Is(attribute, outlivesAttribute));
+    internal IEnumerable<AttributeData> Outlives(IMethodSymbol method) =>
+        (method.MethodKind == MethodKind.DelegateInvoke ? method.ContainingType.GetAttributes() : method.GetAttributes())
+        .Where(attribute => Is(attribute, outlivesAttribute));
 
     internal static RegionSolverOptions Options(AnalyzerConfigOptions options)
     {
@@ -197,7 +200,7 @@ internal sealed class LifetimeContractProvider
 
         var names = new HashSet<string>(parameters.Where(name => name is not null).Select(name => name!), StringComparer.Ordinal);
         if (returned is not null) names.Add(returned);
-        if (!method.IsStatic) names.Add("this");
+        if (LifetimeContractModel.HasReceiver(method)) names.Add("this");
         var boundsSource = method;
         var bounds = Outlives(method).ToArray();
         if (bounds.Length == 0)
@@ -250,11 +253,11 @@ internal sealed class LifetimeContractProvider
     private static void ValidateName(string? name, Location location, IMethodSymbol method, ImmutableArray<LifetimeDeclarationIssue>.Builder issues)
     {
         if (!ValidName(name, method)) issues.Add(new LifetimeDeclarationIssue(location,
-            "lifetime names must be identifiers; the reserved 'this' region is available only on instance methods"));
+            "lifetime names must be identifiers; the reserved 'this' region is available only on instance methods with an explicit receiver"));
     }
 
     private static bool ValidName(string? name, IMethodSymbol method) => name is not null &&
-        (name == "this" ? !method.IsStatic : SyntaxFacts.IsValidIdentifier(name) && !name.StartsWith("@", StringComparison.Ordinal));
+        (name == "this" ? LifetimeContractModel.HasReceiver(method) : SyntaxFacts.IsValidIdentifier(name) && !name.StartsWith("@", StringComparison.Ordinal));
 
     private static bool Is(AttributeData attribute, INamedTypeSymbol? type) => type is not null && SymbolEqualityComparer.Default.Equals(attribute.AttributeClass, type);
     internal static string? Name(AttributeData? attribute) => Argument(attribute, 0);

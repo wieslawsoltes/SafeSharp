@@ -6,7 +6,7 @@ using System.Threading;
 
 namespace SafeSharp.Reporting;
 
-/// <summary>Self-contained SVG over declared edges; cycles affect layout, never the reported topology.</summary>
+/// <summary>Self-contained SVG over exact assumptions and requirements; cycles affect layout, never the reported topology.</summary>
 internal static class HtmlRegionRenderer
 {
     private const int NodeWidth = 220;
@@ -23,8 +23,11 @@ internal static class HtmlRegionRenderer
             writer.Write(" Full diagnostic properties follow.</p>");
             return;
         }
-        writer.Write("<section class=\"region-witness\"><h4>Declared lifetime regions</h4><p class=\"muted\">An arrow from a to b means the declared constraint a : b: a outlives b. Only declared edges are drawn; proof metadata does not add edges.</p>");
-        writer.Write("<p class=\"region-legend\"><span class=\"region-source-key\">Source region</span><span class=\"region-required-key\">Required region</span><span>Other declared region</span></p>");
+        writer.Write(witness.HasRequirements
+            ? "<section class=\"region-witness\"><h4>Lifetime region obligations</h4><p class=\"muted\">An arrow from a to b means a : b: a outlives b. Solid arrows show declared delegate assumptions; dashed purple arrows show callback requirements. Only recorded constraints are drawn; proof and binding metadata do not add edges.</p>"
+            : "<section class=\"region-witness\"><h4>Declared lifetime regions</h4><p class=\"muted\">An arrow from a to b means the declared constraint a : b: a outlives b. Only declared edges are drawn; proof metadata does not add edges.</p>");
+        writer.Write("<p class=\"region-legend\"><span class=\"region-source-key\">Source region</span><span class=\"region-required-key\">Required region</span><span>");
+        writer.Write(witness.HasRequirements ? "Other region" : "Other declared region"); writer.Write("</span></p>");
         if (!witness.OtherOrigins.IsEmpty)
         {
             writer.Write("<p class=\"muted\">Other reported origins, not declared vertices: <code>");
@@ -38,34 +41,48 @@ internal static class HtmlRegionRenderer
         writer.Write(prefix); writer.Write("-title "); writer.Write(prefix); writer.Write("-description\" viewBox=\"0 0 ");
         Point(writer, width, height, ' '); writer.Write("\" width=\""); writer.Write(ReportText.Number(width));
         writer.Write("\" height=\""); writer.Write(ReportText.Number(height)); writer.Write("\"><title id=\"");
-        writer.Write(prefix); writer.Write("-title\">Declared lifetime region graph</title><desc id=\"");
-        writer.Write(prefix); writer.Write("-description\">Arrows show only recorded outlives constraints. Node labels identify source and required regions. Complete names and edges appear in the following tables.</desc><defs><marker id=\"");
-        writer.Write(prefix); writer.Write("-arrow\" markerWidth=\"8\" markerHeight=\"8\" refX=\"7\" refY=\"4\" orient=\"auto\"><path d=\"M0,0 L8,4 L0,8 Z\" fill=\"#91a6bf\"/></marker></defs>");
+        writer.Write(prefix); writer.Write("-title\">"); writer.Write(witness.HasRequirements ? "Lifetime region obligation graph" : "Declared lifetime region graph");
+        writer.Write("</title><desc id=\""); writer.Write(prefix);
+        writer.Write(witness.HasRequirements
+            ? "-description\">Solid arrows show declared assumptions; dashed purple arrows show exact callback requirements. Node labels identify source and required regions. Complete names and edges appear in the following tables.</desc><defs><marker id=\""
+            : "-description\">Arrows show only recorded outlives constraints. Node labels identify source and required regions. Complete names and edges appear in the following tables.</desc><defs><marker id=\"");
+        writer.Write(prefix); writer.Write("-arrow\" markerWidth=\"8\" markerHeight=\"8\" refX=\"7\" refY=\"4\" orient=\"auto\"><path d=\"M0,0 L8,4 L0,8 Z\" fill=\"#91a6bf\"/></marker>");
+        if (witness.HasRequirements)
+        {
+            writer.Write("<marker id=\""); writer.Write(prefix);
+            writer.Write("-requirement-arrow\" markerWidth=\"8\" markerHeight=\"8\" refX=\"7\" refY=\"4\" orient=\"auto\"><path d=\"M0,0 L8,4 L0,8 Z\" fill=\"#c9a5ff\"/></marker>");
+        }
+        writer.Write("</defs>");
         var edgeIndex = 0;
-        foreach (var edge in witness.Edges)
+        foreach (var edge in witness.AllEdges)
         {
             cancellationToken.ThrowIfCancellationRequested();
             var start = positions[edge.Longer];
             var end = positions[edge.Shorter];
             writer.Write("<path class=\"region-edge\" data-longer=\""); writer.Write(ReportText.Html(edge.Longer));
             writer.Write("\" data-shorter=\""); writer.Write(ReportText.Html(edge.Shorter));
-            writer.Write("\" fill=\"none\" stroke=\"#91a6bf\" stroke-width=\"1.6\" marker-end=\"url(#");
-            writer.Write(prefix); writer.Write("-arrow)\" d=\"");
+            if (edge.IsRequirement) writer.Write("\" data-kind=\"requirement\" stroke-dasharray=\"6 4");
+            writer.Write("\" fill=\"none\" stroke=\""); writer.Write(edge.IsRequirement ? "#c9a5ff" : "#91a6bf");
+            writer.Write("\" stroke-width=\"1.6\" marker-end=\"url(#");
+            writer.Write(prefix); writer.Write(edge.IsRequirement ? "-requirement-arrow)\" d=\"" : "-arrow)\" d=\"");
+            // Parallel assumptions and requirements retain separate visible routes, including
+            // when both kinds record the same pair. Their topology is never combined.
+            var offset = edge.IsRequirement ? 8 : 0;
             if (start.Y == end.Y && start.X != end.X)
             {
                 var forward = start.X < end.X;
                 var sx = start.X + (forward ? NodeWidth : 0);
                 var ex = end.X + (forward ? -3 : NodeWidth + 3);
-                var y = start.Y + (forward ? 24 : NodeHeight - 24);
+                var y = start.Y + (forward ? 24 : NodeHeight - 24) + offset;
                 var bend = y + (forward ? -44 : 44);
                 writer.Write('M'); Point(writer, sx, y); writer.Write(" C"); Point(writer, sx, bend);
                 writer.Write(' '); Point(writer, ex, bend); writer.Write(' '); Point(writer, ex, y);
             }
             else if (end.Y > start.Y && end.Y - start.Y == RowPitch)
             {
-                var sx = start.X + NodeWidth / 2;
+                var sx = start.X + NodeWidth / 2 + offset;
                 var sy = start.Y + NodeHeight;
-                var ex = end.X + NodeWidth / 2;
+                var ex = end.X + NodeWidth / 2 + offset;
                 var ey = end.Y - 3;
                 writer.Write('M'); Point(writer, sx, sy); writer.Write(" C"); Point(writer, sx, (sy + ey) / 2);
                 writer.Write(' '); Point(writer, ex, (sy + ey) / 2); writer.Write(' '); Point(writer, ex, ey);
@@ -73,15 +90,15 @@ internal static class HtmlRegionRenderer
             else
             {
                 var sx = start.X + NodeWidth;
-                var sy = start.Y + NodeHeight * 2 / 3;
+                var sy = start.Y + NodeHeight * 2 / 3 + offset;
                 var ex = end.X + NodeWidth + 3;
-                var ey = end.Y + NodeHeight / 3;
+                var ey = end.Y + NodeHeight / 3 + offset;
                 var lane = width - 16 - edgeIndex % 6 * 6;
                 writer.Write('M'); Point(writer, sx, sy); writer.Write(" C"); Point(writer, lane, sy + 32);
                 writer.Write(' '); Point(writer, lane, ey - 32); writer.Write(' '); Point(writer, ex, ey);
             }
             writer.Write("\"><title>"); writer.Write(ReportText.Html(edge.Longer + " : " + edge.Shorter));
-            writer.Write(" (declared outlives)</title></path>");
+            writer.Write(edge.IsRequirement ? " (callback requirement)</title></path>" : " (declared outlives)</title></path>");
             edgeIndex++;
         }
         foreach (var name in witness.Regions)
@@ -97,16 +114,17 @@ internal static class HtmlRegionRenderer
             writer.Write(witness.Color(name)); writer.Write("\" font-size=\"11\">"); writer.Write(witness.Role(name));
             writer.Write("</text><title>"); writer.Write(ReportText.Html(witness.Label(name))); writer.Write("</title></g>");
         }
-        writer.Write("</svg></div><div class=\"table-scroll\"><table><caption>Declared regions and diagnostic roles</caption><thead><tr><th scope=\"col\">Region</th><th scope=\"col\">Diagnostic role</th></tr></thead><tbody>");
+        writer.Write("</svg></div><div class=\"table-scroll\"><table><caption>");
+        writer.Write(witness.HasRequirements ? "Named regions and diagnostic roles" : "Declared regions and diagnostic roles");
+        writer.Write("</caption><thead><tr><th scope=\"col\">Region</th><th scope=\"col\">Diagnostic role</th></tr></thead><tbody>");
         foreach (var region in witness.Regions) Row(writer, region, witness.Role(region));
         writer.Write("</tbody></table></div>");
-        if (witness.Edges.IsEmpty) writer.Write("<p class=\"muted\">No outlives constraints were declared. Disconnected vertices do not imply a relationship.</p>");
+        if (witness.Edges.IsEmpty) writer.Write(witness.HasRequirements
+            ? "<p class=\"muted\">The delegate declares no outlives assumptions. Dashed callback requirements do not establish a relation between independent delegate regions.</p>"
+            : "<p class=\"muted\">No outlives constraints were declared. Disconnected vertices do not imply a relationship.</p>");
         else
-        {
-            writer.Write("<div class=\"table-scroll\"><table><caption>Declared outlives constraints</caption><thead><tr><th scope=\"col\">Longer region</th><th scope=\"col\">Shorter region</th></tr></thead><tbody>");
-            foreach (var edge in witness.Edges) Row(writer, edge.Longer, edge.Shorter);
-            writer.Write("</tbody></table></div>");
-        }
+            EdgeTable(writer, witness.HasRequirements ? "Declared delegate assumptions (solid)" : "Declared outlives constraints", witness.Edges);
+        if (witness.HasRequirements) EdgeTable(writer, "Callback outlives requirements (dashed)", witness.Requirements);
         writer.Write("</section>");
     }
 
@@ -116,8 +134,8 @@ internal static class HtmlRegionRenderer
         var indices = witness.Regions.Select((name, index) => (name, index)).ToDictionary(pair => pair.name, pair => pair.index, StringComparer.Ordinal);
         var reaches = new bool[count, count];
         for (var index = 0; index < count; index++) reaches[index, index] = true;
-        foreach (var edge in witness.Edges) reaches[indices[edge.Longer], indices[edge.Shorter]] = true;
-        // Bounded reachability groups cycles for layout only. Rendering still enumerates Edges,
+        foreach (var edge in witness.AllEdges) reaches[indices[edge.Longer], indices[edge.Shorter]] = true;
+        // Bounded reachability groups cycles for layout only. Rendering still enumerates exact edges,
         // never this matrix; transitive and reflexive relationships are not drawn as declarations.
         for (var via = 0; via < count; via++)
         for (var from = 0; from < count; from++)
@@ -129,7 +147,7 @@ internal static class HtmlRegionRenderer
         for (var pass = 0; pass < count; pass++)
         {
             var changed = false;
-            foreach (var edge in witness.Edges)
+            foreach (var edge in witness.AllEdges)
             {
                 var longer = components[indices[edge.Longer]];
                 var shorter = components[indices[edge.Shorter]];
@@ -153,6 +171,13 @@ internal static class HtmlRegionRenderer
 
     private static void Point(TextWriter writer, int x, int y, char separator = ',')
     { writer.Write(ReportText.Number(x)); writer.Write(separator); writer.Write(ReportText.Number(y)); }
+    private static void EdgeTable(TextWriter writer, string caption, IEnumerable<RegionEdge> edges)
+    {
+        writer.Write("<div class=\"table-scroll\"><table><caption>"); writer.Write(ReportText.Html(caption));
+        writer.Write("</caption><thead><tr><th scope=\"col\">Longer region</th><th scope=\"col\">Shorter region</th></tr></thead><tbody>");
+        foreach (var edge in edges) Row(writer, edge.Longer, edge.Shorter);
+        writer.Write("</tbody></table></div>");
+    }
     private static void Row(TextWriter writer, string first, string second)
     {
         writer.Write("<tr><td>"); writer.Write(ReportText.Html(first)); writer.Write("</td><td>");

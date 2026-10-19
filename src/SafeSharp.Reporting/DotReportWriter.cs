@@ -5,7 +5,7 @@ using System.Threading;
 
 namespace SafeSharp.Reporting;
 
-/// <summary>Emits control flow, reported dependency paths and declared lifetime edges as Graphviz graphs.</summary>
+/// <summary>Emits control flow, dependency paths, and exact lifetime assumptions and requirements as Graphviz graphs.</summary>
 public sealed class DotReportWriter : IAnalysisReportWriter
 {
     public void Write(AnalysisReport report, TextWriter writer, CancellationToken cancellationToken = default)
@@ -75,7 +75,9 @@ public sealed class DotReportWriter : IAnalysisReportWriter
             var prefix = "r" + ReportText.Number(diagnosticIndex);
             writer.Write("  subgraph cluster_"); writer.Write(prefix); writer.Write(" {\n    label=\"");
             writer.Write(ReportText.Dot(diagnostic.Id + (witness.CanRender
-                ? " · declared lifetime regions\nArrows: longer outlives shorter. Labels: source / required."
+                ? witness.HasRequirements
+                    ? " · lifetime region obligations\nSolid: declared assumptions. Dashed: callback requirements. Arrows: longer outlives shorter."
+                    : " · declared lifetime regions\nArrows: longer outlives shorter. Labels: source / required."
                 : " · lifetime diagnostic metadata"))); writer.Write("\";\n");
             var identifiers = witness.Regions.Select((name, index) => (name, id: prefix + "_n" + ReportText.Number(index)))
                 .ToDictionary(pair => pair.name, pair => pair.id, StringComparer.Ordinal);
@@ -87,11 +89,13 @@ public sealed class DotReportWriter : IAnalysisReportWriter
                 writer.Write(witness.Fill(region)); writer.Write("\", color=\""); writer.Write(witness.Color(region));
                 writer.Write("\", penwidth=2];\n");
             }
-            foreach (var edge in witness.Edges)
+            foreach (var edge in witness.AllEdges)
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 writer.Write("    "); writer.Write(identifiers[edge.Longer]); writer.Write(" -> "); writer.Write(identifiers[edge.Shorter]);
-                writer.Write(" [label=\"outlives\"];\n");
+                writer.Write(edge.IsRequirement
+                    ? " [label=\"requires outlives\", style=dashed, color=\"#c9a5ff\"];\n"
+                    : " [label=\"outlives\"];\n");
             }
             writer.Write("    "); writer.Write(prefix); writer.Write("_metadata [shape=note, label=\"");
             writer.Write(ReportText.Dot(witness.MetadataLabel(diagnostic))); writer.Write("\"];\n  }\n");
