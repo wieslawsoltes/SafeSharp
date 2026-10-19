@@ -358,7 +358,7 @@ internal sealed class OperationLowerer
 
     private string? Property(IPropertyReferenceOperation property, bool read)
     {
-        var owner = Evaluate(property.Instance, false);
+        var owner = SnapshotCallValue(Evaluate(property.Instance, false), property, "receiver");
         var getter = property.Property.GetMethod;
         var contract = getter is not null ? _summaries.Get(getter, _cancellationToken) : null;
         string? receiverLoan = null;
@@ -368,8 +368,8 @@ internal sealed class OperationLowerer
             Add(InstructionKind.ReserveExclusiveBorrow, property, target: receiverLoan, source: owner,
                 description: "reserve mutable getter receiver while evaluating index arguments");
         }
-        else if (owner is not null) Add(InstructionKind.Read, property, source: owner);
         var arguments = EvaluateArguments(property.Arguments, getter, contract);
+        if (owner is not null && receiverLoan is null) Add(InstructionKind.Read, property, source: owner);
         if (receiverLoan is not null)
             Add(InstructionKind.ActivateBorrow, property, source: receiverLoan, description: "activate mutable receiver at getter call");
         ActivateArguments(arguments);
@@ -382,7 +382,7 @@ internal sealed class OperationLowerer
         {
             EndArguments(arguments);
             if (receiverLoan is not null) Add(InstructionKind.ReleaseLoan, property, target: receiverLoan);
-            return result;
+            return ReleaseReceiverSnapshot(owner, property, result);
         }
 
         if (property.Property.Name == "ServiceProvider" && owner is not null && SymbolFacts.Implements(property.Type, "System.IServiceProvider"))
@@ -414,7 +414,7 @@ internal sealed class OperationLowerer
     private string? Invoke(IInvocationOperation invocation, bool awaited)
     {
         var method = invocation.TargetMethod;
-        var instance = Evaluate(invocation.Instance, false, awaited && IsCompletionWrapper(method));
+        var instance = SnapshotCallValue(Evaluate(invocation.Instance, false, awaited && IsCompletionWrapper(method)), invocation, "receiver");
         if (SymbolFacts.IsDispose(method) || SymbolFacts.IsDisposeAsync(method))
         {
             var asynchronous = SymbolFacts.IsDisposeAsync(method);
@@ -425,27 +425,27 @@ internal sealed class OperationLowerer
             // A synchronous throw must not invent an awaitable. The owner's invocation obligation is
             // discharged first; the completion obligation exists only on the successful call edge.
             MarkMayThrow(invocation);
-            if (!asynchronous || instance is null) return null;
+            if (!asynchronous || instance is null) return ReleaseReceiverSnapshot(instance, invocation, null);
             var completion = Temporary(invocation);
             Add(InstructionKind.BeginAsyncDispose, invocation, source: instance, target: completion,
                 resourceId: "async-dispose:" + invocation.Syntax.SpanStart,
                 flags: InstructionFlags.DisposalAlreadyInvoked | (invocation.IsImplicit ? InstructionFlags.Implicit : InstructionFlags.None),
                 description: "track asynchronous disposal completion");
-            return completion;
+            return ReleaseReceiverSnapshot(instance, invocation, completion);
         }
         if (IsCompletionWrapper(method))
         {
             foreach (var argument in invocation.Arguments) Evaluate(argument.Value);
             if (instance is not null) Add(InstructionKind.Read, invocation, source: instance);
             MarkMayThrow(invocation);
-            return instance;
+            return ReleaseReceiverSnapshot(instance, invocation, instance);
         }
         if (IsCompletionObservation(method))
         {
             if (instance is not null) Add(InstructionKind.CompleteAsyncDispose, invocation, source: instance,
                 description: "observe disposal completion through " + method.Name);
             MarkMayThrow(invocation);
-            return null;
+            return ReleaseReceiverSnapshot(instance, invocation, null);
         }
         var summary = _summaries.Get(method, _cancellationToken);
         if (method.ContainingType.ToDisplayString() == "SafeSharp.Ownership" && method.Name is "Move" or "Borrow" or "BorrowMut" && invocation.Arguments.Length == 1)
@@ -465,8 +465,8 @@ internal sealed class OperationLowerer
             Add(InstructionKind.ReserveExclusiveBorrow, invocation, target: receiverLoan, source: instance,
                 description: "reserve mutable receiver while evaluating arguments");
         }
-        else if (instance is not null) Add(InstructionKind.Read, invocation, source: instance);
         var arguments = EvaluateArguments(invocation.Arguments, method, summary);
+        if (instance is not null && receiverLoan is null) Add(InstructionKind.Read, invocation, source: instance);
         if (receiverLoan is not null)
             Add(InstructionKind.ActivateBorrow, invocation, source: receiverLoan, description: "activate mutable receiver at call");
         ActivateArguments(arguments);
@@ -481,7 +481,7 @@ internal sealed class OperationLowerer
         {
             EndArguments(arguments);
             if (receiverLoan is not null) Add(InstructionKind.ReleaseLoan, invocation, target: receiverLoan);
-            return result;
+            return ReleaseReceiverSnapshot(instance, invocation, result);
         }
 
         if (SymbolFacts.IsPoolRent(method))
@@ -534,7 +534,35 @@ internal sealed class OperationLowerer
         internal List<(string Place, IOperation Site)> PassedValues { get; } = new();
         internal List<(string Place, IOperation Site, bool Reserved, bool Mutable)> Loans { get; } = new();
         internal List<(string Place, IOperation Site, string Description, int Order)> Disposals { get; } = new();
+        internal List<(string Place, IOperation Site, string Description)> Transfers { get; } = new();
+        internal List<(string Place, IOperation Site)> Snapshots { get; } = new();
     }
+
+    private string? SnapshotCallValue(string? source, IOperation operation, string role)
+    {
+        if (source is null) return null;
+        var snapshot = "$t:call-" + role + ":" + operation.Syntax.SpanStart + ":" + operation.Kind;
+        Add(InstructionKind.Alias, operation, target: snapshot, source: source,
+            description: "capture evaluated " + role + " value until the call completes");
+        ForgetTemporary(source, operation);
+        return snapshot;
+    }
+
+    private string? ReleaseReceiverSnapshot(string? receiver, IOperation operation, string? result)
+    {
+        if (receiver is null) return result;
+        if (result == receiver)
+        {
+            result = Temporary(operation);
+            Add(InstructionKind.Alias, operation, target: result, source: receiver, description: "preserve returned receiver value");
+        }
+        ReleaseCallSnapshot(receiver, operation);
+        return result;
+    }
+
+    private void ReleaseCallSnapshot(string snapshot, IOperation operation) =>
+        Add(InstructionKind.ReleaseLoan, operation, target: snapshot, source: snapshot,
+            description: "end evaluated call value after preserving its result");
 
     private string? ReturnedBorrow(IOperation operation, IMethodSymbol method, MethodSummary summary, string? receiver, CallArguments arguments)
     {
@@ -573,7 +601,7 @@ internal sealed class OperationLowerer
         if (source is not null && method.Parameters.Length == 1 && summary.BorrowedFrom == method.Parameters[0].Name)
         {
             result = Temporary(conversion);
-            var origin = arguments.ParameterLoans.TryGetValue(0, out var loan) ? loan : source;
+            var origin = arguments.ParameterLoans.TryGetValue(0, out var loan) ? loan : arguments.Values[0];
             Add(summary.MutableBorrow ? InstructionKind.BorrowExclusive : InstructionKind.BorrowShared,
                 conversion, target: result, source: origin, description: "borrow returned by conversion operator");
         }
@@ -604,11 +632,16 @@ internal sealed class OperationLowerer
     private void AddArgument(CallArguments result, string source, IParameterSymbol? parameter, IOperation argument,
         IMethodSymbol? method, MethodSummary? summary)
     {
+        if (parameter is null || parameter.RefKind == RefKind.None)
+        {
+            source = SnapshotCallValue(source, argument, "argument:" + (parameter?.Ordinal ?? -1))!;
+            result.Snapshots.Add((source, argument));
+        }
         if (parameter is not null) result.Values[parameter.Ordinal] = source;
         // Out slots are written by the completed call. No incoming value is read or consumed.
         if (parameter?.RefKind == RefKind.Out) return;
         if (parameter is not null && (SymbolFacts.HasAttribute(parameter, "Consumes") || SymbolFacts.HasAttribute(parameter, "Owned")))
-            Add(InstructionKind.Move, argument, source: source, description: "transfer to " + method?.Name + "(" + parameter.Name + ")");
+            result.Transfers.Add((source, argument, "transfer to " + method?.Name + "(" + parameter.Name + ") at call entry"));
         else if (parameter is not null && (SymbolFacts.HasAttribute(parameter, "Borrowed") || SymbolFacts.HasAttribute(parameter, "BorrowedMut") ||
             parameter.RefKind is RefKind.Ref or RefKind.In or RefKind.RefReadOnlyParameter))
         {
@@ -639,6 +672,8 @@ internal sealed class OperationLowerer
             Add(InstructionKind.ActivateBorrow, loan.Site, source: loan.Place, description: "activate mutable argument at call");
         foreach (var loan in arguments.Loans.Where(loan => loan.Mutable))
             Add(InstructionKind.Write, loan.Site, source: loan.Place, description: "callee may mutate borrowed argument");
+        foreach (var transfer in arguments.Transfers)
+            Add(InstructionKind.Move, transfer.Site, source: transfer.Place, description: transfer.Description);
         foreach (var disposal in arguments.Disposals.OrderBy(disposal => disposal.Order))
         {
             Add(InstructionKind.Dispose, disposal.Site, source: disposal.Place, description: disposal.Description);
@@ -659,6 +694,7 @@ internal sealed class OperationLowerer
     private void EndArguments(CallArguments arguments)
     {
         foreach (var loan in arguments.Loans) Add(InstructionKind.ReleaseLoan, loan.Site, target: loan.Place);
+        foreach (var snapshot in arguments.Snapshots) ReleaseCallSnapshot(snapshot.Place, snapshot.Site);
     }
 
     private static bool IsFrameworkAwaitableMethod(IMethodSymbol method)

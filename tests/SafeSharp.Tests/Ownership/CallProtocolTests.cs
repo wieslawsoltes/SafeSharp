@@ -20,6 +20,7 @@ public sealed class CallProtocolTests
             [Mutates] public void Append(int count) { }
             [Mutates] public void Combine([Borrowed] Resource other) { }
             [Mutates, ReturnsBorrowed("this", true)] public Resource EditAndReturn(int count) => this;
+            [ReturnsBorrowed("this")] public Resource Self(Resource ignored) => this;
             public void Dispose() { }
         }
         sealed class AsyncResource : IAsyncDisposable
@@ -365,6 +366,95 @@ public sealed class CallProtocolTests
             }
             """;
         Assert.Empty(await AnalyzerTestHost.GetDiagnosticsAsync(source));
+    }
+
+    [Theory]
+    [InlineData("first = replacement")]
+    [InlineData("Replace(out first, replacement)")]
+    public async Task InferredDisposalUsesTheValueEvaluatedBeforeALaterArgumentAssignment(string laterArgument)
+    {
+        var source = Source("void Release(Resource original, Resource ignored) { original.Dispose(); } " +
+            "Resource Replace(out Resource target, Resource replacement) { target = replacement; return replacement; } " +
+            "void M() { var first = new Resource(); var replacement = new Resource(); " +
+            "Release(first, " + laterArgument + "); first.Read(); replacement.Dispose(); }");
+        Assert.Empty(await AnalyzerTestHost.GetDiagnosticsAsync(source));
+    }
+
+    [Fact]
+    public async Task ReturnedArgumentBorrowKeepsItsEvaluatedOriginalAfterTheLocalIsReassigned()
+    {
+        var (source, span) = ExtractMarker(Source("[ReturnsBorrowed(\"original\")] Resource First(Resource original, Resource ignored) => original; " +
+            "void M() { var first = new Resource(); var original = first; var replacement = new Resource(); " +
+            "var view = First(first, first = replacement); original.Dispose(); [|view.Read()|]; replacement.Dispose(); }"));
+        AssertDiagnosticAt(await AnalyzerTestHost.GetDiagnosticsAsync(source), "SS0001", span);
+    }
+
+    [Theory]
+    [InlineData("First(first, first = replacement)")]
+    [InlineData("first.Self(first = replacement)")]
+    public async Task ReturnedArgumentOrReceiverBorrowDoesNotSwitchToTheReplacement(string call)
+    {
+        var source = Source("[ReturnsBorrowed(\"original\")] Resource First(Resource original, Resource ignored) => original; " +
+            "void M() { var first = new Resource(); var original = first; var replacement = new Resource(); " +
+            "var view = " + call + "; replacement.Dispose(); view.Read(); original.Dispose(); }");
+        Assert.Empty(await AnalyzerTestHost.GetDiagnosticsAsync(source));
+    }
+
+    [Theory]
+    [InlineData("Consumes", "Consume(owner, owner.Count)")]
+    [InlineData("Owned", "Consume(owner, owner.Count)")]
+    [InlineData("Consumes", "new Sink(owner, owner.Count)")]
+    [InlineData("Owned", "new Sink(owner, owner.Count)")]
+    public async Task CallTimeTransferAllowsLaterArgumentsToReadTheUntransferredOwner(string attribute, string call)
+    {
+        var source = Source("void Consume([" + attribute + "] Resource value, int count) { value.Dispose(); } " +
+            "sealed class Sink { public Sink([" + attribute + "] Resource value, int count) { value.Dispose(); } } " +
+            "void M() { var owner = new Resource(); " + call + "; }");
+        Assert.Empty(await AnalyzerTestHost.GetDiagnosticsAsync(source));
+    }
+
+    [Fact]
+    public async Task ExplicitOwnershipMoveStillInvalidatesTheOwnerDuringArgumentEvaluation()
+    {
+        var (source, span) = ExtractMarker(Source("void Consume([Consumes] Resource value, int count) { value.Dispose(); } " +
+            "void M() { var owner = new Resource(); Consume(Ownership.Move(owner), [|owner.Count|]); }"));
+        AssertDiagnosticAt(await AnalyzerTestHost.GetDiagnosticsAsync(source), "SS0004", span);
+    }
+
+    [Fact]
+    public async Task AThrowingLaterArgumentRetainsTheOriginalCleanupObligationUntilCallEntry()
+    {
+        var source = Source("void Consume([Consumes] Resource value, int count) { value.Dispose(); } " +
+            "int Fail() => throw new InvalidOperationException(); " +
+            "void M() { var owner = new Resource(); try { Consume(owner, Fail()); } catch { } }");
+        var allocation = source.LastIndexOf("new Resource()", StringComparison.Ordinal);
+        var diagnostic = AssertDiagnosticAt(await AnalyzerTestHost.GetDiagnosticsAsync(source), "SS0003", new TextSpan(allocation, "new Resource()".Length));
+        Assert.Equal("Possible", diagnostic.Properties["SafeSharp.Certainty"]);
+    }
+
+    [Fact]
+    public async Task AnAbandonedArgumentSnapshotCannotHideAnOwnerOverwrittenInTheCatch()
+    {
+        var (source, span) = ExtractMarker(Source("void Consume([Consumes] Resource value, int count) { value.Dispose(); } " +
+            "int Fail() => throw new InvalidOperationException(); " +
+            "void M() { var owner = new Resource(); try { Consume(owner, Fail()); } catch { [|owner = new Resource()|]; owner.Dispose(); } }"));
+        AssertDiagnosticAt(await AnalyzerTestHost.GetDiagnosticsAsync(source), "SS0011", span);
+    }
+
+    [Fact]
+    public async Task ACompletionWrapperPreservesItsEvaluatedReceiverAcrossArgumentAssignment()
+    {
+        var source = Source("async Task M() { var resource = new AsyncResource(); var pending = resource.DisposeAsync(); " +
+            "var configured = pending.ConfigureAwait((pending = default).IsCompleted); await configured; }");
+        Assert.Empty(await AnalyzerTestHost.GetDiagnosticsAsync(source));
+    }
+
+    [Fact]
+    public async Task AnOrdinaryReceiverIsCheckedAfterLaterArgumentsInvalidateItsCapturedValue()
+    {
+        var (source, span) = ExtractMarker(Source("void M() { var owner = new Resource(); " +
+            "var moved = [|owner.Self(Ownership.Move(owner))|]; moved.Dispose(); }"));
+        AssertDiagnosticAt(await AnalyzerTestHost.GetDiagnosticsAsync(source), "SS0004", span);
     }
 
     private static AnalysisResult AnalyzeMethod(string source)

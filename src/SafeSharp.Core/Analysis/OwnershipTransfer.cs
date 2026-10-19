@@ -398,9 +398,15 @@ internal sealed class OwnershipTransfer
             var completion = resource.Kind == ResourceKind.AsyncDisposalCompletion;
             var carried = incoming.Where(value => value.ResourceId == resource.Id).ToArray();
             if (carried.Any(value => !completion || value.CoversResource && !value.MayBeMoved && value.Projection.Length == 0)) continue;
+            // Call snapshots represent values on the frontend's evaluation stack. An exceptional
+            // edge can abandon that stack without executing its normal ReleaseLoan instructions.
+            // A dead snapshot is not a surviving handle; live snapshots and ordinary aliases are.
             var otherReferences = completion && liveAfter is not null
                 ? liveAfter.Where(place => place != target && !PlaceRelations.IsStrictDescendant(place, target)).SelectMany(state.Resolve)
-                : state.Places.Where(pair => pair.Key != target && !PlaceRelations.IsStrictDescendant(pair.Key, target)).SelectMany(pair => pair.Value.Values);
+                : state.Places.Where(pair => pair.Key != target && !PlaceRelations.IsStrictDescendant(pair.Key, target) &&
+                    (!pair.Key.StartsWith("$t:call-", StringComparison.Ordinal) || liveAfter is null ||
+                     liveAfter.Any(live => live == pair.Key || PlaceRelations.IsStrictDescendant(live, pair.Key))))
+                    .SelectMany(pair => pair.Value.Values);
             var retained = otherReferences.Where(value => value.ResourceId == resource.Id && value.LoanId is null && !value.DefinitelyMoved
                     && (value.Availability & ReferenceAvailability.Available) != 0).ToArray();
             if (retained.Any(value => value.CoversResource && !value.MayBeMoved && value.Projection.Length == 0)) continue;
