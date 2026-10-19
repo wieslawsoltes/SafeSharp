@@ -5,10 +5,14 @@ using System.Threading;
 
 namespace SafeSharp.Core.Regions;
 
-/// <summary>Solves explicit region outlives relations with iterative SCC analysis and deterministic proof-producing closure.</summary>
+/// <summary>Solves explicit region outlives relations with indexed SCC analysis and compact shortest-path forests.</summary>
 /// <remarks>
 /// Original implementation inspired by Rust's universal-region relations and outlives propagation:
 /// https://rustc-dev-guide.rust-lang.org/borrow-check/region-inference.html.
+/// Indexed region identities and separating solving from diagnostic witnesses also follow the design in
+/// https://github.com/rust-lang/rust/blob/f8297e351a40c1439a467bbbb6879088047f50b3/compiler/rustc_borrowck/src/region_infer/mod.rs.
+/// This is an original C# adaptation. It keeps deterministic breadth-first predecessor forests rather
+/// than rustc's program-point region values; complete witness paths are materialized only when queried.
 /// Unlike rustc's full region inference, this solver does not introduce universes, placeholders,
 /// higher-ranked binders, type tests, or every program-point region element.
 /// </remarks>
@@ -26,13 +30,18 @@ public sealed class RegionConstraintSolver
         {
             var names = problem.Regions;
             var index = names.Select((name, ordinal) => new { name, ordinal }).ToDictionary(item => item.name, item => item.ordinal, StringComparer.Ordinal);
-            var outgoing = Enumerable.Range(0, names.Length).Select(_ => new List<RegionConstraint>()).ToArray();
+            var outgoing = Enumerable.Range(0, names.Length).Select(_ => new List<int>()).ToArray();
             var incoming = Enumerable.Range(0, names.Length).Select(_ => new List<int>()).ToArray();
-            foreach (var edge in problem.Constraints)
+            var sources = new int[problem.Constraints.Length];
+            var targets = new int[problem.Constraints.Length];
+            for (var ordinal = 0; ordinal < problem.Constraints.Length; ordinal++)
             {
                 budget.Step();
-                outgoing[index[edge.Longer]].Add(edge);
-                incoming[index[edge.Shorter]].Add(index[edge.Longer]);
+                var edge = problem.Constraints[ordinal];
+                var source = sources[ordinal] = index[edge.Longer];
+                var target = targets[ordinal] = index[edge.Shorter];
+                outgoing[source].Add(ordinal);
+                incoming[target].Add(source);
             }
 
             // Kosaraju's two iterative passes avoid recursion on large or adversarial cycles.
@@ -52,7 +61,7 @@ public sealed class RegionConstraintSolver
                     visited[item.Node] = true;
                     stack.Push((item.Node, true));
                     for (var edge = outgoing[item.Node].Count - 1; edge >= 0; edge--)
-                        stack.Push((index[outgoing[item.Node][edge].Shorter], false));
+                        stack.Push((targets[outgoing[item.Node][edge]], false));
                 }
             }
             Array.Clear(visited, 0, visited.Length);
@@ -76,44 +85,36 @@ public sealed class RegionConstraintSolver
                 components.Add(new RegionComponent(members));
             }
 
-            var implications = new List<RegionProof>();
+            // One predecessor edge per reachable pair is sufficient to retain every shortest proof.
+            // Expanding every path here takes cubic space/time for a chain; compiler checks usually
+            // need only a few witnesses and otherwise query reachability without constructing one.
+            var predecessors = new int[names.Length][];
+            var queue = new int[names.Length];
             for (var root = 0; root < names.Length; root++)
             {
-                var predecessor = new RegionConstraint?[names.Length];
-                Array.Clear(visited, 0, visited.Length);
-                visited[root] = true;
-                var queue = new Queue<int>();
-                queue.Enqueue(root);
-                while (queue.Count > 0)
+                budget.Step();
+                var predecessor = new int[names.Length];
+                for (var target = 0; target < names.Length; target++) predecessor[target] = -1;
+                predecessor[root] = -2; // The root is reachable without a fabricated constraint.
+                predecessors[root] = predecessor;
+                var head = 0;
+                var tail = 0;
+                queue[tail++] = root;
+                while (head < tail)
                 {
                     budget.Step();
-                    var node = queue.Dequeue();
-                    foreach (var edge in outgoing[node])
+                    var node = queue[head++];
+                    foreach (var ordinal in outgoing[node])
                     {
                         budget.Step();
-                        var target = index[edge.Shorter];
-                        if (visited[target]) continue;
-                        visited[target] = true;
-                        predecessor[target] = edge;
-                        queue.Enqueue(target);
+                        var target = targets[ordinal];
+                        if (predecessor[target] != -1) continue;
+                        predecessor[target] = ordinal;
+                        queue[tail++] = target;
                     }
-                }
-                for (var target = 0; target < names.Length; target++)
-                {
-                    if (!visited[target]) continue;
-                    var path = new List<RegionConstraint>();
-                    for (var current = target; current != root;)
-                    {
-                        budget.Step();
-                        var edge = predecessor[current]!;
-                        path.Add(edge);
-                        current = index[edge.Longer];
-                    }
-                    path.Reverse();
-                    implications.Add(new RegionProof(names[root], names[target], path));
                 }
             }
-            return new RegionSolution(true, null, budget.Steps, components, implications);
+            return new RegionSolution(true, null, budget.Steps, names, problem.Constraints, sources, predecessors, components);
         }
         catch (SolveBudgetExceededException)
         {

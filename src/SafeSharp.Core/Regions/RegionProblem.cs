@@ -53,7 +53,8 @@ public sealed class RegionProblem
     }
 }
 
-/// <summary>Finite resource limits for SCC discovery, implication closure, and proof construction.</summary>
+/// <summary>Finite resource limits for SCC discovery, implication closure, and shortest-path predecessor construction.</summary>
+/// <remarks>Complete diagnostic paths are expanded lazily from the bounded predecessor forest.</remarks>
 public sealed class RegionSolverOptions
 {
     public RegionSolverOptions(int maxRegions = 256, int maxConstraints = 4096, int maxSteps = 100000)
