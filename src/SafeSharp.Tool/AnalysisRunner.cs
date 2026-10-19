@@ -128,7 +128,11 @@ internal static class AnalysisRunner
         var analyzerExecution = new CompilationWithAnalyzersOptions(analyzerOptions,
             (exception, _, _) => analyzerFailures.Enqueue(exception), concurrentAnalysis: true,
             logAnalyzerExecutionTime: false, reportSuppressedDiagnostics: true);
-        var analyzerDiagnostics = await compilation.WithAnalyzers(Analyzers, analyzerExecution)
+        // Diagnostic suppression is a presentation setting, not evidence that an analysis
+        // completed. Keep budget markers enabled during the single analyzer execution and
+        // restore the user's configuration separately when producing the visible report.
+        var executionCompilation = CompletenessDiagnostics.EnableBudgetDiagnostics(compilation);
+        var analyzerDiagnostics = await executionCompilation.WithAnalyzers(Analyzers, analyzerExecution)
             .GetAnalyzerDiagnosticsAsync(cancellationToken).ConfigureAwait(false);
         if (!analyzerFailures.IsEmpty || analyzerDiagnostics.Any(diagnostic => diagnostic.Id is "AD0001" or "AD0002"))
             throw new ToolException("An analyzer failed; analysis is incomplete. " +
@@ -139,8 +143,11 @@ internal static class AnalysisRunner
         results.AddRange(captured);
         var engineIssues = captured.SelectMany(result => result.Issues.Select(issue => (Result: result, Issue: issue)))
             .GroupBy(item => DiagnosticKey(item.Issue.Id, item.Issue.Site, item.Issue.ResourceId)).ToDictionary(group => group.Key, group => group.First());
-        foreach (var diagnostic in analyzerDiagnostics.Where(diagnostic => !diagnostic.IsSuppressed && diagnostic.Severity != DiagnosticSeverity.Hidden))
+        foreach (var diagnostic in CompletenessDiagnostics.GetEffectiveDiagnostics(analyzerDiagnostics,
+                     compilation, analyzerOptions, cancellationToken)
+                     .Where(diagnostic => !diagnostic.IsSuppressed && diagnostic.Severity != DiagnosticSeverity.Hidden))
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var site = GetSite(diagnostic.Location);
             var related = diagnostic.AdditionalLocations.Select(GetSite).ToArray();
             var severity = diagnostic.Severity switch
@@ -159,7 +166,7 @@ internal static class AnalysisRunner
             else diagnostics.Add(new ReportDiagnostic(diagnostic.Id, diagnostic.GetMessage(), site, severity,
                 diagnostic.Descriptor.Title.ToString(), relatedLocations: related, properties: diagnostic.Properties));
         }
-        return !analyzerDiagnostics.Any(diagnostic => diagnostic.Id is "SS0015" or "SS0029" or "SS0043" or "SS0046");
+        return !analyzerDiagnostics.Any(diagnostic => CompletenessDiagnostics.IsBudgetDiagnostic(diagnostic.Id));
     }
 
     private static string DiagnosticKey(string id, SourceSite site, string? resourceId) =>

@@ -7,7 +7,7 @@ SafeSharp separates analysis from presentation. The Roslyn analyzers run inside 
 After a package version is published:
 
 ```sh
-dotnet tool install --global SafeSharp.Tool --version 0.1.0-preview.1
+dotnet tool install --global SafeSharp.Tool --version 0.2.0-preview.1
 safesharp --project src/App/App.csproj --format html --output artifacts/ownership.html
 safesharp --solution App.sln --format sarif --output artifacts/ownership.sarif
 ```
@@ -17,7 +17,7 @@ For a package built from this checkout:
 ```sh
 dotnet pack src/SafeSharp.Tool/SafeSharp.Tool.csproj -c Release -o artifacts/packages
 dotnet tool install --tool-path artifacts/tools SafeSharp.Tool \
-  --add-source artifacts/packages --version 0.1.0-preview.1
+  --add-source artifacts/packages --version 0.2.0-preview.1
 artifacts/tools/safesharp --project samples/SafeSharp.Sample/SafeSharp.Sample.csproj \
   --format html --output artifacts/sample-ownership.html
 ```
@@ -56,7 +56,7 @@ Standalone source mode has no project system. It uses the tool's .NET runtime ta
 | `2` | Invalid input, restore/load/compiler failure, analyzer exception, or analysis budget exhaustion. |
 | `130` | Canceled, including Ctrl+C. |
 
-The default threshold is `warning`; informational diagnostics remain in the report. `--fail-on none` permits diagnostics without failing a CI job, but does not convert an incomplete or failed analysis into success. Compilation errors prevent an ownership report from being generated for invalid source. Workspace failures and analyzer exceptions are surfaced explicitly.
+The default threshold is `warning`; informational diagnostics remain in the report. `--fail-on none` permits diagnostics without failing a CI job, but does not convert an incomplete or failed analysis into success. SS0015, SS0029, SS0043 and SS0046 remain incompleteness markers even when suppressed in the compiler-host results. The CLI enables these markers for its single analyzer-catalog execution, records whether an analysis exhausted its budget, then reapplies the original diagnostic policy to the visible report. Per-rule, category and global analyzer severities, pragmas, `SuppressMessage`, `NoWarn`, warning levels and warning promotion retain their compiler semantics. This prevents a hidden budget diagnostic from turning an incomplete check into successful verification. Compilation errors prevent an ownership report from being generated for invalid source. Workspace failures and analyzer exceptions are surfaced explicitly.
 
 Report output goes to stdout unless `--output` is supplied. Progress and errors go to stderr. A file output is written to a temporary sibling and replaced after successful rendering, so a canceled or failed rendering does not truncate an existing report. No generated timestamp is included in a report.
 
@@ -77,9 +77,10 @@ The HTML report includes:
 - A method selector and name filter.
 - An SVG graph of the actual lowered basic blocks and successor edges. Select a block to jump to its state inspector; scroll to pan and use the zoom controls to adjust scale.
 - Every captured instruction with the state before and after it, plus the engine's actual live-before/live-after place sets.
-- Resource identities, ownership obligations, possible lifecycle states, aliases, moved field projections, active loans, reborrow parents, and suspension permissions.
+- Resource identities, ownership obligations, resource/completion kinds, possible lifecycle states, aliases, moved field projections, reserved and active loans, activation sites, reborrow parents, and suspension permissions.
 - Nullability, potentially absent references and loans, resource coverage of projections, and explicit infeasible-state markers for pruned branches.
 - Diagnostic metadata and diagrams of the recorded dependency service, implementation, and lifetime paths for captive-service diagnostics.
+- Declared lifetime-region graphs with required-return and candidate-source roles, outlives constraints, equivalence components and recorded proof metadata. Isolated regions remain visible.
 
 The report has no network dependency, external JavaScript library, or graph-rendering service. SVG diagrams are rendered by the browser. The method filter and zoom controls use a fixed inline script; source text is never interpolated into JavaScript. Source names, diagnostic text, graph labels, and metadata cross explicit HTML/XML escaping boundaries. With JavaScript disabled, all methods and the native `<details>` inspectors remain available.
 
@@ -108,9 +109,11 @@ report
         index, instruction, liveBefore[], liveAfter[], before, after
 ```
 
-Each state contains `isReachable`, `places`, `resources`, and `loans`. Places expose `mayBeNull`; references expose `mayBeAbsent`, `coversResource`, and field-move projections; loans expose `mayBeAbsent` along with their kind and reborrow parent. The JSON includes all captured facts; the writer does not infer new aliases or invent histories. Flag values such as `Alive, Disposed` represent joined possibilities, rather than one concrete object's simultaneous runtime state.
+Each state contains `isReachable`, `places`, `resources`, and `loans`. Places expose `mayBeNull`; references expose `mayBeAbsent`, `coversResource`, and field-move projections; loans expose `mayBeAbsent`, `phase`, activation evidence, kind and reborrow parent. Resources distinguish ordinary resources from asynchronous disposal completions and retain the IDs of disposed resources represented by each completion. The JSON includes all captured facts; the writer does not infer new aliases or invent histories. Flag values such as `Alive, Disposed` or `Reserved, Active` represent joined possibilities, rather than one concrete object's simultaneous runtime state.
 
 `Disposed` records a recognized disposal invocation. The analyzer's release obligation is discharged before an exception from the disposer body propagates; it does not establish that partial or throwing cleanup released every underlying resource successfully.
+
+`Pending` and `Completed` describe the separate completion-observation obligation. A resource may have a recognized disposal invocation while its returned completion remains pending. Awaiting that completion observes the obligation even if the await later propagates a fault. The report preserves this distinction; it does not certify successful physical cleanup or repeated-await validity for arbitrary `ValueTask` instances.
 
 The top-level `diagnostics` list is the compiler-host result when the CLI is used: configured severity, suppressions, and the complete analyzer catalog are honored. The per-method `issues` list is the underlying engine result before compiler diagnostic suppression. An issue can therefore be visible in raw method facts while being absent from the top-level diagnostics. This distinction allows inspection of suppressed findings without changing a build policy.
 
@@ -122,7 +125,7 @@ SARIF output includes the analyzer identity, rule table, configured diagnostic l
 
 Source paths are encoded as file URIs. Windows drive and UNC paths are recognized independently of the host operating system. Relative source paths can use the report's explicit `%SRCROOT%` base. An unavailable source location does not acquire a fabricated file or line number.
 
-Ownership provenance is emitted through `codeFlows` and `relatedLocations`. These code flows are labeled **abstract provenance**. A fixed-point join may combine facts from multiple paths, and SafeSharp does not claim that the listed evidence is a concrete executable counterexample. `executionOrder` is not manufactured for such evidence. Service diagnostics retain their actual `SafeSharp.DependencyPath`, `SafeSharp.DependencyServices`, and `SafeSharp.DependencyLifetimes` properties.
+Ownership provenance is emitted through `codeFlows` and `relatedLocations`. These code flows are labeled **abstract provenance**. A fixed-point join may combine facts from multiple paths, and SafeSharp does not claim that the listed evidence is a concrete executable counterexample. `executionOrder` is not manufactured for such evidence. Service diagnostics retain their actual `SafeSharp.DependencyPath`, `SafeSharp.DependencyServices`, and `SafeSharp.DependencyLifetimes` properties. Region and concurrency diagnostic properties are retained without translating a failed contract into an invented runtime trace.
 
 The report follows the [OASIS SARIF 2.1.0 specification](https://docs.oasis-open.org/sarif/sarif/v2.1.0/os/sarif-v2.1.0-os.html). SARIF carries diagnostic results; use JSON or HTML for the complete ownership state lattice and CFG.
 
@@ -134,6 +137,10 @@ safesharp --project App.csproj --format mermaid --output ownership.mmd
 ```
 
 Each method becomes a subgraph, and each successor relation becomes an edge. Captive-service diagnostics with a recorded `SafeSharp.DependencyPath` additionally produce a dependency-witness subgraph. These edges preserve the reported path; they do not reconstruct every service registration in a container. Service and lifetime labels appear when the corresponding metadata paths have matching lengths.
+
+Lifetime diagnostics carrying `SafeSharp.RegionNames` and `SafeSharp.RegionConstraints` additionally produce a region subgraph. Its edges are the declared outlives constraints. The renderer preserves isolated names, cycles and source/required roles; it does not add reflexive edges, transitive closure edges or nonexistent proof paths. `SafeSharp.RegionProof` and `SafeSharp.RegionComponents` remain recorded evidence beside the graph. Non-region origins use explicit tokens such as `<Unknown>`, `<Local>` and `<Null>`, so they cannot be confused with valid declared region names.
+
+Region graph previews are bounded at 64 names, 256 distinct edges and 65,536 characters per property. Malformed or oversized metadata produces an explicit unavailable-preview explanation while the raw properties remain available. No partial graph is presented as the complete constraint set. The JSON and SARIF diagnostic properties retain the original evidence independently of these visualization limits.
 
 Node identifiers are generated independently from source names. DOT string quoting and Mermaid entity escaping prevent names from becoming graph directives. The raw Mermaid output is intended for a Mermaid-capable renderer; it contains no Markdown fences. For a large solution, use the HTML method selector or consume the JSON to focus on selected methods.
 
@@ -168,6 +175,6 @@ Snapshot capture deliberately remains opt-in in the core engine. The compiler an
 
 ## Verification
 
-The reporting test suite runs real core analysis before checking serialized states and loan lifetimes. It covers all-format determinism under a different process culture, exact URI and UTF-16 coordinate handling, missing snapshots, budget failure, authoritative host severity/suppression, arbitrary diagnostic metadata, Unicode/control-character round trips, cancellation, and HTML/DOT/Mermaid injection boundaries. The CLI is additionally exercised against standalone files, MSBuild projects, and the installed local tool package.
+The reporting test suite runs real core analysis before checking serialized states, loan phases, activation evidence and completion obligations. It also covers declared region graphs, equivalence cycles, disconnected names, malformed/oversized metadata, all-format determinism under a different process culture, exact URI and UTF-16 coordinate handling, missing snapshots, budget failure, authoritative host severity/suppression, arbitrary diagnostic metadata, Unicode/control-character round trips, cancellation, and HTML/DOT/Mermaid injection boundaries. The CLI is additionally exercised against standalone files, MSBuild projects, and the installed local tool package.
 
 For the semantic guarantees and their scope, see [the Rust design comparison](rust-design.md), [contracts and semantic analysis](contracts-and-semantics.md), and [the diagnostic reference](diagnostics.md).
