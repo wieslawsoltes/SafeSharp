@@ -16,12 +16,24 @@ public enum InstructionKind
     /// <summary>Observes the asynchronous disposal completion referenced by Source.</summary>
     CompleteAsyncDispose,
     /// <summary>Joins the current Target value with Source as alternative alias origins.</summary>
-    MergeAlias
+    MergeAlias,
+    /// <summary>Creates a carrier whose successful completion will yield an owned result; Flags describe that result.</summary>
+    BeginAsyncFactory,
+    /// <summary>Observes a factory carrier before an await/GetResult fault boundary, without assuming a result was produced.</summary>
+    ObserveAsyncFactory,
+    /// <summary>Receives a result after successful completion, preserving one payload identity across carrier aliases and repeated receives.</summary>
+    ReceiveAsyncResult,
+    /// <summary>Binds an existing result identity to a framework carrier, preserving ownership and loans; DeferredAsyncResult marks a promised result whose completion is not yet observed.</summary>
+    BindAsyncResult
 }
 
 public enum ResourceOwnership { Owned, Borrowed, External, Scoped }
-public enum ResourceKind { Resource, AsyncDisposalCompletion }
+public enum ResourceKind { Resource, AsyncDisposalCompletion, AsyncFactoryCarrier }
 public enum BorrowKind { Shared, Exclusive }
+
+/// <summary>Whether a carrier's result identity is deferred or represented by existing references in an execution.</summary>
+[Flags]
+public enum AsyncResultState { None = 0, Deferred = 1, Materialized = 2 }
 
 /// <summary>Possible phases of a loan. A joined state can retain both reserved and active alternatives.</summary>
 [Flags]
@@ -43,7 +55,11 @@ public enum InstructionFlags
     /// <summary>The allocation result or input can be null; an absent resource alternative is retained.</summary>
     MayBeNull = 256,
     /// <summary>BeginAsyncDispose creates only the completion because the frontend already emitted the disposal invocation before an exception boundary.</summary>
-    DisposalAlreadyInvoked = 512
+    DisposalAlreadyInvoked = 512,
+    /// <summary>BindAsyncResult represents an existing result promised by an asynchronous borrowed-return contract, without claiming completed execution.</summary>
+    DeferredAsyncResult = 1024,
+    /// <summary>A final borrowed-return Read validates any represented asynchronous result after cleanup without transferring the borrowed value.</summary>
+    ValidateReturnedResult = 2048
 }
 
 /// <summary>
@@ -69,14 +85,16 @@ public sealed class FlowInstruction
         if ((kind == InstructionKind.Allocate || kind == InstructionKind.Alias ||
             kind == InstructionKind.BorrowShared || kind == InstructionKind.BorrowExclusive ||
             kind == InstructionKind.ReserveExclusiveBorrow || kind == InstructionKind.BeginAsyncDispose ||
-            kind == InstructionKind.MergeAlias) && string.IsNullOrEmpty(target))
+            kind == InstructionKind.MergeAlias || kind == InstructionKind.BeginAsyncFactory ||
+            kind == InstructionKind.ReceiveAsyncResult || kind == InstructionKind.BindAsyncResult) && string.IsNullOrEmpty(target))
             throw new ArgumentException("This instruction requires a target place.", nameof(target));
         if ((kind == InstructionKind.Alias || kind == InstructionKind.Move || kind == InstructionKind.BorrowShared ||
             kind == InstructionKind.BorrowExclusive || kind == InstructionKind.Read || kind == InstructionKind.Write ||
             kind == InstructionKind.Dispose || kind == InstructionKind.Escape ||
             kind == InstructionKind.ReserveExclusiveBorrow || kind == InstructionKind.ActivateBorrow ||
             kind == InstructionKind.BeginAsyncDispose || kind == InstructionKind.CompleteAsyncDispose ||
-            kind == InstructionKind.MergeAlias) && string.IsNullOrEmpty(source))
+            kind == InstructionKind.MergeAlias || kind == InstructionKind.ObserveAsyncFactory ||
+            kind == InstructionKind.ReceiveAsyncResult || kind == InstructionKind.BindAsyncResult) && string.IsNullOrEmpty(source))
             throw new ArgumentException("This instruction requires a source place.", nameof(source));
     }
 

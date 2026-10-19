@@ -38,6 +38,8 @@ public sealed class ReferenceOriginSummaryTests
         """;
 
     [Theory]
+    [InlineData("return new();")]
+    [InlineData("Resource value = new(); return value;")]
     [InlineData("var value = new Resource(); ref Resource alias = ref value; return alias;")]
     [InlineData("var value = new Resource(); ref readonly Resource alias = ref value; return alias;")]
     [InlineData("var value = external; ref Resource alias = ref value; alias = new Resource(); return value;")]

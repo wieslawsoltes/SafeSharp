@@ -43,6 +43,7 @@ internal sealed class OwnershipTransfer
                 CheckUse(state, instruction, references, issues);
                 CheckLoans(state, instruction, references, "SS0005", "Ownership cannot move while a loan remains live.", _ => true, false, issues);
                 CheckBorrowedEscape(state, instruction, references, issues);
+                TransferFactoryResults(state, instruction, references, issues);
                 if (instruction.Target is not null) CheckOverwrite(state, instruction, instruction.Target, references, issues, liveAfter);
                 foreach (var reference in references)
                 {
@@ -65,8 +66,10 @@ internal sealed class OwnershipTransfer
                 ActivateBorrow(state, instruction, references, issues);
                 break;
             case InstructionKind.Read:
-                CheckUse(state, instruction, references, issues);
-                CheckLoans(state, instruction, references, "SS0013", "The owner cannot be read while an active exclusive loan remains live.",
+                var readReferences = (instruction.Flags & InstructionFlags.ValidateReturnedResult) != 0
+                    ? IncludingFactoryResults(state, references).ToArray() : references;
+                CheckUse(state, instruction, readReferences, issues);
+                CheckLoans(state, instruction, readReferences, "SS0013", "The owner cannot be read while an active exclusive loan remains live.",
                     IsPossiblyActiveExclusive, true, issues, definitelyConflicts: IsDefinitelyActiveExclusive);
                 break;
             case InstructionKind.Write:
@@ -89,11 +92,29 @@ internal sealed class OwnershipTransfer
                         state.Resources[reference.ResourceId] = completion.Transition(TransferStatus(completion.Status, ResourceStatus.Completed,
                             !reference.CoversResource), "completion", "Asynchronous disposal completion is observed here.", instruction.Site);
                 break;
+            case InstructionKind.BeginAsyncFactory:
+                BeginAsyncFactory(state, instruction, blockId, instructionIndex, liveAfter, issues);
+                break;
+            case InstructionKind.ObserveAsyncFactory:
+                CheckMoved(state, instruction, references, issues);
+                foreach (var reference in references)
+                    if (reference.Projection.Length == 0 && state.Resources.TryGetValue(reference.ResourceId, out var factory) &&
+                        factory.Kind == ResourceKind.AsyncFactoryCarrier)
+                        state.Resources[reference.ResourceId] = factory.Transition(TransferStatus(factory.Status, ResourceStatus.Completed,
+                            !reference.CoversResource), "factory-observation", "Factory completion is observed; a fault does not produce an owned result.", instruction.Site);
+                break;
+            case InstructionKind.ReceiveAsyncResult:
+                ReceiveAsyncResult(state, instruction, references, blockId, instructionIndex, liveAfter, issues);
+                break;
+            case InstructionKind.BindAsyncResult:
+                BindAsyncResult(state, instruction, references, blockId, instructionIndex, liveAfter, issues);
+                break;
             case InstructionKind.Escape:
             case InstructionKind.Return:
                 CheckUse(state, instruction, references, issues);
                 CheckBorrowedEscape(state, instruction, references, issues);
                 CheckLoans(state, instruction, references, "SS0005", "Ownership cannot escape while a loan remains live.", _ => true, false, issues);
+                TransferFactoryResults(state, instruction, references, issues);
                 foreach (var reference in references)
                 {
                     if (reference.Projection.Length != 0 || !state.Resources.TryGetValue(reference.ResourceId, out var resource)
@@ -179,6 +200,158 @@ internal sealed class OwnershipTransfer
         TrackAllocation(state, instruction, completion, false, liveAfter, issues);
     }
 
+    // Rust's Future::Output and Poll::Ready separate an asynchronous computation from its produced
+    // value. C# Task additionally permits receiving the same cached result repeatedly. This original
+    // adaptation retains both identities and never allocates the result on a failing completion edge.
+    // https://github.com/rust-lang/rust/blob/f8297e351a40c1439a467bbbb6879088047f50b3/library/core/src/future/future.rs
+    private static void BeginAsyncFactory(AbstractState state, FlowInstruction instruction, int blockId, int index,
+        ISet<string> liveAfter, IssueCollector? issues)
+    {
+        var id = instruction.ResourceId ?? "async-factory:" + blockId + ":" + index;
+        var fact = new AnalysisEvidence("async-factory", "A successful factory completion must yield an owned result that is disposed or transferred.", instruction.Site);
+        var evidence = ImmutableDictionary.Create<string, AnalysisEvidence>(StringComparer.Ordinal).Add(EvidenceFacts.Key(fact), fact);
+        var carrier = new ResourceFact(id, ResourceOwnership.Owned, ResourceStatus.Pending, instruction.Site, instruction.Flags,
+            ImmutableHashSet.Create<string>(StringComparer.Ordinal), evidence, ResourceKind.AsyncFactoryCarrier,
+            resultState: AsyncResultState.Deferred);
+        TrackAllocation(state, instruction, carrier, false, liveAfter, issues);
+    }
+
+    private const string AsyncResultCachePrefix = "$async-result-cache:";
+    internal static string AsyncResultCache(string carrierId) => AsyncResultCachePrefix + carrierId;
+
+    private static void BindAsyncResult(AbstractState state, FlowInstruction instruction, ReferenceFact[] references,
+        int blockId, int index, ISet<string> liveAfter, IssueCollector? issues)
+    {
+        CheckMoved(state, instruction, references, issues);
+        var nullable = state.CanBeNull(instruction.Source);
+        var id = instruction.ResourceId ?? "completed-factory:" + blockId + ":" + index;
+        var pending = (instruction.Flags & InstructionFlags.DeferredAsyncResult) != 0;
+        var fact = new AnalysisEvidence("factory-binding", pending
+            ? "An asynchronous return contract retains this existing result identity without assuming that completion has occurred."
+            : "A framework result producer wraps this already available value without creating a second owned resource.", instruction.Site);
+        var evidence = ImmutableDictionary.Create<string, AnalysisEvidence>(StringComparer.Ordinal).Add(EvidenceFacts.Key(fact), fact);
+        var carrier = new ResourceFact(id, ResourceOwnership.Owned, pending ? ResourceStatus.Pending : ResourceStatus.Completed, instruction.Site, InstructionFlags.SuppressLeak,
+            ImmutableHashSet.Create<string>(StringComparer.Ordinal), evidence, ResourceKind.AsyncFactoryCarrier,
+            resultState: AsyncResultState.Materialized);
+        TrackAllocation(state, instruction, carrier, false, liveAfter, issues);
+        state.Assign(AsyncResultCache(id), references, nullable);
+    }
+
+    internal static IEnumerable<ReferenceFact> IncludingFactoryResults(AbstractState state, IEnumerable<ReferenceFact> references)
+    {
+        foreach (var reference in references)
+        {
+            yield return reference;
+            if (reference.Projection.Length != 0 || !state.Resources.TryGetValue(reference.ResourceId, out var carrier) ||
+                carrier.Kind != ResourceKind.AsyncFactoryCarrier || (carrier.ResultState & AsyncResultState.Materialized) == 0) continue;
+            foreach (var result in state.Resolve(AsyncResultCache(carrier.Id)))
+                yield return reference.CoversResource ? result : result.WithAbsence(false);
+        }
+    }
+
+    private static void TransferFactoryResults(AbstractState state, FlowInstruction instruction, ReferenceFact[] references, IssueCollector? issues)
+    {
+        foreach (var reference in references)
+        {
+            if (reference.Projection.Length != 0 || !state.Resources.TryGetValue(reference.ResourceId, out var carrier) ||
+                carrier.Kind != ResourceKind.AsyncFactoryCarrier || (carrier.ResultState & AsyncResultState.Materialized) == 0) continue;
+            var cache = AsyncResultCache(carrier.Id);
+            var cached = state.Resolve(cache).ToArray();
+            var values = reference.CoversResource ? cached : cached.Select(value => value.WithAbsence(false)).ToArray();
+            CheckUse(state, instruction, values, issues);
+            CheckBorrowedEscape(state, instruction, values, issues);
+            CheckLoans(state, instruction, values, "SS0005", "A factory carrier cannot transfer its received result while a loan to that result remains live.",
+                _ => true, false, issues);
+            var localMove = instruction.Kind == InstructionKind.Move && instruction.Target is not null;
+            foreach (var value in values)
+            {
+                if (instruction.Kind == InstructionKind.Move) InvalidateAliases(state, value, instruction.Site, !value.CoversResource);
+                if (localMove || value.Projection.Length != 0 || value.LoanId is not null ||
+                    !state.Resources.TryGetValue(value.ResourceId, out var resource) || resource.Ownership != ResourceOwnership.Owned) continue;
+                state.Resources[value.ResourceId] = resource.Transition(TransferStatus(resource.Status,
+                    instruction.Kind == InstructionKind.Escape ? ResourceStatus.Escaped : ResourceStatus.Transferred, !value.CoversResource),
+                    "factory-result-transfer", "Responsibility for the received result leaves with its factory carrier.", instruction.Site);
+            }
+            // A local carrier Move invalidates existing payload aliases, but its destination keeps
+            // the original cached result. An already stale cached result is never made available.
+            if (localMove) state.Assign(cache, cached, state.CanBeNull(cache));
+        }
+    }
+
+    private static void ReceiveAsyncResult(AbstractState state, FlowInstruction instruction, ReferenceFact[] references,
+        int blockId, int index, ISet<string> liveAfter, IssueCollector? issues)
+    {
+        CheckMoved(state, instruction, references, issues);
+        var received = new List<ReferenceFact>();
+        var external = references.Length == 0;
+        var mayBeNull = false;
+        foreach (var reference in references)
+        {
+            if (reference.Projection.Length != 0 || !state.Resources.TryGetValue(reference.ResourceId, out var carrier) ||
+                carrier.Kind != ResourceKind.AsyncFactoryCarrier)
+            {
+                // Neither an opaque Task nor a loan of that Task proves a payload alias.
+                // A declared borrowed output uses BindAsyncResult to name its actual source.
+                external = true;
+                continue;
+            }
+            var cache = AsyncResultCache(carrier.Id);
+            var previous = state.Resolve(cache).ToArray();
+            var materialized = (carrier.ResultState & AsyncResultState.Materialized) != 0;
+            var values = new List<ReferenceFact>();
+            var cacheMayBeNull = false;
+            if (materialized) values.AddRange(previous);
+            if ((carrier.ResultState & AsyncResultState.Deferred) != 0)
+            {
+                var id = "async-result:" + carrier.Id;
+                var nullable = (carrier.Flags & InstructionFlags.MayBeNull) != 0;
+                var absent = nullable || reference.MayBeAbsent || (carrier.Status & ResourceStatus.Absent) != 0;
+                var produced = new AnalysisEvidence("factory-result", "The owned result becomes available only after this successful completion.", instruction.Site);
+                var resource = new ResourceFact(id, ResourceOwnership.Owned, ResourceStatus.Alive | (absent ? ResourceStatus.Absent : ResourceStatus.None),
+                    instruction.Site, carrier.Flags, ImmutableHashSet.Create<string>(StringComparer.Ordinal),
+                    carrier.Evidence.SetItem(EvidenceFacts.Key(produced), produced));
+                if (state.Resources.TryGetValue(id, out var old))
+                {
+                    var retained = materialized || liveAfter.Where(place => place != instruction.Target && place != cache)
+                        .SelectMany(state.Resolve).Any(value => value.ResourceId == id && !value.DefinitelyMoved);
+                    if (retained) resource = resource.Join(old);
+                    else if (old.HasOutstandingObligation && (old.Flags & InstructionFlags.SuppressLeak) == 0)
+                        issues?.Add("SS0011", "Receiving a new result from this repeated factory site abandons an undisposed earlier result.", instruction.Site,
+                            Certainty(old.Status == ResourceStatus.Alive, instruction), old.Id, Evidence(old));
+                }
+                state.Resources[id] = resource;
+                values.Add(new ReferenceFact(id, mayBeAbsent: absent, coversResource: reference.CoversResource));
+                cacheMayBeNull |= nullable;
+            }
+            if (materialized)
+            {
+                // The cached reference participates in ordinary Move invalidation; a later await
+                // cannot create fresh ownership after an earlier result was consumed or moved.
+                CheckMoved(state, instruction, previous, issues);
+                cacheMayBeNull |= state.CanBeNull(cache);
+            }
+            state.Assign(cache, values, cacheMayBeNull);
+            mayBeNull |= cacheMayBeNull;
+            received.AddRange(state.Resolve(cache));
+            state.Resources[carrier.Id] = carrier.Transition(TransferStatus(carrier.Status, ResourceStatus.Completed, !reference.CoversResource),
+                "factory-result", "The factory result is received through this carrier alias.", instruction.Site)
+                .WithResultState(reference.CoversResource ? AsyncResultState.Materialized : carrier.ResultState | AsyncResultState.Materialized);
+        }
+        if (external)
+        {
+            var id = instruction.ResourceId ?? "external-async-result:" + blockId + ":" + index;
+            var nullable = (instruction.Flags & InstructionFlags.MayBeNull) != 0;
+            var resource = new ResourceFact(id, ResourceOwnership.External, ResourceStatus.Alive | (nullable ? ResourceStatus.Absent : ResourceStatus.None),
+                instruction.Site, instruction.Flags, ImmutableHashSet.Create<string>(StringComparer.Ordinal));
+            if (state.Resources.TryGetValue(id, out var previous)) resource = resource.Join(previous);
+            state.Resources[id] = resource;
+            received.Add(new ReferenceFact(id, mayBeAbsent: nullable || received.Count != 0));
+            mayBeNull |= nullable;
+        }
+        CheckOverwrite(state, instruction, instruction.Target!, received, issues, liveAfter);
+        state.Assign(instruction.Target!, received, mayBeNull);
+    }
+
     private static void Dispose(AbstractState state, FlowInstruction instruction, ReferenceFact[] references, IssueCollector? issues)
     {
         CheckMoved(state, instruction, references, issues);
@@ -211,6 +384,10 @@ internal sealed class OwnershipTransfer
                     ? "A completion from an earlier execution of this disposal site may still be pending."
                     : "A repeated asynchronous disposal abandons an unobserved completion from an earlier iteration.", instruction.Site,
                     Certainty(!retained && previous.Status == ResourceStatus.Pending, instruction), previous.Id, Evidence(previous));
+            if (previous.Kind == ResourceKind.AsyncFactoryCarrier && previous.HasOutstandingObligation &&
+                (previous.Flags & InstructionFlags.SuppressLeak) == 0)
+                issues?.Add("SS0011", "A repeated asynchronous factory call may abandon an owned result before the previous carrier is received or transferred.",
+                    instruction.Site, IssueCertainty.Possible, previous.Id, Evidence(previous));
             if (retained) resource = resource.Join(previous);
             else if (issues is not null && previous.Ownership == ResourceOwnership.Owned && (previous.Status & ResourceStatus.Alive) != 0
                 && (previous.Flags & InstructionFlags.SuppressLeak) == 0)
@@ -396,14 +573,16 @@ internal sealed class OwnershipTransfer
                 || !state.Resources.TryGetValue(reference.ResourceId, out var resource) || resource.Ownership != ResourceOwnership.Owned
                 || (resource.Flags & InstructionFlags.SuppressLeak) != 0 || !resource.HasOutstandingObligation) continue;
             var completion = resource.Kind == ResourceKind.AsyncDisposalCompletion;
+            var factory = resource.Kind == ResourceKind.AsyncFactoryCarrier;
             var carried = incoming.Where(value => value.ResourceId == resource.Id).ToArray();
-            if (carried.Any(value => !completion || value.CoversResource && !value.MayBeMoved && value.Projection.Length == 0)) continue;
+            if (carried.Any(value => !(completion || factory) || value.CoversResource && !value.MayBeMoved && value.Projection.Length == 0)) continue;
             // Call snapshots represent values on the frontend's evaluation stack. An exceptional
             // edge can abandon that stack without executing its normal ReleaseLoan instructions.
             // A dead snapshot is not a surviving handle; live snapshots and ordinary aliases are.
-            var otherReferences = completion && liveAfter is not null
+            var otherReferences = (completion || factory) && liveAfter is not null
                 ? liveAfter.Where(place => place != target && !PlaceRelations.IsStrictDescendant(place, target)).SelectMany(state.Resolve)
                 : state.Places.Where(pair => pair.Key != target && !PlaceRelations.IsStrictDescendant(pair.Key, target) &&
+                    IsUsableResultCache(state, pair.Key, liveAfter) &&
                     (!pair.Key.StartsWith("$t:call-", StringComparison.Ordinal) || liveAfter is null ||
                      liveAfter.Any(live => live == pair.Key || PlaceRelations.IsStrictDescendant(live, pair.Key))))
                     .SelectMany(pair => pair.Value.Values);
@@ -412,10 +591,19 @@ internal sealed class OwnershipTransfer
             if (retained.Any(value => value.CoversResource && !value.MayBeMoved && value.Projection.Length == 0)) continue;
             issues.Add(completion ? "SS0017" : "SS0011", completion
                     ? "Overwriting this place loses an asynchronous disposal completion before it is observed or transferred."
+                    : factory ? "Overwriting this place may abandon an owned factory result before its carrier is received or transferred."
                     : "Overwriting this place loses the last known owner of an undisposed resource.", instruction.Site,
-                Certainty(resource.Status == resource.OutstandingStatus && !reference.MayBeAbsent && old.Count == 1 && retained.Length == 0 && carried.Length == 0, instruction),
+                factory ? IssueCertainty.Possible : Certainty(resource.Status == resource.OutstandingStatus && !reference.MayBeAbsent && old.Count == 1 && retained.Length == 0 && carried.Length == 0, instruction),
                 resource.Id, Evidence(resource).Concat(reference.Evidence.Values));
         }
+    }
+
+    private static bool IsUsableResultCache(AbstractState state, string place, ISet<string>? liveAfter)
+    {
+        if (!place.StartsWith(AsyncResultCachePrefix, StringComparison.Ordinal)) return true;
+        if (liveAfter is null) return false;
+        var carrier = place.Substring(AsyncResultCachePrefix.Length);
+        return liveAfter.SelectMany(state.Resolve).Any(reference => reference.ResourceId == carrier && !reference.DefinitelyMoved);
     }
 
     private static void CheckLoans(AbstractState state, FlowInstruction instruction, ReferenceFact[] references,
@@ -461,7 +649,16 @@ internal sealed class OwnershipTransfer
     private static void CheckSuspension(AbstractState state, FlowInstruction instruction, ISet<string> liveAfter, IssueCollector? issues)
     {
         if (issues is null) return;
-        var liveReferences = liveAfter.SelectMany(state.Resolve).ToArray();
+        var directReferences = liveAfter.SelectMany(state.Resolve).ToArray();
+        List<ReferenceFact>? cachedReferences = null;
+        foreach (var reference in directReferences)
+        {
+            if (reference.DefinitelyMoved || !state.Resources.TryGetValue(reference.ResourceId, out var resource) ||
+                resource.Kind != ResourceKind.AsyncFactoryCarrier || (resource.ResultState & AsyncResultState.Materialized) == 0) continue;
+            foreach (var cached in state.Resolve(AsyncResultCache(reference.ResourceId)))
+                (cachedReferences ??= new List<ReferenceFact>(directReferences)).Add(cached);
+        }
+        IReadOnlyCollection<ReferenceFact> liveReferences = cachedReferences is not null ? cachedReferences : directReferences;
         foreach (var loan in state.Loans.Values)
         {
             if (loan.AllowsSuspension || !liveReferences.Any(reference => reference.LoanId is not null && LoanAncestors(state, reference.LoanId).Contains(loan.Id))) continue;
@@ -471,7 +668,7 @@ internal sealed class OwnershipTransfer
         }
         foreach (var resource in state.Resources.Values)
         {
-            if ((resource.Flags & InstructionFlags.NoSuspend) == 0 || (resource.Status & (ResourceStatus.Alive | ResourceStatus.Escaped)) == 0
+            if (resource.Kind != ResourceKind.Resource || (resource.Flags & InstructionFlags.NoSuspend) == 0 || (resource.Status & (ResourceStatus.Alive | ResourceStatus.Escaped)) == 0
                 || !liveReferences.Any(reference => reference.ResourceId == resource.Id && !reference.DefinitelyMoved)) continue;
             issues.Add("SS0016", "This resource's no-suspension contract is violated by a live value across await or yield.", instruction.Site,
                 Certainty(resource.Status == ResourceStatus.Alive, instruction), resource.Id, Evidence(resource).Concat(new[] {
@@ -486,7 +683,8 @@ internal sealed class OwnershipTransfer
     internal static IEnumerable<AnalysisEvidence> Evidence(ResourceFact resource)
     {
         yield return new AnalysisEvidence("origin", resource.Kind == ResourceKind.AsyncDisposalCompletion
-            ? "The asynchronous disposal completion originates here." : resource.Ownership + " resource originates here.", resource.Origin);
+            ? "The asynchronous disposal completion originates here." : resource.Kind == ResourceKind.AsyncFactoryCarrier
+                ? "The carrier of a potentially owned asynchronous result originates here." : resource.Ownership + " resource originates here.", resource.Origin);
         foreach (var item in resource.Evidence.Values) yield return item;
     }
 

@@ -20,9 +20,15 @@ internal sealed class MethodSummaryProvider
     private readonly ConcurrentDictionary<IMethodSymbol, MethodSummary> _cache = new(SymbolEqualityComparer.Default);
 
     public MethodSummaryProvider(Compilation compilation)
-    { _compilation = compilation; _lifetimes = new LifetimeContractProvider(compilation); Callbacks = new CallbackOwnershipModel(compilation); }
+    {
+        _compilation = compilation;
+        _lifetimes = new LifetimeContractProvider(compilation);
+        Callbacks = new CallbackOwnershipModel(compilation);
+        AsyncResults = new AsyncResultOriginModel(compilation);
+    }
 
     internal CallbackOwnershipModel Callbacks { get; }
+    internal AsyncResultOriginModel AsyncResults { get; }
 
     public MethodSummary Get(IMethodSymbol method, CancellationToken cancellationToken) =>
         _cache.GetOrAdd(method.OriginalDefinition, m => Compute(m, cancellationToken, new HashSet<IMethodSymbol>(SymbolEqualityComparer.Default)));
@@ -49,6 +55,8 @@ internal sealed class MethodSummaryProvider
             var sources = ImmutableArray.CreateBuilder<string>();
             if (from is not null) sources.Add(from);
             var lifetime = _lifetimes.Get(method, cancellationToken);
+            var returnsAsyncPayload = AsyncResults.IsCarrier(method.ReturnType) &&
+                (owned || borrowed is not null || lifetime.ReturnRegion is not null);
             if (from is null && !owned && lifetime.ReturnRegion is { } returnedRegion && lifetime.DeclarationIssues.IsEmpty)
             {
                 var regions = lifetime.Solve(new RegionSolverOptions(), cancellationToken);
@@ -78,7 +86,8 @@ internal sealed class MethodSummaryProvider
                 };
                 MethodSummary Callee(IMethodSymbol callee) => _cache.TryGetValue(callee.OriginalDefinition, out var cached) ? cached :
                     Compute(callee.OriginalDefinition, cancellationToken, path);
-                var origins = MethodOriginAnalysis.Analyze(method, model.GetOperation(operationNode, cancellationToken), Callee, cancellationToken);
+                var origins = MethodOriginAnalysis.Analyze(method, model.GetOperation(operationNode, cancellationToken), Callee, AsyncResults, cancellationToken);
+                returnsAsyncPayload |= origins.ReturnsAsyncPayload;
                 static bool IsFresh(ImmutableHashSet<string> values) => values.Contains(MethodOriginAnalysis.Fresh) &&
                     values.All(value => value is MethodOriginAnalysis.Fresh or MethodOriginAnalysis.Null);
                 if (sources.Count == 0 && lifetime.ReturnRegion is null && IsFresh(origins.Returns))
@@ -115,7 +124,7 @@ internal sealed class MethodSummaryProvider
                     }
                 }
             }
-            return new MethodSummary(owned, sources.ToImmutable(), mutable, disposed.ToImmutable(), outputs.ToImmutable());
+            return new MethodSummary(owned, sources.ToImmutable(), mutable, disposed.ToImmutable(), outputs.ToImmutable(), returnsAsyncPayload);
         }
         finally { path.Remove(method.OriginalDefinition); }
     }
@@ -138,7 +147,8 @@ internal sealed class MethodSummary
         ImmutableArray<int>.Empty, ImmutableDictionary<int, bool>.Empty);
 
     public MethodSummary(bool returnsOwned, ImmutableArray<string> borrowedSources, bool mutableBorrow,
-        ImmutableArray<int> parameterDisposalOrder, ImmutableDictionary<int, bool> ownedOutputParameters)
+        ImmutableArray<int> parameterDisposalOrder, ImmutableDictionary<int, bool> ownedOutputParameters,
+        bool returnsAsyncPayload = false)
     {
         ReturnsOwned = returnsOwned;
         BorrowedSources = borrowedSources;
@@ -146,9 +156,15 @@ internal sealed class MethodSummary
         ParameterDisposalOrder = parameterDisposalOrder;
         DisposedParameters = parameterDisposalOrder.ToImmutableHashSet();
         OwnedOutputParameters = ownedOutputParameters;
+        ReturnsAsyncPayload = returnsAsyncPayload;
     }
 
     public bool ReturnsOwned { get; }
+    /// <summary>
+    /// Whether the returned ownership/provenance describes one Task&lt;T&gt;/ValueTask&lt;T&gt; result
+    /// layer. A carrier identity such as Identity(task) retains ordinary value provenance instead.
+    /// </summary>
+    public bool ReturnsAsyncPayload { get; }
     public ImmutableArray<string> BorrowedSources { get; }
     public string? BorrowedFrom => BorrowedSources.Length == 1 ? BorrowedSources[0] : null;
     public bool HasBorrowedReturn => !BorrowedSources.IsEmpty;

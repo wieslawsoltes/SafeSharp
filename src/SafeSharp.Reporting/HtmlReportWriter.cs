@@ -194,7 +194,9 @@ public sealed class HtmlReportWriter : IAnalysisReportWriter
         foreach (var resource in state.Resources.OrderBy(resource => resource.Id, StringComparer.Ordinal))
             Row(writer, resource.Id, resource.Kind + " / " + resource.Ownership, resource.Status.ToString(),
                 string.Join(", ", resource.OwnerResourceIds.OrderBy(id => id, StringComparer.Ordinal)) +
-                (resource.DisposedResourceIds.IsEmpty ? "" : "completion for: " + string.Join(", ", resource.DisposedResourceIds.OrderBy(id => id, StringComparer.Ordinal))));
+                (resource.DisposedResourceIds.IsEmpty ? "" : "completion for: " + string.Join(", ", resource.DisposedResourceIds.OrderBy(id => id, StringComparer.Ordinal))) +
+                (resource.Kind == ResourceKind.AsyncFactoryCarrier ? " result: " + resource.ResultState +
+                    (resource.ProducedResourceIds.IsEmpty ? "" : " (" + string.Join(", ", resource.ProducedResourceIds) + ")") : ""));
         TableEnd(writer);
         TableStart(writer, "Places and aliases", "Place", "Resource", "Availability", "Loan / projection");
         foreach (var place in state.Places.OrderBy(place => place.Place, StringComparer.Ordinal))

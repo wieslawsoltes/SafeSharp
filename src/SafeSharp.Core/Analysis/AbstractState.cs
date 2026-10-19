@@ -133,7 +133,7 @@ internal sealed class AbstractState : IEquatable<AbstractState>
         if (Loans.Count == 0) return;
         var retained = new HashSet<string>(StringComparer.Ordinal);
         foreach (var place in livePlaces)
-        foreach (var reference in Resolve(place))
+        foreach (var reference in OwnershipTransfer.IncludingFactoryResults(this, Resolve(place)))
             if (reference.LoanId is not null) retained.Add(reference.LoanId);
         var queue = new Queue<string>(retained);
         while (queue.Count != 0)
@@ -153,7 +153,10 @@ internal sealed class AbstractState : IEquatable<AbstractState>
                 reference.MovedPaths.OrderBy(path => path, StringComparer.Ordinal).ToImmutableArray(), reference.MayBeAbsent, reference.CoversResource)).ToImmutableArray(), CanBeNull(pair.Key))).ToImmutableArray(),
         Resources.Values.OrderBy(resource => resource.Id, StringComparer.Ordinal).Select(resource => new ResourceSnapshot(
             resource.Id, resource.Ownership, resource.Status, resource.Origin, resource.OwnerIds.OrderBy(id => id, StringComparer.Ordinal).ToImmutableArray(),
-            resource.Kind, resource.DisposedResourceIds.OrderBy(id => id, StringComparer.Ordinal).ToImmutableArray())).ToImmutableArray(),
+            resource.Kind, resource.DisposedResourceIds.OrderBy(id => id, StringComparer.Ordinal).ToImmutableArray(), resource.ResultState,
+            resource.Kind == ResourceKind.AsyncFactoryCarrier && (resource.ResultState & AsyncResultState.Materialized) != 0
+                ? Resolve(OwnershipTransfer.AsyncResultCache(resource.Id)).Select(reference => reference.ResourceId).Distinct(StringComparer.Ordinal)
+                    .OrderBy(id => id, StringComparer.Ordinal).ToImmutableArray() : ImmutableArray<string>.Empty)).ToImmutableArray(),
         Loans.Values.OrderBy(loan => loan.Id, StringComparer.Ordinal).Select(loan => new LoanSnapshot(loan.Id, loan.ResourceId,
             loan.Holder, loan.Kind, loan.Origin, loan.ParentIds.OrderBy(id => id, StringComparer.Ordinal).FirstOrDefault(), loan.Projection,
             loan.AllowsSuspension, loan.MayBeAbsent, loan.Phase, loan.ActivationEvidence.Values.Select(evidence => evidence.Site)
@@ -261,7 +264,8 @@ internal sealed class ResourceFact : IEquatable<ResourceFact>
 {
     internal ResourceFact(string id, ResourceOwnership ownership, ResourceStatus status, SourceSite origin,
         InstructionFlags flags, ImmutableHashSet<string> ownerIds, ImmutableDictionary<string, AnalysisEvidence>? evidence = null,
-        ResourceKind kind = ResourceKind.Resource, ImmutableHashSet<string>? disposedResourceIds = null)
+        ResourceKind kind = ResourceKind.Resource, ImmutableHashSet<string>? disposedResourceIds = null,
+        AsyncResultState resultState = AsyncResultState.None)
     {
         Id = id;
         Ownership = ownership;
@@ -271,6 +275,7 @@ internal sealed class ResourceFact : IEquatable<ResourceFact>
         OwnerIds = ownerIds;
         Evidence = evidence ?? ImmutableDictionary.Create<string, AnalysisEvidence>(StringComparer.Ordinal);
         Kind = kind;
+        ResultState = resultState;
         DisposedResourceIds = disposedResourceIds ?? ImmutableHashSet.Create<string>(StringComparer.Ordinal);
     }
 
@@ -282,19 +287,21 @@ internal sealed class ResourceFact : IEquatable<ResourceFact>
     internal ImmutableHashSet<string> OwnerIds { get; }
     internal ImmutableDictionary<string, AnalysisEvidence> Evidence { get; }
     internal ResourceKind Kind { get; }
+    internal AsyncResultState ResultState { get; }
     internal ImmutableHashSet<string> DisposedResourceIds { get; }
-    internal ResourceStatus OutstandingStatus => Kind == ResourceKind.AsyncDisposalCompletion ? ResourceStatus.Pending : ResourceStatus.Alive;
+    internal ResourceStatus OutstandingStatus => Kind is ResourceKind.AsyncDisposalCompletion or ResourceKind.AsyncFactoryCarrier ? ResourceStatus.Pending : ResourceStatus.Alive;
     internal bool HasOutstandingObligation => (Status & OutstandingStatus) != 0;
-    internal ResourceFact WithStatus(ResourceStatus status) => new(Id, Ownership, status, Origin, Flags, OwnerIds, Evidence, Kind, DisposedResourceIds);
+    internal ResourceFact WithStatus(ResourceStatus status) => new(Id, Ownership, status, Origin, Flags, OwnerIds, Evidence, Kind, DisposedResourceIds, ResultState);
+    internal ResourceFact WithResultState(AsyncResultState resultState) => new(Id, Ownership, Status, Origin, Flags, OwnerIds, Evidence, Kind, DisposedResourceIds, resultState);
     internal ResourceFact Transition(ResourceStatus status, string kind, string message, SourceSite site)
     {
         var evidence = new AnalysisEvidence(kind, message, site);
-        return new ResourceFact(Id, Ownership, status, Origin, Flags, OwnerIds, Evidence.SetItem(EvidenceFacts.Key(evidence), evidence), Kind, DisposedResourceIds);
+        return new ResourceFact(Id, Ownership, status, Origin, Flags, OwnerIds, Evidence.SetItem(EvidenceFacts.Key(evidence), evidence), Kind, DisposedResourceIds, ResultState);
     }
     internal ResourceFact Join(ResourceFact other) => new(Id, Ownership, Status | other.Status, Origin, Flags | other.Flags,
-        OwnerIds.Union(other.OwnerIds), Evidence.SetItems(other.Evidence), Kind, DisposedResourceIds.Union(other.DisposedResourceIds));
+        OwnerIds.Union(other.OwnerIds), Evidence.SetItems(other.Evidence), Kind, DisposedResourceIds.Union(other.DisposedResourceIds), ResultState | other.ResultState);
     public bool Equals(ResourceFact? other) => other is not null && Id == other.Id && Ownership == other.Ownership && Status == other.Status
-        && Flags == other.Flags && Kind == other.Kind && OwnerIds.SetEquals(other.OwnerIds) && DisposedResourceIds.SetEquals(other.DisposedResourceIds)
+        && Flags == other.Flags && Kind == other.Kind && ResultState == other.ResultState && OwnerIds.SetEquals(other.OwnerIds) && DisposedResourceIds.SetEquals(other.DisposedResourceIds)
         && EvidenceFacts.Equal(Evidence, other.Evidence);
     public override bool Equals(object? obj) => obj is ResourceFact other && Equals(other);
     public override int GetHashCode() => StringComparer.Ordinal.GetHashCode(Id) ^ (int)Status;

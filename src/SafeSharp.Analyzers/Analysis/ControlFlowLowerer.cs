@@ -148,7 +148,9 @@ internal static class ControlFlowLowerer
                     {
                         if (context.Returning && !context.Exceptional)
                             instructions.Add(new FlowInstruction(_lowerer.ReturnsBorrowed ? InstructionKind.Read : InstructionKind.Return, context.ReturnSite ?? _site,
-                                source: OperationLowerer.ReturnPlace, description: "validate return after finally cleanup"));
+                                source: OperationLowerer.ReturnPlace,
+                                flags: _lowerer.ReturnsBorrowed ? InstructionFlags.ValidateReturnedResult : InstructionFlags.None,
+                                description: "validate return after finally cleanup"));
                     }
                     else
                     {

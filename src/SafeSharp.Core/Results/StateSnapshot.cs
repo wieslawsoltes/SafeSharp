@@ -7,9 +7,9 @@ namespace SafeSharp.Core;
 public enum ResourceStatus
 {
     None = 0, Absent = 1, Alive = 2, Disposed = 4, Transferred = 8, Escaped = 16,
-    /// <summary>The asynchronous disposal awaitable has not been observed or transferred.</summary>
+    /// <summary>An asynchronous disposal completion or owned factory result has not been observed or transferred.</summary>
     Pending = 32,
-    /// <summary>The asynchronous disposal completion has been observed.</summary>
+    /// <summary>The asynchronous operation has been observed; successful factory result production is tracked separately.</summary>
     Completed = 64
 }
 
@@ -57,7 +57,8 @@ public sealed class ResourceSnapshot
 {
     internal ResourceSnapshot(string id, ResourceOwnership ownership, ResourceStatus status,
         SourceSite origin, ImmutableArray<string> ownerResourceIds, ResourceKind kind = ResourceKind.Resource,
-        ImmutableArray<string> disposedResourceIds = default)
+        ImmutableArray<string> disposedResourceIds = default, AsyncResultState resultState = AsyncResultState.None,
+        ImmutableArray<string> producedResourceIds = default)
     {
         Id = id;
         Ownership = ownership;
@@ -66,6 +67,8 @@ public sealed class ResourceSnapshot
         OwnerResourceIds = ownerResourceIds;
         Kind = kind;
         DisposedResourceIds = disposedResourceIds.IsDefault ? ImmutableArray<string>.Empty : disposedResourceIds;
+        ResultState = resultState;
+        ProducedResourceIds = producedResourceIds.IsDefault ? ImmutableArray<string>.Empty : producedResourceIds;
     }
 
     public string Id { get; }
@@ -76,6 +79,12 @@ public sealed class ResourceSnapshot
     public ResourceKind Kind { get; }
     /// <summary>Resources whose cleanup produced this completion; these are provenance, not owning scopes.</summary>
     public ImmutableArray<string> DisposedResourceIds { get; }
+    /// <summary>Factory result production alternatives, independent of completion observation and ownership transfer.</summary>
+    public AsyncResultState ResultState { get; }
+    /// <summary>The stable result identity associated with this factory carrier, when a result has been materialized.</summary>
+    public string? ProducedResourceId => ProducedResourceIds.Length == 1 ? ProducedResourceIds[0] : null;
+    /// <summary>Possible existing or newly produced result identities represented by this carrier.</summary>
+    public ImmutableArray<string> ProducedResourceIds { get; }
 }
 
 public sealed class LoanSnapshot

@@ -186,6 +186,12 @@ public sealed class JsonReportWriter : IAnalysisReportWriter
             json.Name("origin"); WriteSite(json, resource.Origin);
             json.Name("ownerResourceIds"); WriteStrings(json, resource.OwnerResourceIds);
             json.Name("disposedResourceIds"); WriteStrings(json, resource.DisposedResourceIds);
+            if (resource.Kind == ResourceKind.AsyncFactoryCarrier)
+            {
+                json.Property("resultState", resource.ResultState.ToString());
+                json.Property("producedResourceId", resource.ProducedResourceId);
+                json.Name("producedResourceIds"); WriteStrings(json, resource.ProducedResourceIds);
+            }
             json.EndObject();
         }
         json.EndArray();

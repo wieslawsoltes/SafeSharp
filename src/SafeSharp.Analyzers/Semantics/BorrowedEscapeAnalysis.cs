@@ -415,10 +415,9 @@ internal sealed class BorrowedEscapeAnalysis
         // An opaque method is neither an inferred identity nor an inferred escape sink.
         if (values.Count == 0) return Value.External;
         var result = Union(values);
-        // Existing lifetime contracts on Task<T>/ValueTask<T> constrain the result payload.
-        return target.OriginalDefinition.ReturnType is INamedTypeSymbol { Arity: 1, Name: "Task" or "ValueTask" } returned &&
-            returned.ContainingNamespace.ToDisplayString() == "System.Threading.Tasks" &&
-            (SymbolFacts.HasAttribute(unreduced, "ReturnsBorrowed") || SymbolFacts.HasReturnAttribute(unreduced, "Lifetime"))
+        // Payload summaries introduce exactly one carrier layer. A generic or nonasync task
+        // identity already denotes the carrier itself and must preserve its existing contents.
+        return summary.ReturnsAsyncPayload && summaries.AsyncResults.IsCarrier(target.ReturnType)
             ? Container(operation, result, state, isPayload: true) : result;
     }
 

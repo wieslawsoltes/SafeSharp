@@ -54,7 +54,8 @@ internal sealed class LifetimeReturnFlow
                 Step();
                 if (parameter.RefKind != RefKind.Out)
                     initial.Values[ParameterKey(parameter)] = One(new RegionOrigin(OriginKind.Parameter, "parameter:" + parameter.Ordinal,
-                        parameter.Ordinal, contract.ParameterRegions[parameter.Ordinal], parameter.Locations.FirstOrDefault() ?? Location.None, parameter.Name));
+                        parameter.Ordinal, contract.ParameterRegions[parameter.Ordinal], parameter.Locations.FirstOrDefault() ?? Location.None, parameter.Name,
+                        sharedBorrow: SymbolFacts.HasAttribute(parameter, "Borrowed") && !SymbolFacts.HasAttribute(parameter, "BorrowedMut")));
             }
             if (!contract.Method.IsStatic)
                 initial.Values["this"] = One(new RegionOrigin(OriginKind.Receiver, "this", -1, "this", contract.Method.Locations.FirstOrDefault() ?? Location.None, "this"));
@@ -307,7 +308,8 @@ internal sealed class LifetimeReturnFlow
             Store(state, replacement.Targets, replaced);
         }
         if (MayRunCapturedCode(invocation)) InvalidateCapturedStorage(state, invocation);
-        if (method.ContainingType.ToDisplayString() == "SafeSharp.Ownership" && method.Name is "Borrow" or "BorrowMut" && arguments.TryGetValue(0, out var borrowed)) return borrowed;
+        if (method.ContainingType.ToDisplayString() == "SafeSharp.Ownership" && method.Name is "Borrow" or "BorrowMut" && arguments.TryGetValue(0, out var borrowed))
+            return method.Name == "Borrow" ? SharedBorrow(borrowed) : borrowed;
         if (method.Name == "FromResult" && method.ContainingNamespace.ToDisplayString() == "System.Threading.Tasks" &&
             method.ContainingType is { Arity: 0, Name: "Task" or "ValueTask" } && IsFrameworkAwaitable(method.ReturnType) &&
             arguments.Count == 1 && arguments.TryGetValue(0, out var payload)) return WrapAwaitable(payload);
@@ -323,8 +325,13 @@ internal sealed class LifetimeReturnFlow
         if (called.ReturnsOwned) return Local(operation, "owned factory result");
         if (!called.DeclarationIssues.IsEmpty) return Unknown(operation, "callee lifetime declaration is invalid");
         var source = called.BorrowedSource;
-        ImmutableHashSet<RegionOrigin> ExplicitResult(ImmutableHashSet<RegionOrigin> value) =>
-            IsFrameworkAwaitable(method.ReturnType) ? WrapAwaitable(value) : value;
+        ImmutableHashSet<RegionOrigin> ExplicitResult(ImmutableHashSet<RegionOrigin> value)
+        {
+            // A shared result contract narrows access even if its owner was exclusive. An
+            // exclusive result cannot erase a shared restriction already present at the input.
+            var result = called.MutableBorrow ? value : SharedBorrow(value);
+            return IsFrameworkAwaitable(method.ReturnType) ? WrapAwaitable(result) : result;
+        }
         if (source == "this") return ExplicitResult(receiver);
         if (source is not null && method.Parameters.FirstOrDefault(parameter => parameter.Name == source) is { } input && arguments.TryGetValue(input.Ordinal, out var origins)) return ExplicitResult(origins);
         if (called.ReturnRegion is { } returned)
@@ -346,7 +353,8 @@ internal sealed class LifetimeReturnFlow
             var candidates = summary.BorrowedSources.Select(candidate => candidate == "this" ? receiver :
                 method.Parameters.FirstOrDefault(parameter => parameter.Name == candidate) is { } parameter && arguments.TryGetValue(parameter.Ordinal, out var value)
                     ? value : Unknown(operation, "returned source could not be mapped to an argument"));
-            return Union(candidates, operation);
+            var inferred = Union(candidates, operation);
+            return summary.ReturnsAsyncPayload && summaries.AsyncResults.IsCarrier(method.ReturnType) ? WrapAwaitable(inferred) : inferred;
         }
         return Unknown(operation, "call has no trusted returned-source contract");
     }
@@ -385,6 +393,7 @@ internal sealed class LifetimeReturnFlow
     {
         if (origin.Kind == OriginKind.Null) return true;
         if (origin.Kind is OriginKind.Local or OriginKind.Unknown) return false;
+        if (contract.MutableBorrow && origin.SharedBorrow) return false;
         if (contract.BorrowedSource is not null && origin.ParameterOrdinal != requiredSourceOrdinal) return false;
         return contract.ReturnRegion is null || origin.Region is { } region && solution.Outlives(region, contract.ReturnRegion);
     }
@@ -393,6 +402,8 @@ internal sealed class LifetimeReturnFlow
     {
         OriginKind.Local => origin.Description + " cannot establish a caller-visible borrowed lifetime",
         OriginKind.Unknown => "the lifetime of " + origin.Description + " is not established",
+        _ when contract.MutableBorrow && origin.SharedBorrow
+            => "a shared borrow from '" + origin.Description + "' cannot establish an exclusive returned borrow",
         _ when contract.BorrowedSource is { } source && origin.ParameterOrdinal != requiredSourceOrdinal
             => "source '" + origin.Description + "' differs from promised borrowed source '" + source + "'",
         _ => "region '" + (origin.Region ?? "<undeclared>") + "' is not known to outlive '" + contract.ReturnRegion + "'",
@@ -534,8 +545,13 @@ internal sealed class LifetimeReturnFlow
     private static Location ReturnLocation(IOperation operation)
     {
         var syntax = operation.Syntax;
-        if (syntax.AncestorsAndSelf().OfType<ReturnStatementSyntax>().FirstOrDefault()?.Expression is { } expression) return expression.GetLocation();
-        if (syntax.AncestorsAndSelf().OfType<ArrowExpressionClauseSyntax>().FirstOrDefault() is { } arrow) return arrow.Expression.GetLocation();
+        foreach (var ancestor in syntax.AncestorsAndSelf())
+        {
+            if (ancestor is ReturnStatementSyntax { Expression: { } expression }) return expression.GetLocation();
+            if (ancestor is LambdaExpressionSyntax { Body: ExpressionSyntax body }) return body.GetLocation();
+            if (ancestor is AnonymousFunctionExpressionSyntax or LocalFunctionStatementSyntax) break;
+            if (ancestor is ArrowExpressionClauseSyntax arrow) return arrow.Expression.GetLocation();
+        }
         return syntax.GetLocation();
     }
 
@@ -612,6 +628,11 @@ internal sealed class LifetimeReturnFlow
         return first.Union(second);
     }
     private static ImmutableHashSet<RegionOrigin> One(RegionOrigin origin) => ImmutableHashSet.Create(origin);
+    private ImmutableHashSet<RegionOrigin> SharedBorrow(ImmutableHashSet<RegionOrigin> origins)
+    {
+        Step(origins.Count);
+        return origins.Select(origin => origin.WithSharedBorrow()).ToImmutableHashSet();
+    }
     private static ImmutableHashSet<RegionOrigin> Unknown(IOperation operation, string description) => One(new RegionOrigin(OriginKind.Unknown,
         "unknown:" + operation.Syntax.SpanStart + ":" + description, -2, null, operation.Syntax.GetLocation(), description));
     private static ImmutableHashSet<RegionOrigin> Local(IOperation operation, string description) => One(new RegionOrigin(OriginKind.Local,
@@ -661,8 +682,9 @@ internal sealed class LifetimeReturnFlow
     {
         internal static readonly RegionOrigin Null = new(OriginKind.Null, "null", -2, null, Location.None, "null");
         internal static readonly RegionOrigin Missing = new(OriginKind.Unknown, "missing", -2, null, Location.None, "a value missing from one incoming path");
-        internal RegionOrigin(OriginKind kind, string key, int parameterOrdinal, string? region, Location location, string description, int awaitableDepth = 0)
-        { Kind = kind; Key = key; ParameterOrdinal = parameterOrdinal; Region = region; Location = location; Description = description; AwaitableDepth = awaitableDepth; }
+        internal RegionOrigin(OriginKind kind, string key, int parameterOrdinal, string? region, Location location, string description,
+            int awaitableDepth = 0, bool sharedBorrow = false)
+        { Kind = kind; Key = key; ParameterOrdinal = parameterOrdinal; Region = region; Location = location; Description = description; AwaitableDepth = awaitableDepth; SharedBorrow = sharedBorrow; }
         internal OriginKind Kind { get; }
         internal string Key { get; }
         internal int ParameterOrdinal { get; }
@@ -670,10 +692,12 @@ internal sealed class LifetimeReturnFlow
         internal Location Location { get; }
         internal string Description { get; }
         internal int AwaitableDepth { get; }
-        internal RegionOrigin WithAwaitableDepth(int depth) => new(Kind, Key, ParameterOrdinal, Region, Location, Description, depth);
-        public bool Equals(RegionOrigin? other) => other is not null && Key == other.Key && AwaitableDepth == other.AwaitableDepth;
+        internal bool SharedBorrow { get; }
+        internal RegionOrigin WithAwaitableDepth(int depth) => new(Kind, Key, ParameterOrdinal, Region, Location, Description, depth, SharedBorrow);
+        internal RegionOrigin WithSharedBorrow() => SharedBorrow ? this : new(Kind, Key, ParameterOrdinal, Region, Location, Description, AwaitableDepth, true);
+        public bool Equals(RegionOrigin? other) => other is not null && Key == other.Key && AwaitableDepth == other.AwaitableDepth && SharedBorrow == other.SharedBorrow;
         public override bool Equals(object? obj) => obj is RegionOrigin other && Equals(other);
-        public override int GetHashCode() => unchecked(StringComparer.Ordinal.GetHashCode(Key) * 397 ^ AwaitableDepth);
+        public override int GetHashCode() => unchecked((StringComparer.Ordinal.GetHashCode(Key) * 397 ^ AwaitableDepth) * 397 ^ SharedBorrow.GetHashCode());
     }
 
     private sealed class LifetimeFlowBudgetException : Exception { }
