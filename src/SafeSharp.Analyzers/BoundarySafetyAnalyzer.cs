@@ -18,7 +18,7 @@ public sealed class BoundarySafetyAnalyzer : DiagnosticAnalyzer
         helpLinkUri: "https://github.com/wieslawsoltes/SafeSharp/blob/main/docs/diagnostics.md#ss0030");
     public static readonly DiagnosticDescriptor UnobservedDisposal = new("SS0031", "Asynchronous disposal is not observed",
         "Await or return the result of '{0}'; dropping the awaitable can leave disposal incomplete", "Ownership",
-        DiagnosticSeverity.Warning, true, description: "DisposeAsync completion must be observed. Assigning its result to a local for a later await is a separate lifetime-analysis boundary.",
+        DiagnosticSeverity.Warning, true, description: "DisposeAsync completion must be observed. Stored and aliased completions are tracked by the ownership engine; SS0017 reports pending completion paths.",
         helpLinkUri: "https://github.com/wieslawsoltes/SafeSharp/blob/main/docs/diagnostics.md#ss0031");
     public static readonly DiagnosticDescriptor UnsafeBoundary = new("SS0032", "Operation crosses the ownership model boundary",
         "Ownership analysis does not prove safety across this {0} operation", "Ownership",
@@ -50,7 +50,7 @@ public sealed class BoundarySafetyAnalyzer : DiagnosticAnalyzer
                 if (SymbolFacts.IsTracked(invocation.Type) && !SymbolFacts.IsServiceResolution(invocation.TargetMethod) && !SymbolFacts.IsScopeFactory(invocation.TargetMethod))
                 {
                     var summary = summaries.Get(invocation.TargetMethod, operationContext.CancellationToken);
-                    if (!summary.ReturnsOwned && summary.BorrowedFrom is null)
+                    if (!summary.ReturnsOwned && !summary.HasBorrowedReturn)
                         operationContext.ReportDiagnostic(Diagnostic.Create(MissingContract, invocation.Syntax.GetLocation(), invocation.TargetMethod.ToDisplayString()));
                 }
             }, OperationKind.Invocation);

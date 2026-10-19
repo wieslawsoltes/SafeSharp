@@ -9,5 +9,5 @@ public static class SafeSharpAnalyzerCatalog
 {
     public static ImmutableArray<DiagnosticAnalyzer> Create() => ImmutableArray.Create<DiagnosticAnalyzer>(
         new OwnershipAnalyzer(), new SafeSharpSemanticAnalyzer(), new BoundarySafetyAnalyzer(),
-        new ConcurrencyContractAnalyzer());
+        new LifetimeContractAnalyzer(), new ConcurrencyContractAnalyzer());
 }

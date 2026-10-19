@@ -231,7 +231,9 @@ internal static class ControlFlowLowerer
         private bool HasExceptionalTarget(Context context, ControlFlowRegion region)
         {
             if (context.Filter is not null) return true;
-            for (var current = region; current.EnclosingRegion is { } parent; current = parent)
+            // Nested Roslyn CFG roots retain their lexical enclosing region in the parent CFG.
+            // Exceptions leave the callback at its own root; parent ordinals are not local blocks.
+            for (var current = region; !ReferenceEquals(current, _graph.Root) && current.EnclosingRegion is { } parent; current = parent)
                 if (current.Kind == ControlFlowRegionKind.Try && parent.Kind is ControlFlowRegionKind.TryAndCatch or ControlFlowRegionKind.TryAndFinally)
                     return true;
             return false;
@@ -249,7 +251,7 @@ internal static class ControlFlowLowerer
             var cleanup = ImmutableArray.CreateBuilder<int>();
             var routes = ImmutableArray.CreateBuilder<ExceptionRoute>();
             var handled = false;
-            for (var current = block.EnclosingRegion; current.EnclosingRegion is { } parent && !handled; current = parent)
+            for (var current = block.EnclosingRegion; !ReferenceEquals(current, _graph.Root) && current.EnclosingRegion is { } parent && !handled; current = parent)
             {
                 if (current.Kind != ControlFlowRegionKind.Try) continue;
                 if (parent.Kind == ControlFlowRegionKind.TryAndFinally)
@@ -308,20 +310,20 @@ internal static class ControlFlowLowerer
             return Intern(route.Cleanup[0], continuation, false, true, plan.ImplicitException).Id;
         }
 
-        private static ControlFlowRegion? EnclosingFinally(ControlFlowRegion region)
+        private ControlFlowRegion? EnclosingFinally(ControlFlowRegion region)
         {
-            for (var current = region; current is not null; current = current.EnclosingRegion)
+            for (var current = region; current is not null && !ReferenceEquals(current, _graph.Root); current = current.EnclosingRegion)
                 if (current.Kind == ControlFlowRegionKind.Finally) return current;
             return null;
         }
 
         private static bool Contains(ControlFlowRegion region, int ordinal) => region.FirstBlockOrdinal <= ordinal && ordinal <= region.LastBlockOrdinal;
 
-        private static (ITypeSymbol? Type, bool Exact) ThrownType(BasicBlock block, ControlFlowBranch branch)
+        private (ITypeSymbol? Type, bool Exact) ThrownType(BasicBlock block, ControlFlowBranch branch)
         {
             if (branch.Semantics == ControlFlowBranchSemantics.Rethrow)
             {
-                for (var region = block.EnclosingRegion; region is not null; region = region.EnclosingRegion)
+                for (var region = block.EnclosingRegion; region is not null && !ReferenceEquals(region, _graph.Root); region = region.EnclosingRegion)
                     if (region.Kind == ControlFlowRegionKind.Catch) return (region.ExceptionType, false);
                 return (null, false);
             }

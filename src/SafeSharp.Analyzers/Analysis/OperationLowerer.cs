@@ -1,6 +1,7 @@
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.FlowAnalysis;
 using Microsoft.CodeAnalysis.Operations;
+using SafeSharp.Analyzers.Semantics;
 using SafeSharp.Core;
 
 namespace SafeSharp.Analyzers.Analysis;
@@ -20,11 +21,11 @@ internal sealed class OperationLowerer
     private List<FlowInstruction> _instructions = new();
 
     public OperationLowerer(IMethodSymbol method, MethodSummaryProvider summaries, CancellationToken cancellationToken)
-    { _method = method; _summaries = summaries; _cancellationToken = cancellationToken; SeedParameters(); }
+    { _method = method; _summaries = summaries; _cancellationToken = cancellationToken; SeedCallbackInputs(); SeedParameters(); }
 
     public const string ReturnPlace = "$return";
     public IReadOnlyList<FlowInstruction> Seeds => _seeds;
-    public bool ReturnsBorrowed => _summaries.Get(_method, _cancellationToken).BorrowedFrom is not null;
+    public bool ReturnsBorrowed => _summaries.Get(_method, _cancellationToken).HasBorrowedReturn;
 
     public (string Place, bool IsNullWhenTrue)? NullTest(BasicBlock block)
     {
@@ -94,8 +95,55 @@ internal sealed class OperationLowerer
             Seed("this", _method.ContainingType, ResourceOwnership.External, _method.Locations.FirstOrDefault() ?? Location.None);
     }
 
+    private void SeedCallbackInputs()
+    {
+        var inputs = _summaries.Callbacks.Inputs(_method, _cancellationToken);
+        foreach (var group in _summaries.Callbacks.AliasGroups(inputs, _cancellationToken))
+        {
+            var capture = group.FirstOrDefault(value => SymbolFacts.HasAttribute(value.Symbol, "Borrowed") || SymbolFacts.HasAttribute(value.Symbol, "BorrowedMut")) ??
+                          group.FirstOrDefault(value => SymbolFacts.IsDisposable(value.Type)) ?? group.FirstOrDefault(TracksCapture);
+            if (capture is null) continue;
+            var place = CapturePlace(capture);
+            var borrowed = SymbolFacts.HasAttribute(capture.Symbol, "Borrowed") || SymbolFacts.HasAttribute(capture.Symbol, "BorrowedMut");
+            if (borrowed)
+            {
+                var root = "$callback-input:" + place;
+                Seed(root, capture.Type, ResourceOwnership.Borrowed, capture.Location);
+                _seeds.Add(new FlowInstruction(SymbolFacts.HasAttribute(capture.Symbol, "BorrowedMut") ? InstructionKind.BorrowExclusive : InstructionKind.BorrowShared,
+                    Site(capture.Location), target: place, source: root, description: "preserve captured parameter borrow contract"));
+            }
+            else Seed(place, capture.Type, ResourceOwnership.Owned, capture.Location);
+            foreach (var alias in group)
+            {
+                if (SymbolEqualityComparer.Default.Equals(alias.Symbol, capture.Symbol)) continue;
+                var aliasPlace = CapturePlace(alias);
+                _seeded.Add(aliasPlace);
+                _seeds.Add(new FlowInstruction(InstructionKind.Alias, Site(alias.Location), target: aliasPlace, source: place,
+                    description: "preserve stable captured reference alias"));
+            }
+        }
+    }
+
+    private static bool TracksCapture(ConcurrencyCapture capture) => SymbolFacts.IsTracked(capture.Type) ||
+        HasOwnershipContract(capture.Symbol) || SymbolFacts.Implements(capture.Type, "System.IServiceProvider");
+
+    private string CapturePlace(ConcurrencyCapture capture) => capture.Name == "this" && capture.Symbol is ITypeSymbol ? "this" : Place(capture.Symbol);
+
+    private void TransferCallbackCaptures(IInvocationOperation invocation)
+    {
+        foreach (var transfer in _summaries.Callbacks.Transfers(invocation, _cancellationToken))
+        {
+            var capture = transfer.Captures.FirstOrDefault(TracksCapture);
+            if (capture is null) continue;
+            _instructions.Add(new FlowInstruction(InstructionKind.Move, Site(transfer.Boundary), source: CapturePlace(capture),
+                flags: transfer.Conditional ? InstructionFlags.Conditional : InstructionFlags.None,
+                description: "transfer captured " + capture.Name + " through TransfersToThread"));
+        }
+    }
+
     private static bool HasOwnershipContract(ISymbol symbol) => SymbolFacts.HasAttribute(symbol, "Owned") ||
-        SymbolFacts.HasAttribute(symbol, "Consumes") || SymbolFacts.HasAttribute(symbol, "Borrowed") || SymbolFacts.HasAttribute(symbol, "BorrowedMut");
+        SymbolFacts.HasAttribute(symbol, "Consumes") || SymbolFacts.HasAttribute(symbol, "Borrowed") || SymbolFacts.HasAttribute(symbol, "BorrowedMut") ||
+        SymbolFacts.HasAttribute(symbol, "Lifetime");
 
     private void Seed(string place, ITypeSymbol? type, ResourceOwnership ownership, Location location)
     {
@@ -140,6 +188,8 @@ internal sealed class OperationLowerer
                 return Use(Place(local.Local), local, read);
             case IParameterReferenceOperation parameter:
                 return Use(Place(parameter.Parameter), parameter, read);
+            case IDeclarationExpressionOperation declarationExpression:
+                return Evaluate(declarationExpression.Expression, false);
             case IInstanceReferenceOperation instance:
                 return Use("this", instance, read);
             case IFlowCaptureReferenceOperation capture:
@@ -176,8 +226,12 @@ internal sealed class OperationLowerer
             }
             case IObjectCreationOperation creation:
             {
-                EvaluateArguments(creation.Arguments, creation.Constructor);
+                var arguments = EvaluateArguments(creation.Arguments, creation.Constructor);
+                ActivateArguments(arguments);
                 MarkMayThrow(creation);
+                ApplyOutputArguments(creation.Arguments, arguments.Values, creation.Constructor is { } constructor ? _summaries.Get(constructor, _cancellationToken) : null);
+                TouchArguments(arguments);
+                EndArguments(arguments);
                 if (creation.Initializer is not null) Evaluate(creation.Initializer);
                 if (!SymbolFacts.IsTracked(creation.Type)) return null;
                 var target = Temporary(creation);
@@ -190,15 +244,18 @@ internal sealed class OperationLowerer
             case IAwaitOperation awaitOperation:
             {
                 var value = Evaluate(awaitOperation.Operation, false, true);
-                // Task<T>/ValueTask<T> factory results become owned only once awaited.
-                if (value is null && SymbolFacts.IsTracked(awaitOperation.Type) && SymbolFacts.Unwrap(awaitOperation.Operation) is IInvocationOperation factory &&
-                    _summaries.Get(factory.TargetMethod, _cancellationToken).ReturnsOwned)
+                Add(InstructionKind.Suspend, awaitOperation, description: "await suspension point");
+                if (value is not null)
+                    Add(InstructionKind.CompleteAsyncDispose, awaitOperation, source: value, description: "observe awaited disposal completion");
+                // Observing a faulted completion still fulfills the obligation to await it. The fault
+                // may then propagate, before a successful factory result becomes available.
+                MarkMayThrow(awaitOperation);
+                if (FindOwnedAwaitedFactory(awaitOperation.Operation) is { } factory && SymbolFacts.IsTracked(awaitOperation.Type))
                 {
                     value = Temporary(awaitOperation);
                     Add(InstructionKind.Allocate, awaitOperation, target: value, resourceId: "await:" + awaitOperation.Syntax.SpanStart,
-                        flags: ResourceFlags(awaitOperation.Type));
+                        flags: ResourceFlags(awaitOperation.Type), description: "receive owned result after awaiting " + factory.TargetMethod.Name);
                 }
-                Add(InstructionKind.Suspend, awaitOperation, description: "await suspension point");
                 return value;
             }
             case IFieldReferenceOperation field:
@@ -328,15 +385,36 @@ internal sealed class OperationLowerer
     private string? Invoke(IInvocationOperation invocation, bool awaited)
     {
         var method = invocation.TargetMethod;
-        var instance = Evaluate(invocation.Instance, false);
+        var instance = Evaluate(invocation.Instance, false, awaited && IsCompletionWrapper(method));
         if (SymbolFacts.IsDispose(method) || SymbolFacts.IsDisposeAsync(method))
         {
-            if (instance is not null && (SymbolFacts.IsDispose(method) || awaited || invocation.IsImplicit))
+            var asynchronous = SymbolFacts.IsDisposeAsync(method);
+            if (instance is not null)
                 Add(InstructionKind.Dispose, invocation, source: instance,
                     flags: (invocation.IsImplicit ? InstructionFlags.Implicit : InstructionFlags.None) |
-                           (SymbolFacts.IsDisposeAsync(method) ? InstructionFlags.AsyncDispose : InstructionFlags.None));
-            // The caller's release obligation is discharged by invoking cleanup. Whether a throwing
-            // implementation physically completed cleanup is outside this call-boundary contract.
+                           (asynchronous ? InstructionFlags.AsyncDispose : InstructionFlags.None));
+            // A synchronous throw must not invent an awaitable. The owner's invocation obligation is
+            // discharged first; the completion obligation exists only on the successful call edge.
+            MarkMayThrow(invocation);
+            if (!asynchronous || instance is null) return null;
+            var completion = Temporary(invocation);
+            Add(InstructionKind.BeginAsyncDispose, invocation, source: instance, target: completion,
+                resourceId: "async-dispose:" + invocation.Syntax.SpanStart,
+                flags: InstructionFlags.DisposalAlreadyInvoked | (invocation.IsImplicit ? InstructionFlags.Implicit : InstructionFlags.None),
+                description: "track asynchronous disposal completion");
+            return completion;
+        }
+        if (IsCompletionWrapper(method))
+        {
+            foreach (var argument in invocation.Arguments) Evaluate(argument.Value);
+            if (instance is not null) Add(InstructionKind.Read, invocation, source: instance);
+            MarkMayThrow(invocation);
+            return instance;
+        }
+        if (IsCompletionObservation(method))
+        {
+            if (instance is not null) Add(InstructionKind.CompleteAsyncDispose, invocation, source: instance,
+                description: "observe disposal completion through " + method.Name);
             MarkMayThrow(invocation);
             return null;
         }
@@ -350,93 +428,211 @@ internal sealed class OperationLowerer
                 invocation, target: target, source: source);
             return target;
         }
-        if (instance is not null) Add(SymbolFacts.HasAttribute(method, "Mutates") ? InstructionKind.Write : InstructionKind.Read, invocation, source: instance);
+
+        string? receiverLoan = null;
+        if (instance is not null && SymbolFacts.HasAttribute(method, "Mutates"))
+        {
+            receiverLoan = "$receiver-loan:" + invocation.Syntax.SpanStart;
+            Add(InstructionKind.ReserveExclusiveBorrow, invocation, target: receiverLoan, source: instance,
+                description: "reserve mutable receiver while evaluating arguments");
+        }
+        else if (instance is not null) Add(InstructionKind.Read, invocation, source: instance);
         var arguments = EvaluateArguments(invocation.Arguments, method, summary);
+        if (receiverLoan is not null)
+            Add(InstructionKind.ActivateBorrow, invocation, source: receiverLoan, description: "activate mutable receiver at call");
+        ActivateArguments(arguments);
+        if (receiverLoan is not null) Add(InstructionKind.Write, invocation, source: receiverLoan);
+        TransferCallbackCaptures(invocation);
         MarkMayThrow(invocation);
+        ApplyOutputArguments(invocation.Arguments, arguments.Values, summary);
+        TouchArguments(arguments);
+        if (receiverLoan is not null) Add(InstructionKind.Read, invocation, source: receiverLoan);
+
+        string? Finish(string? result)
+        {
+            EndArguments(arguments);
+            if (receiverLoan is not null) Add(InstructionKind.ReleaseLoan, invocation, target: receiverLoan);
+            return result;
+        }
+
         if (SymbolFacts.IsPoolRent(method))
         {
             var target = Temporary(invocation);
             Add(InstructionKind.Allocate, invocation, target: target, resourceId: "pool:" + invocation.Syntax.SpanStart,
                 description: "lease from " + method.ContainingType.ToDisplayString());
-            return target;
+            return Finish(target);
         }
-        if (SymbolFacts.IsPoolReturn(method) && arguments.TryGetValue(0, out var lease))
+        if (SymbolFacts.IsPoolReturn(method) && arguments.Values.TryGetValue(0, out var lease))
         {
             Add(InstructionKind.Dispose, invocation, source: lease, description: "return lease to pool");
-            return null;
+            return Finish(null);
         }
         if (SymbolFacts.IsServiceResolution(method))
         {
-            var owner = instance ?? (arguments.TryGetValue(0, out var provider) ? provider : null);
+            var owner = instance ?? (arguments.Values.TryGetValue(0, out var provider) ? provider : null);
             var target = Temporary(invocation);
             Add(InstructionKind.Allocate, invocation, target: target, resourceId: "service:" + invocation.Syntax.SpanStart,
                 ownership: ResourceOwnership.Scoped, owner: owner, flags: InstructionFlags.SuppressLeak,
                 description: "resolve container-owned service");
-            return target;
+            return Finish(target);
         }
-        if (summary.BorrowedFrom is { } from)
+        if (summary.HasBorrowedReturn)
         {
-            var source = from == "this" ? instance : method.Parameters.FirstOrDefault(p => p.Name == from) is { } parameter &&
-                arguments.TryGetValue(parameter.Ordinal, out var value) ? value : null;
-            if (source is not null)
+            var origins = new List<string>();
+            foreach (var from in summary.BorrowedSources)
             {
+                var source = from == "this" ? receiverLoan ?? instance : method.Parameters.FirstOrDefault(parameter => parameter.Name == from) is { } parameter &&
+                    arguments.Values.TryGetValue(parameter.Ordinal, out var value)
+                        ? arguments.ParameterLoans.TryGetValue(parameter.Ordinal, out var loan) ? loan : value : null;
+                if (source is not null && !origins.Contains(source)) origins.Add(source);
+            }
+            if (origins.Count > 0)
+            {
+                // A signature can constrain a result to several inputs without selecting one.
+                // Join source alternatives before creating one loan family to avoid simultaneous
+                // artificial exclusive loans between inputs that are aliases of the same resource.
+                var union = "$return-origins:" + invocation.Syntax.SpanStart;
+                Add(InstructionKind.Alias, invocation, target: union, source: origins[0]);
+                foreach (var source in origins.Skip(1)) Add(InstructionKind.MergeAlias, invocation, target: union, source: source);
                 var target = Temporary(invocation);
-                Add(summary.MutableBorrow ? InstructionKind.BorrowExclusive : InstructionKind.BorrowShared, invocation, target: target, source: source);
-                return target;
+                Add(summary.MutableBorrow ? InstructionKind.BorrowExclusive : InstructionKind.BorrowShared,
+                    invocation, target: target, source: union, description: "returned borrow bounded by " + string.Join(", ", summary.BorrowedSources));
+                Add(InstructionKind.ReleaseLoan, invocation, target: union);
+                return Finish(target);
             }
         }
+        // Task<T> is itself IDisposable, but a factory contract describes the awaited T.
+        // The direct await acquires T after its suspension and exceptional completion boundary.
+        if (awaited && IsOwnedAwaitableFactory(invocation)) return Finish(null);
         if (summary.ReturnsOwned && SymbolFacts.IsTracked(invocation.Type))
         {
             var target = Temporary(invocation);
             Add(InstructionKind.Allocate, invocation, target: target, resourceId: "factory:" + invocation.Syntax.SpanStart, flags: ResourceFlags(invocation.Type),
                 description: "acquire result of " + method.ToDisplayString());
-            return target;
+            return Finish(target);
         }
         if (SymbolFacts.IsTracked(invocation.Type))
         {
             var target = Temporary(invocation);
             Add(InstructionKind.Allocate, invocation, target: target, resourceId: "external-call:" + invocation.Syntax.SpanStart,
                 ownership: ResourceOwnership.External, flags: ResourceFlags(invocation.Type), description: "uncontracted external result");
-            return target;
+            return Finish(target);
         }
-        return null;
+        return Finish(null);
     }
 
-    private Dictionary<int, string> EvaluateArguments(System.Collections.Immutable.ImmutableArray<IArgumentOperation> arguments, IMethodSymbol? method, MethodSummary? summary = null)
+    private sealed class CallArguments
     {
-        var values = new Dictionary<int, string>();
-        var loans = new List<string>();
+        internal Dictionary<int, string> Values { get; } = new();
+        internal Dictionary<int, string> ParameterLoans { get; } = new();
+        internal List<(string Place, IOperation Site)> PassedValues { get; } = new();
+        internal List<(string Place, IOperation Site, bool Reserved, bool Mutable)> Loans { get; } = new();
+        internal List<(string Place, IOperation Site, string Description)> Disposals { get; } = new();
+    }
+
+    private CallArguments EvaluateArguments(System.Collections.Immutable.ImmutableArray<IArgumentOperation> arguments,
+        IMethodSymbol? method, MethodSummary? summary = null)
+    {
+        var result = new CallArguments();
         foreach (var argument in arguments)
         {
             var source = Evaluate(argument.Value, false);
             if (source is null) continue;
             var parameter = argument.Parameter;
-            if (parameter is not null) values[parameter.Ordinal] = source;
+            if (parameter is not null) result.Values[parameter.Ordinal] = source;
+            // Out slots are written by the completed call. No incoming value is read or consumed.
+            if (parameter?.RefKind == RefKind.Out) continue;
             if (parameter is not null && (SymbolFacts.HasAttribute(parameter, "Consumes") || SymbolFacts.HasAttribute(parameter, "Owned")))
                 Add(InstructionKind.Move, argument, source: source, description: "transfer to " + method?.Name + "(" + parameter.Name + ")");
-            else if (parameter is not null && (SymbolFacts.HasAttribute(parameter, "Borrowed") || SymbolFacts.HasAttribute(parameter, "BorrowedMut")))
+            else if (parameter is not null && (SymbolFacts.HasAttribute(parameter, "Borrowed") || SymbolFacts.HasAttribute(parameter, "BorrowedMut") ||
+                parameter.RefKind is RefKind.Ref or RefKind.In or RefKind.RefReadOnlyParameter))
             {
                 var loan = "$call-loan:" + argument.Syntax.SpanStart + ":" + parameter.Ordinal;
-                Add(SymbolFacts.HasAttribute(parameter, "BorrowedMut") ? InstructionKind.BorrowExclusive : InstructionKind.BorrowShared,
-                    argument, target: loan, source: source, description: "borrow for argument " + parameter.Name);
-                loans.Add(loan);
+                var reserved = SymbolFacts.HasAttribute(parameter, "BorrowedMut");
+                var kind = reserved ? InstructionKind.ReserveExclusiveBorrow : parameter.RefKind == RefKind.Ref
+                    ? InstructionKind.BorrowExclusive : InstructionKind.BorrowShared;
+                Add(kind, argument, target: loan, source: source, description: "borrow for argument " + parameter.Name);
+                result.Loans.Add((loan, argument, reserved, reserved || parameter.RefKind == RefKind.Ref));
+                result.ParameterLoans[parameter.Ordinal] = loan;
             }
             else if (parameter is not null && summary?.DisposedParameters.Contains(parameter.Ordinal) == true)
-                Add(InstructionKind.Dispose, argument, source: source, description: "callee disposes parameter " + parameter.Name);
-            else if (parameter?.RefKind == RefKind.Ref)
-                Add(InstructionKind.Write, argument, source: source, description: "mutable ref argument");
-            else if (parameter?.RefKind != RefKind.Out)
+                result.Disposals.Add((source, argument, "callee disposes parameter " + parameter.Name));
+            else
+            {
                 Add(InstructionKind.Read, argument, source: source);
-            if (parameter?.RefKind == RefKind.Out)
-                Add(InstructionKind.Forget, argument, target: source);
+                result.PassedValues.Add((source, argument));
+            }
         }
-        // Keep all argument loans live simultaneously through the call; otherwise backward liveness
-        // would incorrectly expire the first argument before checking the second argument's alias.
-        foreach (var loan in loans)
-            _instructions.Add(new FlowInstruction(InstructionKind.Read, _instructions.Last().Site, source: loan));
-        foreach (var loan in loans)
-            _instructions.Add(new FlowInstruction(InstructionKind.ReleaseLoan, _instructions.Last().Site, target: loan));
-        return values;
+        return result;
+    }
+
+    private void ActivateArguments(CallArguments arguments)
+    {
+        foreach (var loan in arguments.Loans.Where(loan => loan.Reserved))
+            Add(InstructionKind.ActivateBorrow, loan.Site, source: loan.Place, description: "activate mutable argument at call");
+        foreach (var loan in arguments.Loans.Where(loan => loan.Mutable))
+            Add(InstructionKind.Write, loan.Site, source: loan.Place, description: "callee may mutate borrowed argument");
+        foreach (var disposal in arguments.Disposals)
+            Add(InstructionKind.Dispose, disposal.Site, source: disposal.Place, description: disposal.Description);
+    }
+
+    private void TouchArguments(CallArguments arguments)
+    {
+        // Loans remain live simultaneously through activation and the call. These reads precede
+        // returned reborrows: reading an exclusive parent after creating its child would be invalid.
+        foreach (var loan in arguments.Loans) Add(InstructionKind.Read, loan.Site, source: loan.Place);
+        foreach (var value in arguments.PassedValues) Add(InstructionKind.Read, value.Site, source: value.Place);
+    }
+
+    private void EndArguments(CallArguments arguments)
+    {
+        foreach (var loan in arguments.Loans) Add(InstructionKind.ReleaseLoan, loan.Site, target: loan.Place);
+    }
+
+    private static bool IsFrameworkAwaitableMethod(IMethodSymbol method)
+    {
+        var assembly = method.ContainingAssembly.Identity.Name;
+        if (assembly is not ("System.Private.CoreLib" or "mscorlib" or "System.Runtime" or "System.Threading.Tasks" or "System.Threading.Tasks.Extensions")) return false;
+        var type = method.ContainingType;
+        while (type.ContainingType is { } containing) type = containing;
+        return type.ContainingNamespace.ToDisplayString() is "System.Threading.Tasks" or "System.Runtime.CompilerServices" &&
+            type.Name is "Task" or "ValueTask" or "ConfiguredTaskAwaitable" or "ConfiguredValueTaskAwaitable" or "TaskAwaiter" or "ValueTaskAwaiter";
+    }
+
+    private static bool IsCompletionWrapper(IMethodSymbol method) => !method.IsStatic && IsFrameworkAwaitableMethod(method) &&
+        (method.Name == "ConfigureAwait" && method.Parameters.Length == 1 || method.Name is "AsTask" or "GetAwaiter" && method.Parameters.Length == 0);
+
+    private static bool IsCompletionObservation(IMethodSymbol method) => !method.IsStatic && method.Parameters.Length == 0 &&
+        method.Name is "GetResult" or "Wait" && IsFrameworkAwaitableMethod(method);
+
+    private bool IsOwnedAwaitableFactory(IInvocationOperation invocation) => invocation.Type is INamedTypeSymbol { Arity: 1 } type &&
+        type.ContainingNamespace.ToDisplayString() == "System.Threading.Tasks" && type.Name is "Task" or "ValueTask" &&
+        _summaries.Get(invocation.TargetMethod, _cancellationToken).ReturnsOwned;
+
+    private IInvocationOperation? FindOwnedAwaitedFactory(IOperation operation)
+    {
+        operation = SymbolFacts.Unwrap(operation);
+        if (operation is not IInvocationOperation invocation) return null;
+        if (IsOwnedAwaitableFactory(invocation)) return invocation;
+        return IsCompletionWrapper(invocation.TargetMethod) && invocation.Instance is { } instance ? FindOwnedAwaitedFactory(instance) : null;
+    }
+
+    private void ApplyOutputArguments(System.Collections.Immutable.ImmutableArray<IArgumentOperation> arguments,
+        Dictionary<int, string> values, MethodSummary? summary)
+    {
+        foreach (var argument in arguments.Where(argument => argument.Parameter?.RefKind == RefKind.Out))
+        {
+            var parameter = argument.Parameter!;
+            if (!values.TryGetValue(parameter.Ordinal, out var target)) continue;
+            Add(InstructionKind.Forget, argument, target: target, description: "replace caller out slot after successful call");
+            if (summary?.OwnedOutputParameters.TryGetValue(parameter.Ordinal, out var nullable) == true)
+                Add(InstructionKind.Allocate, argument, target: target, resourceId: "out-owned:" + argument.Syntax.SpanStart,
+                    flags: ResourceFlags(parameter.Type) | (nullable ? InstructionFlags.MayBeNull : InstructionFlags.None),
+                    description: "receive owned out parameter " + parameter.Name);
+            else if (SymbolFacts.IsTracked(parameter.Type))
+                Add(InstructionKind.Allocate, argument, target: target, resourceId: "out-external:" + argument.Syntax.SpanStart,
+                    ownership: ResourceOwnership.External, flags: ResourceFlags(parameter.Type), description: "receive uncontracted out parameter " + parameter.Name);
+        }
     }
 
     private string Use(string place, IOperation operation, bool read)
