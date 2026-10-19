@@ -84,8 +84,101 @@ safesharp_max_contract_steps = 20000
 
 Reaching a bound emits informational SS0046; the safety property has not been established. Existing SS0021 findings can accompany this diagnostic. The CLI treats SS0046 as incomplete analysis even when its visible severity is suppressed.
 
+## Explicit concurrency: SS0044–SS0046
+
+`[Send]` and `[Sync]` can annotate classes, structs, interfaces, and generic parameters. They are independent promises. A type that supports shared access may still be unsuitable for exclusive transfer; a type that supports exclusive transfer may contain mutable state that cannot be shared.
+
+| Contract | Checked meaning |
+| --- | --- |
+| `[Send]` | The value's declared structure supports transfer under exclusive ownership. Mutable scalar state is permitted. Reference components must themselves be Send and must either be `[Owned]` or also support Sync. |
+| `[Sync]` | Instance storage is readonly or init-only and each component supports Sync. This is a structural sharing check. |
+| `[ThreadSafe]` | A trusted synchronization contract can supply Sync and permit mutable or otherwise opaque component storage. Its synchronization implementation is not proved. |
+| `[ThreadAffine]` | Conflicts with both capabilities, including inherited contracts and contained source-visible affinity. ThreadSafe cannot erase thread affinity. |
+| `[TransfersToThread] Action callback` | Declares an exclusive transfer boundary for captured values. Captures require Send. The ownership engine applies this explicit transfer contract to visible captures. |
+| `[SharesAcrossThreads] Action callback` | Declares that captured values may be shared across threads. Captures require Sync. |
+
+```csharp
+[Send]
+sealed class WorkItem
+{
+    public int Attempts;
+}
+
+[Send, Sync]
+sealed class WorkDescription
+{
+    public string Text { get; }
+    public WorkDescription(string text) => Text = text;
+}
+
+static void Enqueue([TransfersToThread] Action callback)
+{
+    // This API's implementation must uphold its declared transfer protocol.
+}
+
+static void Publish([SharesAcrossThreads] Action callback)
+{
+    // This API's implementation may invoke the callback on another thread.
+}
+
+static void Schedule()
+{
+    var item = new WorkItem();
+    Enqueue(() => item.Attempts++);  // Send permits owned mutable state.
+
+    var description = new WorkDescription("compile");
+    Publish(() => Console.WriteLine(description.Text));
+}
+```
+
+The boundary attributes are parameter contracts and require delegate-typed parameters. Declaring both on the same parameter is invalid. Interface and override parameter contracts are honored when the implementation omits its annotations. Forwarding a callback parameter to a boundary requiring the same capability preserves that checked precondition.
+
+### Composition and generic requirements
+
+Source declarations are checked through all instance fields, including compiler-generated auto-property storage and inherited fields. An inherited type or interface contract applies to concrete source implementations. Recursive annotated structures are checked coinductively without caching an assumed success before their dependencies have been checked. Metadata-only annotated components remain trusted external contracts; an external base without the required contract is not silently accepted.
+
+```csharp
+[Send]
+sealed class WorkBatch<[Send] T>
+{
+    [Owned] private T item;
+    public WorkBatch(T item) => this.item = item;
+}
+
+[Sync]
+sealed class Snapshot<[Sync] T>
+{
+    public T Value { get; }
+    public Snapshot(T value) => Value = value;
+}
+```
+
+An annotated generic parameter is an assumption inside the generic body and a requirement at constructed type uses and generic method calls, including inferred method arguments. A type parameter can also obtain a capability from an appropriately annotated interface or base constraint. An arbitrary `T`, `object`, delegate, native pointer, or `dynamic` value has no inferred capability. A method name resembling a concurrency contract has no effect; attributes are resolved by symbol identity.
+
+The intrinsic immutable list is deliberately small: Boolean and numeric scalar types, `char`, `string`, enums, and the actual framework `DateTime`, `DateTimeOffset`, `TimeSpan`, and `Guid` types. Nullable scalar wrappers and tuples compose their component capabilities. `IntPtr` and `UIntPtr` are not accepted as ordinary immutable scalar payloads because their native ownership is unknown. Arrays can be Send when their elements are Send, but are not Sync because their elements remain writable through shared references. A Send owner containing such an array must declare ownership of that field. Other collection types require explicit or external trusted contracts; there is no blanket claim that all BCL collections are safe.
+
+Readonly fields protect their slots, not their referenced objects. For example, `readonly object state` cannot establish Sync; neither can `readonly int[] items`. A writable scalar field can establish Send, but requires trusted synchronization to establish Sync. Init-only auto-properties are treated as construction-time state. Reflection and unsafe writes can invalidate these conventions and remain outside the proof.
+
+### Callback captures and cells
+
+The analyzer resolves direct lambdas, local functions, instance method groups, conditional/coalesced callback expressions, and visible local delegate aliases and assignments. Alias resolution conservatively considers visible assignments in the containing operation body; it is not a whole-program delegate points-to analysis. An opaque delegate at an explicit custom boundary receives SS0045 because its captures cannot be established.
+
+For ordinary `Task.Run`, the new sharing check applies when a captured value has an explicit Send, Sync, or ThreadSafe contract. Existing SS0025 continues to report ThreadAffine Task.Run captures. Unannotated Task.Run code does not automatically acquire a new universal concurrency requirement. A Send-only mutable value captured by Task.Run receives SS0045 because the ordinary closure shares access to that value.
+
+Captured **variable cells** are checked separately from value types. A captured `int` is an immutable scalar value, but `() => counter++` still mutates shared closure storage. Writes, increments, `ref`/`out` exposure, and direct ref aliases of a captured variable are rejected at explicit boundaries. The scan is conservative across the containing body; an assignment that happens before scheduling can still require restructuring into a stable local. A method-group delegate stores its receiver value when created, so later reassignment of the original receiver variable is not itself a shared-cell write.
+
+Static fields and properties remain shared storage even at a transfer boundary and require Sync. Mutable static slots are rejected. Capturing `this` checks the receiver's contract and structure. Nested callback bodies are included when collecting visible captures; values created entirely inside a callback do not become outer captures. `nameof` references do not count as runtime captures.
+
+SS0044 identifies invalid declarations or generic composition. SS0045 identifies the precise captured value at a violating boundary. Both retain `SafeSharp.ConcurrencyCapability`, `SafeSharp.ConcurrencyPath`, and `SafeSharp.ConcurrencyReason`; related source locations preserve component declarations and the scheduling invocation.
+
+### What these contracts establish
+
+The checks establish the declared structural conditions at analyzed source boundaries. They do not prove lock correctness, atomicity, temporal publication, deadlock freedom, custom scheduler behavior, arbitrary static state accessed inside methods, unmanaged resource thread affinity, or unrestricted data-race freedom. ThreadSafe and external metadata contracts are trusted assertions. Transfer-boundary implementations must honor their declared exclusivity and callback protocol; an attribute does not schedule work, copy a closure by value, or prevent reflection from obtaining an alias.
+
+Concurrency checks share `safesharp_max_contract_steps` with aggregate cleanup, with an independent budget for each declaration, generic-use check, or callback boundary. Recursive type expansion and delegate alias resolution additionally stop at depth 128; each source-visible affinity traversal examines at most 128 distinct types. SS0046 records an incomplete check and is not evidence that the contract was satisfied.
+
 ## Relationship to Rust
 
 Rust's drop elaboration uses initialization and move information to decide where destruction is required, including conditional drops. SafeSharp instead tracks explicitly declared C# disposal obligations and checks explicit cleanup methods. It does not insert C# cleanup, replace the garbage collector, or adopt Rust's destructor scheduling. The implementation takes the control-flow obligation idea from [Rust's drop elaboration documentation](https://rustc-dev-guide.rust-lang.org/mir/drop-elaboration.html); see the repository's [pinned Rust source references](rust-design.md) for the broader design mapping.
 
-Rust distinguishes transferable owned values (`Send`) from values whose shared references can cross threads (`Sync`). Their language-level meaning depends on Rust's aliasing and mutability rules. SafeSharp's forthcoming explicit contracts retain this distinction while checking C# structure and declared callback boundaries; they are not Rust auto traits. Primary references are the [Send API](https://doc.rust-lang.org/std/marker/trait.Send.html), [Sync API](https://doc.rust-lang.org/std/marker/trait.Sync.html), and [Rustonomicon discussion](https://doc.rust-lang.org/nomicon/send-and-sync.html).
+Rust distinguishes transferable owned values (`Send`) from values whose shared references can cross threads (`Sync`). Their language-level meaning depends on Rust's aliasing and mutability rules. SafeSharp's explicit contracts retain this distinction while checking C# structure and declared callback boundaries; they are not Rust auto traits. Primary references are the [Send API](https://doc.rust-lang.org/std/marker/trait.Send.html), [Sync API](https://doc.rust-lang.org/std/marker/trait.Sync.html), and [Rustonomicon discussion](https://doc.rust-lang.org/nomicon/send-and-sync.html).
