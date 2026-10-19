@@ -48,12 +48,16 @@ internal sealed class OwnershipTransfer
                 break;
             case InstructionKind.BorrowShared:
             case InstructionKind.BorrowExclusive:
+            case InstructionKind.ReserveExclusiveBorrow:
                 Borrow(state, instruction, references, blockId, instructionIndex, issues);
+                break;
+            case InstructionKind.ActivateBorrow:
+                ActivateBorrow(state, instruction, references, issues);
                 break;
             case InstructionKind.Read:
                 CheckUse(state, instruction, references, issues);
-                CheckLoans(state, instruction, references, "SS0013", "The owner cannot be read while an exclusive loan remains live.",
-                    loan => loan.Kind == BorrowKind.Exclusive, true, issues);
+                CheckLoans(state, instruction, references, "SS0013", "The owner cannot be read while an active exclusive loan remains live.",
+                    IsPossiblyActiveExclusive, true, issues, definitelyConflicts: IsDefinitelyActiveExclusive);
                 break;
             case InstructionKind.Write:
                 CheckUse(state, instruction, references, issues);
@@ -165,16 +169,23 @@ internal sealed class OwnershipTransfer
     {
         CheckUse(state, instruction, references, issues);
         var kind = instruction.Kind == InstructionKind.BorrowShared ? BorrowKind.Shared : BorrowKind.Exclusive;
-        CheckLoans(state, instruction, references, "SS0006", kind == BorrowKind.Exclusive
-            ? "An exclusive loan conflicts with another live loan."
-            : "A shared loan conflicts with a live exclusive loan.", loan => kind == BorrowKind.Exclusive || loan.Kind == BorrowKind.Exclusive, true, issues);
+        var isReservation = instruction.Kind == InstructionKind.ReserveExclusiveBorrow;
+        CheckLoans(state, instruction, references, "SS0006", isReservation
+            ? "An exclusive reservation conflicts with another exclusive loan or reservation."
+            : kind == BorrowKind.Exclusive ? "An exclusive loan conflicts with another live loan."
+                : "A shared loan conflicts with a live active exclusive loan.",
+            loan => isReservation ? loan.Kind == BorrowKind.Exclusive : kind == BorrowKind.Exclusive || IsPossiblyActiveExclusive(loan),
+            true, issues, definitelyConflicts: loan => isReservation ? loan.Kind == BorrowKind.Exclusive
+                : kind == BorrowKind.Exclusive || IsDefinitelyActiveExclusive(loan));
         if (kind == BorrowKind.Exclusive)
         {
             var sharedParents = references.Where(reference => reference.LoanId is not null
-                && state.Loans.TryGetValue(reference.LoanId, out var parent) && parent.Kind == BorrowKind.Shared).ToArray();
+                && state.Loans.TryGetValue(reference.LoanId, out var parent) &&
+                    (parent.Kind == BorrowKind.Shared || (parent.Phase & BorrowPhase.Reserved) != 0)).ToArray();
             if (sharedParents.Length != 0 && issues is not null)
-                issues.Add("SS0006", "An exclusive loan cannot be derived from a shared loan.", instruction.Site,
-                    Certainty(sharedParents.Length == references.Length && sharedParents.All(reference => !reference.MayBeAbsent), instruction),
+                issues.Add("SS0006", "An exclusive loan cannot be derived from a shared loan or an unactivated reservation.", instruction.Site,
+                    Certainty(sharedParents.Length == references.Length && sharedParents.All(reference => !reference.MayBeAbsent &&
+                        (state.Loans[reference.LoanId!].Kind == BorrowKind.Shared || state.Loans[reference.LoanId!].Phase == BorrowPhase.Reserved)), instruction),
                     sharedParents[0].ResourceId, FactsFor(state, sharedParents));
         }
         CheckOverwrite(state, instruction, instruction.Target!, references, issues);
@@ -185,7 +196,8 @@ internal sealed class OwnershipTransfer
             var parents = reference.LoanId is null ? ImmutableHashSet.Create<string>(StringComparer.Ordinal)
                 : ImmutableHashSet.Create(StringComparer.Ordinal, reference.LoanId);
             var loan = new LoanFact(id, reference.ResourceId, instruction.Target!, kind, instruction.Site, reference.Projection,
-                (instruction.Flags & InstructionFlags.AllowsSuspension) != 0, parents, references.Length > 1 || reference.MayBeAbsent);
+                (instruction.Flags & InstructionFlags.AllowsSuspension) != 0, parents, references.Length > 1 || reference.MayBeAbsent,
+                isReservation ? BorrowPhase.Reserved : BorrowPhase.Active);
             if (state.Loans.TryGetValue(id, out var previous)) loan = previous.Join(loan);
             state.Loans[id] = loan;
             borrowed.Add(new ReferenceFact(reference.ResourceId, reference.Availability, id, reference.Projection,
@@ -193,6 +205,29 @@ internal sealed class OwnershipTransfer
         }
         state.Assign(instruction.Target!, borrowed, state.CanBeNull(instruction.Source));
     }
+
+    private static void ActivateBorrow(AbstractState state, FlowInstruction instruction, ReferenceFact[] references, IssueCollector? issues)
+    {
+        // SafeSharp retains possible phases in its CFG lattice instead of rustc's dominance-based activation query.
+        // https://rustc-dev-guide.rust-lang.org/borrow-check/two-phase-borrows.html
+        // Pinned implementation reference: https://github.com/rust-lang/rust/blob/f8297e351a40c1439a467bbbb6879088047f50b3/compiler/rustc_borrowck/src/borrow_set.rs
+        CheckUse(state, instruction, references, issues);
+        CheckLoans(state, instruction, references, "SS0006", "An exclusive reservation cannot activate while a conflicting loan remains live.",
+            _ => true, true, issues);
+        foreach (var reference in references)
+        {
+            if (reference.LoanId is null || !state.Loans.TryGetValue(reference.LoanId, out var loan) || loan.Kind != BorrowKind.Exclusive)
+            {
+                issues?.Add("SS0006", "Only an exclusive loan reservation can be activated.", instruction.Site,
+                    Certainty(references.Length == 1 && !reference.MayBeAbsent, instruction), reference.ResourceId, FactsFor(state, new[] { reference }));
+                continue;
+            }
+            state.Loans[loan.Id] = loan.Activate(instruction.Site, !reference.CoversResource);
+        }
+    }
+
+    private static bool IsPossiblyActiveExclusive(LoanFact loan) => loan.Kind == BorrowKind.Exclusive && (loan.Phase & BorrowPhase.Active) != 0;
+    private static bool IsDefinitelyActiveExclusive(LoanFact loan) => loan.Kind == BorrowKind.Exclusive && loan.Phase == BorrowPhase.Active;
 
     private static void InvalidateAliases(AbstractState state, ReferenceFact moved, SourceSite site, bool conditional)
     {
@@ -314,7 +349,8 @@ internal sealed class OwnershipTransfer
     }
 
     private static void CheckLoans(AbstractState state, FlowInstruction instruction, ReferenceFact[] references,
-        string id, string message, Func<LoanFact, bool> conflicts, bool allowAncestors, IssueCollector? issues, bool allowOwnExclusive = false)
+        string id, string message, Func<LoanFact, bool> conflicts, bool allowAncestors, IssueCollector? issues, bool allowOwnExclusive = false,
+        Func<LoanFact, bool>? definitelyConflicts = null)
     {
         if (issues is null || references.Length == 0 || state.Loans.Count == 0) return;
         var invalid = new List<ReferenceFact>();
@@ -324,15 +360,17 @@ internal sealed class OwnershipTransfer
         {
             var ancestors = allowAncestors ? LoanAncestors(state, reference.LoanId) : new HashSet<string>(StringComparer.Ordinal);
             var loans = state.Loans.Values.Where(loan => loan.ResourceId == reference.ResourceId && PlaceRelations.Overlaps(loan.Projection, reference.Projection)
-                && conflicts(loan) && (!ancestors.Contains(loan.Id) || allowOwnExclusive && loan.Id == reference.LoanId && loan.Kind == BorrowKind.Shared)).ToArray();
+                && conflicts(loan) && (!ancestors.Contains(loan.Id) || allowOwnExclusive && loan.Id == reference.LoanId &&
+                    (loan.Kind == BorrowKind.Shared || (loan.Phase & BorrowPhase.Reserved) != 0))).ToArray();
             if (loans.Length == 0) { definite = false; continue; }
             invalid.Add(reference);
             conflictingLoans.AddRange(loans);
-            definite &= !reference.MayBeAbsent && loans.Any(loan => !loan.MayBeAbsent);
+            definite &= !reference.MayBeAbsent && loans.Any(loan => !loan.MayBeAbsent && (definitelyConflicts?.Invoke(loan) ?? true) &&
+                (!allowOwnExclusive || loan.Id != reference.LoanId || loan.Kind == BorrowKind.Shared || loan.Phase == BorrowPhase.Reserved));
         }
         if (invalid.Count == 0) return;
         issues.Add(id, message, instruction.Site, Certainty(definite && invalid.Count == references.Length, instruction), invalid[0].ResourceId,
-            FactsFor(state, invalid).Concat(conflictingLoans.Select(LoanEvidence)));
+            FactsFor(state, invalid).Concat(conflictingLoans.SelectMany(LoanFacts)));
     }
 
     private static HashSet<string> LoanAncestors(AbstractState state, string? loanId)
@@ -357,7 +395,7 @@ internal sealed class OwnershipTransfer
         foreach (var loan in state.Loans.Values)
         {
             if (loan.AllowsSuspension || !liveReferences.Any(reference => reference.LoanId is not null && LoanAncestors(state, reference.LoanId).Contains(loan.Id))) continue;
-            var evidence = new[] { LoanEvidence(loan), new AnalysisEvidence("suspension", "This loan is live after an await or yield boundary.", instruction.Site) };
+            var evidence = LoanFacts(loan).Concat(new[] { new AnalysisEvidence("suspension", "This loan is live after an await or yield boundary.", instruction.Site) });
             issues.Add("SS0010", "A loan remains live across a suspension point; shorten its lifetime or declare an explicit suspension-safe contract.",
                 instruction.Site, Certainty(!loan.MayBeAbsent, instruction), loan.ResourceId, evidence);
         }
@@ -380,7 +418,11 @@ internal sealed class OwnershipTransfer
         foreach (var item in resource.Evidence.Values) yield return item;
     }
 
-    private static AnalysisEvidence LoanEvidence(LoanFact loan) => new("loan", loan.Kind + " loan is created here and is still live.", loan.Origin);
+    private static IEnumerable<AnalysisEvidence> LoanFacts(LoanFact loan)
+    {
+        yield return new AnalysisEvidence("loan", loan.Kind + " loan originates here; its possible current phases are " + loan.Phase + ".", loan.Origin);
+        foreach (var evidence in loan.ActivationEvidence.Values) yield return evidence;
+    }
 
     private static IEnumerable<AnalysisEvidence> FactsFor(AbstractState state, IEnumerable<ReferenceFact> references)
     {
@@ -394,7 +436,8 @@ internal sealed class OwnershipTransfer
                         foreach (var item in Evidence(ownerResource)) yield return item;
             }
             foreach (var item in reference.Evidence.Values) yield return item;
-            if (reference.LoanId is not null && state.Loans.TryGetValue(reference.LoanId, out var loan)) yield return LoanEvidence(loan);
+            if (reference.LoanId is not null && state.Loans.TryGetValue(reference.LoanId, out var loan))
+                foreach (var evidence in LoanFacts(loan)) yield return evidence;
         }
     }
 }

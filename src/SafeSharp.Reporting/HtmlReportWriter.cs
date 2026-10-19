@@ -204,11 +204,12 @@ public sealed class HtmlReportWriter : IAnalysisReportWriter
                     (reference.MovedProjections.IsEmpty ? "" : "; moved: " + string.Join(", ", reference.MovedProjections.OrderBy(value => value, StringComparer.Ordinal))));
         }
         TableEnd(writer);
-        TableStart(writer, "Live loans", "Loan", "Resource / projection", "Holder", "Kind / parent");
+        TableStart(writer, "Live loans", "Loan", "Resource / projection", "Holder", "Kind / phase / parent");
         foreach (var loan in state.Loans.OrderBy(loan => loan.Id, StringComparer.Ordinal))
             Row(writer, loan.Id, loan.ResourceId + loan.Projection, loan.Holder,
-                loan.Kind + (loan.MayBeAbsent ? " (possible)" : "") + " / " + (loan.ParentId ?? "—") +
-                (loan.AllowsSuspension ? "; suspension allowed" : ""));
+                loan.Kind + " / " + loan.Phase + (loan.MayBeAbsent ? " (possible)" : "") + " / " + (loan.ParentId ?? "—") +
+                (loan.AllowsSuspension ? "; suspension allowed" : "") +
+                (loan.ActivationSites.IsEmpty ? "" : "; activation: " + string.Join(", ", loan.ActivationSites.Select(ReportText.Site))));
         TableEnd(writer);
     }
 

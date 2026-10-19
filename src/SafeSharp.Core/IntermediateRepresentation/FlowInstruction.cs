@@ -6,11 +6,19 @@ namespace SafeSharp.Core;
 public enum InstructionKind
 {
     Nop, Allocate, Alias, Move, BorrowShared, BorrowExclusive, Read, Write,
-    Dispose, Escape, Return, Suspend, Forget, ReleaseLoan, AssumeNull, AssumeNotNull
+    Dispose, Escape, Return, Suspend, Forget, ReleaseLoan, AssumeNull, AssumeNotNull,
+    /// <summary>Creates an exclusive reservation which permits reads and shared loans until activation.</summary>
+    ReserveExclusiveBorrow,
+    /// <summary>Activates the reserved loan referenced by Source, including through aliases.</summary>
+    ActivateBorrow
 }
 
 public enum ResourceOwnership { Owned, Borrowed, External, Scoped }
 public enum BorrowKind { Shared, Exclusive }
+
+/// <summary>Possible phases of a loan. A joined state can retain both reserved and active alternatives.</summary>
+[Flags]
+public enum BorrowPhase { None = 0, Reserved = 1, Active = 2 }
 
 [Flags]
 public enum InstructionFlags
@@ -50,11 +58,13 @@ public sealed class FlowInstruction
         Flags = flags;
         Description = description;
         if ((kind == InstructionKind.Allocate || kind == InstructionKind.Alias ||
-            kind == InstructionKind.BorrowShared || kind == InstructionKind.BorrowExclusive) && string.IsNullOrEmpty(target))
+            kind == InstructionKind.BorrowShared || kind == InstructionKind.BorrowExclusive ||
+            kind == InstructionKind.ReserveExclusiveBorrow) && string.IsNullOrEmpty(target))
             throw new ArgumentException("This instruction requires a target place.", nameof(target));
         if ((kind == InstructionKind.Alias || kind == InstructionKind.Move || kind == InstructionKind.BorrowShared ||
             kind == InstructionKind.BorrowExclusive || kind == InstructionKind.Read || kind == InstructionKind.Write ||
-            kind == InstructionKind.Dispose || kind == InstructionKind.Escape) && string.IsNullOrEmpty(source))
+            kind == InstructionKind.Dispose || kind == InstructionKind.Escape ||
+            kind == InstructionKind.ReserveExclusiveBorrow || kind == InstructionKind.ActivateBorrow) && string.IsNullOrEmpty(source))
             throw new ArgumentException("This instruction requires a source place.", nameof(source));
     }
 

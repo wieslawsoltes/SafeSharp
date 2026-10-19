@@ -71,7 +71,8 @@ public sealed class ResourceSnapshot
 public sealed class LoanSnapshot
 {
     internal LoanSnapshot(string id, string resourceId, string holder, BorrowKind kind,
-        SourceSite origin, string? parentId, string projection, bool allowsSuspension, bool mayBeAbsent = false)
+        SourceSite origin, string? parentId, string projection, bool allowsSuspension, bool mayBeAbsent = false,
+        BorrowPhase phase = BorrowPhase.Active, ImmutableArray<SourceSite> activationSites = default)
     {
         Id = id;
         ResourceId = resourceId;
@@ -82,6 +83,8 @@ public sealed class LoanSnapshot
         Projection = projection;
         AllowsSuspension = allowsSuspension;
         MayBeAbsent = mayBeAbsent;
+        Phase = phase;
+        ActivationSites = activationSites.IsDefault ? ImmutableArray<SourceSite>.Empty : activationSites;
     }
 
     public string Id { get; }
@@ -93,6 +96,8 @@ public sealed class LoanSnapshot
     public string Projection { get; }
     public bool AllowsSuspension { get; }
     public bool MayBeAbsent { get; }
+    public BorrowPhase Phase { get; }
+    public ImmutableArray<SourceSite> ActivationSites { get; }
 }
 
 public sealed class StateSnapshot

@@ -155,7 +155,8 @@ internal sealed class AbstractState : IEquatable<AbstractState>
             resource.Id, resource.Ownership, resource.Status, resource.Origin, resource.OwnerIds.OrderBy(id => id, StringComparer.Ordinal).ToImmutableArray())).ToImmutableArray(),
         Loans.Values.OrderBy(loan => loan.Id, StringComparer.Ordinal).Select(loan => new LoanSnapshot(loan.Id, loan.ResourceId,
             loan.Holder, loan.Kind, loan.Origin, loan.ParentIds.OrderBy(id => id, StringComparer.Ordinal).FirstOrDefault(), loan.Projection,
-            loan.AllowsSuspension, loan.MayBeAbsent)).ToImmutableArray(), !IsUnreachable);
+            loan.AllowsSuspension, loan.MayBeAbsent, loan.Phase, loan.ActivationEvidence.Values.Select(evidence => evidence.Site)
+                .OrderBy(site => site.Path, StringComparer.Ordinal).ThenBy(site => site.Start).ThenBy(site => site.Length).ToImmutableArray())).ToImmutableArray(), !IsUnreachable);
 
     public bool Equals(AbstractState? other) => other is not null && IsUnreachable == other.IsUnreachable && (IsUnreachable ||
         MapEquals(NullablePlaces, other.NullablePlaces, (left, right) => left == right)
@@ -293,7 +294,8 @@ internal sealed class ResourceFact : IEquatable<ResourceFact>
 internal sealed class LoanFact : IEquatable<LoanFact>
 {
     internal LoanFact(string id, string resourceId, string holder, BorrowKind kind, SourceSite origin,
-        string projection, bool allowsSuspension, ImmutableHashSet<string> parentIds, bool mayBeAbsent = false)
+        string projection, bool allowsSuspension, ImmutableHashSet<string> parentIds, bool mayBeAbsent = false,
+        BorrowPhase phase = BorrowPhase.Active, ImmutableDictionary<string, AnalysisEvidence>? activationEvidence = null)
     {
         Id = id;
         ResourceId = resourceId;
@@ -304,6 +306,8 @@ internal sealed class LoanFact : IEquatable<LoanFact>
         AllowsSuspension = allowsSuspension;
         ParentIds = parentIds;
         MayBeAbsent = mayBeAbsent;
+        Phase = phase;
+        ActivationEvidence = activationEvidence ?? ImmutableDictionary.Create<string, AnalysisEvidence>(StringComparer.Ordinal);
     }
     internal string Id { get; }
     internal string ResourceId { get; }
@@ -314,11 +318,20 @@ internal sealed class LoanFact : IEquatable<LoanFact>
     internal bool AllowsSuspension { get; }
     internal ImmutableHashSet<string> ParentIds { get; }
     internal bool MayBeAbsent { get; }
-    internal LoanFact WithAbsence() => new(Id, ResourceId, Holder, Kind, Origin, Projection, AllowsSuspension, ParentIds, true);
+    internal BorrowPhase Phase { get; }
+    internal ImmutableDictionary<string, AnalysisEvidence> ActivationEvidence { get; }
+    internal LoanFact WithAbsence() => new(Id, ResourceId, Holder, Kind, Origin, Projection, AllowsSuspension, ParentIds, true, Phase, ActivationEvidence);
+    internal LoanFact Activate(SourceSite site, bool weak)
+    {
+        var evidence = new AnalysisEvidence("activation", "The exclusive reservation is activated here.", site);
+        return new LoanFact(Id, ResourceId, Holder, Kind, Origin, Projection, AllowsSuspension, ParentIds, MayBeAbsent,
+            weak ? Phase | BorrowPhase.Active : BorrowPhase.Active, ActivationEvidence.SetItem(EvidenceFacts.Key(evidence), evidence));
+    }
     internal LoanFact Join(LoanFact other) => new(Id, ResourceId, Holder, Kind, Origin, Projection, AllowsSuspension && other.AllowsSuspension,
-        ParentIds.Union(other.ParentIds), MayBeAbsent || other.MayBeAbsent);
+        ParentIds.Union(other.ParentIds), MayBeAbsent || other.MayBeAbsent, Phase | other.Phase, ActivationEvidence.SetItems(other.ActivationEvidence));
     public bool Equals(LoanFact? other) => other is not null && Id == other.Id && MayBeAbsent == other.MayBeAbsent
-        && AllowsSuspension == other.AllowsSuspension && ParentIds.SetEquals(other.ParentIds);
+        && AllowsSuspension == other.AllowsSuspension && Phase == other.Phase && ParentIds.SetEquals(other.ParentIds)
+        && EvidenceFacts.Equal(ActivationEvidence, other.ActivationEvidence);
     public override bool Equals(object? obj) => obj is LoanFact other && Equals(other);
     public override int GetHashCode() => StringComparer.Ordinal.GetHashCode(Id);
 }

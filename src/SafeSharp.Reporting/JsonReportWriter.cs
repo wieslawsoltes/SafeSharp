@@ -195,11 +195,15 @@ public sealed class JsonReportWriter : IAnalysisReportWriter
             json.Property("resourceId", loan.ResourceId);
             json.Property("holder", loan.Holder);
             json.Property("kind", loan.Kind.ToString());
+            json.Property("phase", loan.Phase.ToString());
             json.Property("parentId", loan.ParentId);
             json.Property("projection", loan.Projection);
             json.Property("allowsSuspension", loan.AllowsSuspension);
             json.Property("mayBeAbsent", loan.MayBeAbsent);
             json.Name("origin"); WriteSite(json, loan.Origin);
+            json.Name("activationSites"); json.StartArray();
+            foreach (var site in loan.ActivationSites) WriteSite(json, site);
+            json.EndArray();
             json.EndObject();
         }
         json.EndArray();

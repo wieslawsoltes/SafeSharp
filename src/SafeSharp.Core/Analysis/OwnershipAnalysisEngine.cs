@@ -144,7 +144,8 @@ internal sealed class IssueCollector
         {
             InstructionKind.Alias => new[] { "SS0004", "SS0011" },
             InstructionKind.Move => new[] { "SS0001", "SS0004", "SS0005", "SS0008", "SS0011", "SS0012" },
-            InstructionKind.BorrowShared or InstructionKind.BorrowExclusive => new[] { "SS0001", "SS0004", "SS0006", "SS0011", "SS0012" },
+            InstructionKind.BorrowShared or InstructionKind.BorrowExclusive or InstructionKind.ReserveExclusiveBorrow => new[] { "SS0001", "SS0004", "SS0006", "SS0011", "SS0012" },
+            InstructionKind.ActivateBorrow => new[] { "SS0001", "SS0004", "SS0006", "SS0012" },
             InstructionKind.Read => new[] { "SS0001", "SS0004", "SS0012", "SS0013" },
             InstructionKind.Write => new[] { "SS0001", "SS0004", "SS0007", "SS0012" },
             InstructionKind.Dispose => new[] { "SS0002", "SS0004", "SS0009", "SS0012", "SS0014" },
