@@ -15,7 +15,7 @@ public static class ConcurrencyDiagnostics
 
     public static readonly DiagnosticDescriptor IncompleteContractAnalysis = Create("SS0046", "Contract analysis reached its budget",
         "Contract analysis for '{0}' exceeded its {1} budget; the required safety property is not established",
-        "Structural composition and recursive cleanup summaries have finite exploration limits. A budget result must not be treated as a proof of safety.", DiagnosticSeverity.Info);
+        "Structural composition, recursive cleanup summaries, and borrowed escape provenance have finite exploration limits. A budget result must not be treated as a proof of safety.", DiagnosticSeverity.Info);
 
     private static DiagnosticDescriptor Create(string id, string title, string message, string description,
         DiagnosticSeverity severity = DiagnosticSeverity.Warning) => new(id, title, message, "SafeSharp.Ownership", severity,

@@ -28,7 +28,7 @@ SS0023 | SafeSharp.Ownership | Warning | Inconsistent ownership contract
 SS0024 | SafeSharp.Ownership | Warning | Ignored MustUse result
 SS0025 | SafeSharp.Ownership | Warning | Thread-affine value crosses Task.Run
 SS0026 | SafeSharp.Ownership | Warning | Singleton may capture scoped service
-SS0027 | SafeSharp.Ownership | Warning | Borrowed parameter stored persistently
+SS0027 | SafeSharp.Ownership | Warning | Borrowed origin may be retained beyond its boundary
 SS0028 | SafeSharp.Ownership | Warning | Using resource captured by escaping callback
 SS0029 | SafeSharp.Ownership | Info | Service dependency exploration budget exceeded
 SS0030 | Ownership | Info | Manual disposal exception safety advisory
@@ -42,4 +42,4 @@ SS0042 | SafeSharp.Lifetimes | Warning | Incompatible inherited lifetime contrac
 SS0043 | SafeSharp.Lifetimes | Warning | Lifetime constraint analysis incomplete
 SS0044 | SafeSharp.Ownership | Warning | Invalid concurrency contract
 SS0045 | SafeSharp.Ownership | Warning | Unsafe concurrent capture
-SS0046 | SafeSharp.Ownership | Info | Concurrency or cleanup analysis incomplete
+SS0046 | SafeSharp.Ownership | Info | Concurrency, cleanup or borrowed escape analysis incomplete

@@ -14,7 +14,8 @@ The current implementation is **`0.2.0-preview.1`**. Its design is informed by R
 | Area | Analysis |
 | --- | --- |
 | Resource ownership | Use after disposal, repeated disposal, leaks, lost ownership on overwrite, owned results, consuming parameters, explicit moves, and aliases invalidated by moves. |
-| Borrowing | Shared/exclusive loans, two-phase implicit receiver/argument borrows, reborrows, mutation/disposal conflicts, borrowed escapes, projected overlap, and backward control-flow loan liveness. |
+| Borrowing | Shared/exclusive loans, two-phase implicit receiver/argument borrows, stable evaluated call values, reborrows, mutation/disposal conflicts, projected overlap, and backward control-flow loan liveness. |
+| Borrowed escapes | Bounded CFG may-origin analysis follows aliases, ref slots, allocation containers and captured cells into persistent storage, returned containers/delegates, and explicit no-escape contract violations. |
 | Named lifetimes | `[Lifetime]` and `[Outlives]`, bounded region solving, equivalent regions, shortest implication proofs, returned-value provenance, inherited promises, and multi-input returned-loan alternatives. |
 | Control flow | Forward fixed points over branches and loops; nullable guards; explicit throw/rethrow; typed catches and filters; implicit fault markers; finally and using cleanup continuations; return validation after cleanup. |
 | Async and views | Deferred disposal completion obligations through aliases, branches and supported awaitable wrappers; `await using`; suspension restrictions; `[NoSuspend]`; pool leases and modeled `Memory`/`Span` views. |
@@ -174,6 +175,7 @@ Contributions should define the effect being added, include both valid and inval
 - [Diagnostic reference](docs/diagnostics.md)
 - [Two-phase borrowing and async completion protocols](docs/advanced-engine.md)
 - [Named lifetime regions and returned borrows](docs/lifetime-regions.md)
+- [Borrowed aliases, containers, and escape analysis](docs/borrowed-escape.md)
 - [Aggregate cleanup and concurrency contracts](docs/aggregate-concurrency.md)
 - [Contracts, aggregates, callbacks, and services](docs/contracts-and-semantics.md)
 - [Engine and Roslyn architecture](docs/architecture.md)

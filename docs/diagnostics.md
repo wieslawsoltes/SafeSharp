@@ -34,7 +34,7 @@ Every rule below is implemented. “Implemented” describes the stated check wi
 | [SS0024](#ss0024) | Required result is ignored | Semantic | Warning | Yes |
 | [SS0025](#ss0025) | Thread-affine value captured by `Task.Run` | Semantic | Warning | Yes |
 | [SS0026](#ss0026) | Singleton transitively depends on scoped service | Semantic | Warning | Yes |
-| [SS0027](#ss0027) | Borrowed parameter stored in persistent member | Semantic | Warning | Yes |
+| [SS0027](#ss0027) | Borrowed argument may escape into persistent storage | Semantic | Warning | Yes |
 | [SS0028](#ss0028) | Escaping callback captures a using resource | Semantic | Warning | Yes |
 | [SS0029](#ss0029) | Service graph exploration incomplete | Semantic | Info | Yes |
 | [SS0030](#ss0030) | Exception can bypass later manual cleanup | Boundary | Info | Yes |
@@ -48,7 +48,7 @@ Every rule below is implemented. “Implemented” describes the stated check wi
 | [SS0043](#ss0043) | Lifetime-region analysis is incomplete | Lifetime | Warning | Yes |
 | [SS0044](#ss0044) | Invalid Send/Sync declaration or generic composition | Concurrency | Warning | Yes |
 | [SS0045](#ss0045) | Captured value does not satisfy its concurrency boundary | Concurrency | Warning | Yes |
-| [SS0046](#ss0046) | Aggregate cleanup or concurrency analysis is incomplete | Semantic / Concurrency | Info | Yes |
+| [SS0046](#ss0046) | Cleanup, concurrency or borrowed escape analysis is incomplete | Semantic / Concurrency | Info | Yes |
 
 The public analyzer classes and descriptor categories are:
 
@@ -200,7 +200,7 @@ Resource CreateView()
 
 Return an owned resource when the caller should own it. For a view over an input, declare a named source such as `[ReturnsBorrowed("source")]` and keep the source alive in the caller. Use `[ReturnsBorrowed("this")]` for an instance-owned view. A returned relation cannot validly name a newly created local owner that is about to die.
 
-Borrowed parameter stores also have a complementary declaration-aware rule, SS0027. Arbitrary container aliases and callbacks are not a complete general heap-escape analysis.
+Borrowed parameter retention also has a complementary declaration-aware CFG rule, SS0027, which follows aliases, modeled containers and captured cells. Neither checker establishes a complete general heap-escape proof.
 
 ## SS0009
 
@@ -471,7 +471,7 @@ The graph is compilation-local and conservatively keeps registration alternative
 
 ## SS0027
 
-**Borrowed argument escapes into persistent storage.** A parameter marked `Borrowed`, `BorrowedMut`, or `DoesNotEscape` is retained in a field/property.
+**Borrowed argument may escape into persistent storage.** Converged CFG may-origin analysis finds a parameter marked `Borrowed`, `BorrowedMut`, or `DoesNotEscape` reaching a persistent storage or escape boundary.
 
 ```csharp
 sealed class Cache
@@ -486,7 +486,9 @@ sealed class Cache
 
 Keep access within the call or retain independent copied data. If the object should own the argument, redesign the method with a consuming contract and ensure the aggregate releases it. C# cannot express an arbitrary Rust-style lifetime parameter tying a persistent field to an external owner.
 
-Origin tracking covers direct stores, conversions, conditional/coalescing results, tuples/arrays, and named returned-borrow relationships. Arbitrary aliases through containers, unknown methods, and every local-variable chain are outside this dedicated checker. The core supplies complementary modeled loan-escape analysis.
+Origin tracking covers local/ref aliases, conditional/coalescing results, branches, loops, modeled call summaries, allocation containers and captured cells. Destinations include fields, properties, events, external array/ref-out storage, and returned or persistently stored containers/delegates. `DoesNotEscape` additionally excludes direct return and explicit consuming calls. An ordinary borrowed return can use the supported returned-loan contract.
+
+Each diagnostic supplies `SafeSharp.BorrowedSource`, `SafeSharp.EscapeDestination`, `SafeSharp.EscapeAnalysis`, `SafeSharp.Certainty`, and `SafeSharp.DoesNotEscape`, with source/destination locations. The solver reports **possible** retention, uses conservative exception/capture envelopes, and merges fields/elements within an allocation container. Unknown calls do not establish a general heap effect. SS0046 identifies budget exhaustion. See [borrowed escape analysis](borrowed-escape.md) for the exact model; the core supplies complementary resource-loan escape diagnostics.
 
 ## SS0028
 
@@ -673,7 +675,7 @@ safesharp_max_region_constraints = 4096
 safesharp_max_region_steps = 100000
 ```
 
-Reduce an unnecessarily complex signature or method, inspect expanding relationships, or raise the relevant bound after measuring analysis cost. The displayed values are defaults. The analyzer caps effective values at 4,096 regions, 100,000 constraints, and 10,000,000 steps; invalid/nonpositive values use defaults. These limits are independent of SS0015's ownership iteration/resource limits and SS0046's aggregate/concurrency budgets.
+Reduce an unnecessarily complex signature or method, inspect expanding relationships, or raise the relevant bound after measuring analysis cost. The displayed values are defaults. The analyzer caps effective values at 4,096 regions, 100,000 constraints, and 10,000,000 steps; invalid/nonpositive values use defaults. These limits are independent of SS0015's ownership iteration/resource limits and SS0046's aggregate/concurrency/escape budgets.
 
 The reusable solver returns an incomplete solution without partial components or proofs. Suppressing SS0043 suppresses the notification, not the missing proof. See [the reusable region solver](lifetime-regions.md#reusable-region-solver).
 
@@ -728,7 +730,7 @@ The primary diagnostic points to the capture; related locations retain the sched
 
 ## SS0046
 
-**Aggregate cleanup or concurrency analysis is incomplete.** Cleanup summaries, CFG continuation exploration, structural type composition, generic checking, or callback resolution exceeds an analysis bound. The required cleanup or concurrency property has not been established.
+**Cleanup, concurrency or borrowed escape analysis is incomplete.** Cleanup summaries, CFG continuation exploration, structural type composition, generic checking, callback resolution, or borrowed-origin propagation exceeds an analysis bound. The corresponding contract property has not been established.
 
 ```editorconfig
 [*.cs]
@@ -737,9 +739,9 @@ safesharp_max_contract_steps = 20000
 
 Inspect recursive helpers, deeply expanding structures, or complex callback aliases. Simplify the model or raise the step budget after measuring compiler cost. This key uses per-file configuration before global configuration, defaults to 20,000, and caps positive effective values at 1,000,000. Invalid values use the default.
 
-Aggregate checks additionally bound tracked members to 512, active summaries to 32, cached summaries to 256, and CFG continuation contexts to 8,192. Concurrency checks bound recursive type and delegate alias depth to 128 and each source-visible affinity traversal to 128 distinct types. Their budgets are separate from ownership fixed-point and lifetime-region limits. Existing SS0021 findings may accompany an incomplete aggregate result.
+Aggregate checks additionally bound tracked members to 512, active summaries to 32, cached summaries to 256, and CFG continuation contexts to 8,192. Concurrency checks bound recursive type and delegate alias depth to 128 and each source-visible affinity traversal to 128 distinct types. Borrowed escape checks bound expression depth to 256 and charge propagation work to the per-method contract budget. Their budgets are separate from ownership fixed-point and lifetime-region limits. Existing SS0021 findings may accompany an incomplete aggregate result.
 
-SS0046 is informational and enabled by default. The CLI treats it as incomplete analysis even if its visible diagnostic is suppressed. See [aggregate limits](aggregate-concurrency.md#analysis-limits) and [concurrency limits](aggregate-concurrency.md#what-these-contracts-establish).
+SS0046 is informational and enabled by default. The CLI treats it as incomplete analysis even if its visible diagnostic is suppressed. See [aggregate limits](aggregate-concurrency.md#analysis-limits), [concurrency limits](aggregate-concurrency.md#what-these-contracts-establish), and [borrowed escape analysis](borrowed-escape.md).
 
 ## Configuration and adoption
 

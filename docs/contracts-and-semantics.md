@@ -5,7 +5,7 @@ SafeSharp has **five complementary analyzers and 39 implemented diagnostic rules
 | Analyzer | Responsibility | Descriptor category |
 | --- | --- | --- |
 | `OwnershipAnalyzer` | Resource identities, moves, loans, liveness, disposal, async completion, and control-flow transitions. | `Ownership` |
-| `SafeSharpSemanticAnalyzer` | Aggregate normal-exit cleanup, declaration consistency, callback escape, thread affinity, and dependency injection lifetimes. | `SafeSharp.Ownership` |
+| `SafeSharpSemanticAnalyzer` | Aggregate normal-exit cleanup, declaration consistency, borrowed/callback escape, thread affinity, and dependency injection lifetimes. | `SafeSharp.Ownership` |
 | `BoundarySafetyAnalyzer` | Exception/disposal boundaries, inherited parameter ownership compatibility, and opt-in audits of unsafe operations and unknown factories. | `Ownership` |
 | `LifetimeContractAnalyzer` | Explicit named-region declarations, outlives solving, returned provenance, and inherited lifetime/return compatibility. | `SafeSharp.Lifetimes` |
 | `ConcurrencyContractAnalyzer` | Send/Sync composition, generic capability requirements, and captures at declared thread boundaries. | `SafeSharp.Ownership` |
@@ -29,7 +29,7 @@ All contracts live in namespace `SafeSharp`. Analyzer matching resolves the actu
 | `Lifetime("a")` | Parameter, return value | Names the method-scoped borrowed lifetime supplied by an input or promised by a result. |
 | `Outlives("a", "b")` | Method; repeatable | Requires region `a` to remain valid for at least the duration promised by region `b`. |
 | `Mutates` | Instance method | The method mutates its receiver. |
-| `DoesNotEscape` | Parameter | The callee must not retain the argument after returning. |
+| `DoesNotEscape` | Parameter | The callee must not retain, return, or explicitly transfer ownership of the argument. |
 | `MustUse` | Method, class, struct | An expression-statement result must be used or explicitly discarded. |
 | `NoSuspend` | Class, struct | Values of this type must not remain live across suspension. |
 | `ThreadAffine` | Class, struct | Access is tied to an owning thread or context. |
@@ -240,9 +240,9 @@ This is a conservative, compilation-local graph. It does not reconstruct runtime
 
 ### SS0027: borrowed parameters do not enter persistent storage
 
-Direct stores to fields or properties are checked for `Borrowed`, `BorrowedMut`, and `DoesNotEscape` parameters. Origin tracking follows conversions, conditional/coalescing results, tuple/array construction, and methods with a named `ReturnsBorrowed` relationship. The diagnostic points to the source argument, with the destination member as a related location.
+The bounded CFG solver follows `Borrowed`, `BorrowedMut`, and `DoesNotEscape` origins through local aliases, ref slots, branches, loops, allocation containers and captured storage. Persistent fields, properties, events, array/ref-out storage and escaping containers/delegates are retention boundaries. Returning an ordinary borrowed value can be governed by a returned-loan contract; `DoesNotEscape` is stricter and also excludes direct return or an explicit consuming sink.
 
-A call returning a clone is not assumed to borrow merely because a borrowed parameter was passed to it. This rule does not independently solve arbitrary aliasing through local variables, containers, unknown methods, or external assemblies; the ownership engine handles its modeled local loan escapes.
+Diagnostics are emitted after convergence and carry the borrowed source, escape destination, related locations and possible-certainty metadata. A possible retention does not establish a concrete runtime path. Source summaries and explicit contracts carry known call-result origins; arbitrary calls do not establish either retention or a fresh clone. Containers are field/element insensitive, and exception handlers and mutable captures use conservative envelopes. The [borrowed-escape guide](borrowed-escape.md) describes transfer rules, configuration, evidence and limits. The ownership engine supplies complementary resource-loan escape diagnostics.
 
 ### SS0028: escaping callbacks do not retain `using` resources
 

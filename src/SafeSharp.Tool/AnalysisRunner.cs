@@ -163,8 +163,18 @@ internal static class AnalysisRunner
                     diagnostic.Descriptor.Title.ToString(), engine.Result.Graph.Name, engine.Issue.ResourceId,
                     engine.Issue.Certainty, related, engine.Issue.Evidence, diagnostic.Properties));
             }
-            else diagnostics.Add(new ReportDiagnostic(diagnostic.Id, diagnostic.GetMessage(), site, severity,
-                diagnostic.Descriptor.Title.ToString(), relatedLocations: related, properties: diagnostic.Properties));
+            else
+            {
+                diagnostic.Properties.TryGetValue("SafeSharp.Certainty", out var declaredCertainty);
+                IssueCertainty? certainty = declaredCertainty switch
+                {
+                    "Definite" => IssueCertainty.Definite,
+                    "Possible" => IssueCertainty.Possible,
+                    _ => null,
+                };
+                diagnostics.Add(new ReportDiagnostic(diagnostic.Id, diagnostic.GetMessage(), site, severity,
+                    diagnostic.Descriptor.Title.ToString(), certainty: certainty, relatedLocations: related, properties: diagnostic.Properties));
+            }
         }
         return !analyzerDiagnostics.Any(diagnostic => CompletenessDiagnostics.IsBudgetDiagnostic(diagnostic.Id));
     }

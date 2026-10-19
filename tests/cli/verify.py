@@ -204,8 +204,9 @@ sealed class CleanupBudget : IDisposable {
             # Recreating a diagnostic to restore its default severity must retain
             # its formatted message and exact source/evidence, not its format template.
             assert all("{0}" not in item["message"] and item["message"] for item in matching), matching
-            assert all(item["source"]["path"] == str(source) and item["source"]["length"] > 0
-                       for item in matching), matching
+            # MSBuild may expand Windows short paths; compare the source file itself.
+            assert all(Path(item["source"]["path"]).samefile(source) and item["source"]["length"] > 0
+                       for item in matching), {"expectedPath": str(source), "diagnostics": matching}
             if rule in ("SS0029", "SS0043", "SS0046"):
                 expected_span = {"SS0029": "Service0", "SS0043": "Pick", "SS0046": "CleanupBudget"}[rule]
                 assert all(fixture[item["source"]["start"]:item["source"]["start"] + item["source"]["length"]]

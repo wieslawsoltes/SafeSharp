@@ -6,6 +6,8 @@
 
 - Added first-order named lifetime contracts, outlives solving, strongly connected region equivalence, deterministic proof witnesses, and body validation of borrowed returns. Overrides, interfaces, getters and indexers preserve effective contracts, including parameter renaming.
 - Connected implicit mutable receiver and argument borrows to reservation and activation phases. Explicit mutable borrows remain active when evaluated.
+- Preserved the resource identity of evaluated by-value arguments and receivers across later argument assignments. Attribute-driven ownership transfers occur only after all operands have evaluated successfully; explicit `Ownership.Move` remains an expression-time effect.
+- Replaced direct-store borrowed checks with bounded, converged CFG may-origin analysis. Aliases, ref/out slots, allocation containers and captured storage participate in SS0027; `DoesNotEscape` additionally rejects returning or explicitly consuming the argument. Conservative exception/capture envelopes and unknown-call boundaries are documented.
 - Separated asynchronous disposal invocation from completion observation. Pending completions retain their identity through supported aliases, wrappers, transfers, joins and overwrites.
 - Added bounded source summaries for fresh ownership, input/receiver aliases, alternative borrowed origins and owned output parameters. Executable conversions use their own contracts, and inferred disposal effects retain source order and exception boundaries.
 - Distinguished an awaitable object from its result payload in lifetime proofs. Modeled framework producers and explicit contracts carry payload provenance through stored and configured awaitables; opaque payloads remain unknown.

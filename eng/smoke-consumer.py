@@ -79,6 +79,8 @@ using SafeSharp;
 public static class Consumer {
     public static void Bad() { var stream = new MemoryStream(); stream.Dispose(); stream.WriteByte(1); }
     public static void Pending() { var stream = new MemoryStream(); var pending = stream.DisposeAsync(); }
+    public static object? Retained;
+    public static void Retain([Borrowed] object value) { var alias = value; Retained = alias; }
     [return: Lifetime("a")] public static MemoryStream Wrong([Lifetime("a")] MemoryStream first, [Lifetime("b")] MemoryStream second) => second;
     public static Task Share(Context value) => Schedule(() => value.Read());
     private static Task Schedule([SharesAcrossThreads] Action callback) => Task.Run(callback);
@@ -91,7 +93,7 @@ public sealed class IncompleteOwner : IDisposable {
 }
 ''', encoding="utf-8")
     bad = run(["build", "Consumer.csproj", "--no-restore", "--nologo", "-v", "minimal"], root, expected=1)
-    expected_rules = {"SS0001", "SS0017", "SS0021", "SS0041", "SS0044", "SS0045"}
+    expected_rules = {"SS0001", "SS0017", "SS0021", "SS0027", "SS0041", "SS0044", "SS0045"}
     if any("error " + rule not in bad for rule in expected_rules) or any(code in bad for code in ("AD0001", "AD0002", "CS8032", "CS8034")):
         raise SystemExit("Bad consumer did not exercise every packaged analyzer family\n" + bad)
     run(["tool", "install", "SafeSharp.Tool", "--version", args.version, "--tool-path", str(root / "tools"),
@@ -107,6 +109,12 @@ public sealed class IncompleteOwner : IDisposable {
         payload = json.loads(report.read_text(encoding="utf-8"))
         if not payload.get("analysisComplete") or not expected_rules <= {diagnostic["id"] for diagnostic in payload["diagnostics"]}:
             raise SystemExit(f"Packaged tool {mode} report lost an analyzer finding")
+        borrowed = [diagnostic for diagnostic in payload["diagnostics"] if diagnostic["id"] == "SS0027"]
+        if any(diagnostic.get("certainty") != "Possible" or
+               diagnostic.get("properties", {}).get("SafeSharp.BorrowedSource") != "value" or
+               diagnostic.get("properties", {}).get("SafeSharp.DoesNotEscape") != "false" or
+               not diagnostic.get("relatedLocations") for diagnostic in borrowed):
+            raise SystemExit(f"Packaged tool {mode} report lost borrowed-escape certainty or provenance")
 
     # The analyzer's buildTransitive props must expose MSBuild budget defaults to
     # compiler analysis, and a file's EditorConfig setting must take precedence.
@@ -146,4 +154,4 @@ public sealed class IncompleteOwner : IDisposable {
          "-p:SafeSharpPackageVersion=" + args.version], host)
     host_output = run([str(host / "bin/Debug/net10.0/PackageHost.dll"), str(analyzer_path), str(code_fixes_path)], host)
     print(host_output.strip())
-    print("NuGet consumer: fresh package cache; valid lifetime/async/concurrency contracts accepted; SS0001/17/21/41/44/45 enforced; installed CLI source/project modes and packaged MSBuild-budget/EditorConfig precedence verified.")
+    print("NuGet consumer: fresh package cache; valid lifetime/async/concurrency contracts accepted; SS0001/17/21/27/41/44/45 enforced; installed CLI source/project modes and packaged MSBuild-budget/EditorConfig precedence verified.")

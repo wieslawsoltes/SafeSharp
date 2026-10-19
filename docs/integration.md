@@ -29,7 +29,7 @@ python eng/verify-packages.py artifacts/packages
 python eng/smoke-consumer.py artifacts/packages --version 0.2.0-preview.1
 ```
 
-The consumer smoke check restores real NuGet packages in an isolated SDK project and package cache. Its safe example exercises named return lifetimes, observed deferred disposal, and valid Send/Sync structure. The unsafe example must fail with `SS0001`, `SS0017`, `SS0021`, `SS0041`, `SS0044`, and `SS0045`, covering ownership, cleanup, regions and concurrency. It then installs the packaged .NET tool and checks the same findings and exit code in both standalone source and MSBuild project modes. Project mode exercises the packaged build host and installed-SDK resolution, suppressed exhaustion from an MSBuild budget property exposed by the package, and EditorConfig precedence over that property.
+The consumer smoke check restores real NuGet packages in an isolated SDK project and package cache. Its safe example exercises named return lifetimes, observed deferred disposal, and valid Send/Sync structure. The unsafe example must fail with `SS0001`, `SS0017`, `SS0021`, `SS0027`, `SS0041`, `SS0044`, and `SS0045`, covering ownership, cleanup, aliased borrowed retention, regions and concurrency. It then installs the packaged .NET tool and checks the same findings and exit code in both standalone source and MSBuild project modes. Project mode exercises the packaged build host and installed-SDK resolution, suppressed exhaustion from an MSBuild budget property exposed by the package, and EditorConfig precedence over that property.
 
 The separate `eng/package-host` fixture loads the packaged analyzer assembly through Roslyn's analyzer discovery API, composes the packaged C# code-fix export with MEF, obtains a real `SS0024` diagnostic, applies its registered action, and recompiles the changed document. It retains the changed syntax tree instead of reparsing the resulting text, so malformed contextual tokens cannot be hidden by a fresh parse. The same fixture executes an ownership graph and serializes its finding through the `SafeSharp.Core` and `SafeSharp.Reporting` NuGet packages. These checks cover all six packages and catch missing dependencies, omitted analyzer entries and export/load failures that direct unit tests do not.
 
@@ -59,13 +59,13 @@ safesharp_max_regions = 256
 safesharp_max_region_constraints = 4096
 safesharp_max_region_steps = 100000
 
-# Aggregate cleanup and concurrency contracts; exhaustion produces SS0046.
+# Aggregate cleanup, concurrency and borrowed escape; exhaustion produces SS0046.
 safesharp_max_contract_steps = 20000
 ```
 
-Ownership and lifetime budgets bound each analyzed method; contract budgets bound the corresponding cleanup or structural/callback check. Invalid settings fall back to defaults, and excessively large budgets are clamped. Lifetime settings cap at 4,096 names, 100,000 constraints and 10,000,000 steps; contract steps cap at 1,000,000. File-specific configuration takes precedence over global analyzer configuration. Additional structural limits are documented in the [region guide](lifetime-regions.md) and [aggregate/concurrency guide](aggregate-concurrency.md).
+Ownership and lifetime budgets bound each analyzed method; contract budgets independently bound the corresponding cleanup, structural/callback, or borrowed-escape check. Invalid settings fall back to defaults, and excessively large budgets are clamped. Lifetime settings cap at 4,096 names, 100,000 constraints and 10,000,000 steps; contract steps cap at 1,000,000. File-specific configuration takes precedence over global analyzer configuration. Additional structural limits are documented in the [region guide](lifetime-regions.md), [aggregate/concurrency guide](aggregate-concurrency.md), and [borrowed-escape guide](borrowed-escape.md).
 
-`safesharp_report_possible_issues = false` hides path-ambiguous findings; it does not strengthen the analysis guarantee. Use ordinary `#pragma warning`, `SuppressMessage`, or EditorConfig suppressions only after assessing the related acquisition and effect evidence. Generated source is skipped, and analysis honors cancellation. The analyzer never writes graph files during an IDE/build compilation.
+`safesharp_report_possible_issues = false` hides possible findings from the ownership dataflow engine; it does not strengthen the analysis guarantee. Semantic contract diagnostics such as SS0027 use their own standard per-rule severity/suppression settings. Use ordinary `#pragma warning`, `SuppressMessage`, or EditorConfig suppressions only after assessing the related acquisition and effect evidence. Generated source is skipped, and analysis honors cancellation. The analyzer never writes graph files during an IDE/build compilation.
 
 The analyzer package exposes `SafeSharpMaxIterations` and `SafeSharpMaxTrackedResources` as compiler-visible MSBuild properties. Set them in a project or `Directory.Build.props` for shared defaults; file-specific EditorConfig budget values take precedence. For example:
 

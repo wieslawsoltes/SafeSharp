@@ -108,7 +108,9 @@ Shared and exclusive loans use `Ownership.Borrow`/`Ownership.BorrowMut` or corre
 | Non-lexical loan lifetimes | Backward CFG place liveness and expiry at instruction boundaries. | Intraprocedural liveness plus explicit borrowed-result contracts. |
 | Reborrowing | Parent-loan ancestry and conflict tracking. | A derived exclusive loan cannot erase a shared/reserved ancestor restriction. |
 | Two-phase borrowing | Exclusive reservation during argument evaluation, followed by activation at the call. | Implicit Mutates receivers and BorrowedMut arguments; explicit BorrowMut/ref loans remain immediate. |
+| Evaluated call values | Stable by-value argument/receiver snapshots and consumption at call entry. | Preserves C# evaluation order when later arguments reassign storage or throw; explicit moves remain expression-time effects. |
 | Named signature regions | Outlives closure, SCC equivalence, deterministic proofs and returned-provenance checking. | Explicit first-order names and constraints, including inherited contracts and multi-input returns. |
+| Persistent borrowed storage | Converged CFG provenance over aliases, ref slots, containers and captured cells; stricter DoesNotEscape return/consumption checks. | Declared input origins, field-insensitive allocation containers and conservative handler/capture histories; see [borrowed escapes](borrowed-escape.md). |
 | Field projections and partial moves | Projection-aware reference and loan state. | Static modeled paths; no complete heap-shape or symbolic index reasoning. |
 | Branches, joins, loops | Bounded fixed-point iteration over a finite domain. | The supplied CFG and abstract allocation identities. |
 | Nullable control flow | Null/non-null assumptions refine references and prune infeasible edges. | Recognized guards and abstract nullable-reference facts. |
