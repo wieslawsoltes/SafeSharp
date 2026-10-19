@@ -1,0 +1,6 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <Description>Explicit ownership, borrowing, thread affinity and service lifetime contracts for SafeSharp.</Description>
+  </PropertyGroup>
+</Project>

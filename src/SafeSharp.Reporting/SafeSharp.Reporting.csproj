@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <Description>Deterministic ownership graphs, evidence reports, JSON, SARIF, DOT, Mermaid and HTML for SafeSharp.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../SafeSharp.Core/SafeSharp.Core.csproj" />
+  </ItemGroup>
+</Project>
