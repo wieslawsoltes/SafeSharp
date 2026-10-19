@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: NuGet version, for example 0.2.0-preview.1
+        description: NuGet version, for example 0.3.0-preview.1
         required: true
         type: string
 

@@ -7,7 +7,7 @@ SafeSharp separates analysis from presentation. The Roslyn analyzers run inside 
 After a package version is published:
 
 ```sh
-dotnet tool install --global SafeSharp.Tool --version 0.2.0-preview.1
+dotnet tool install --global SafeSharp.Tool --version 0.3.0-preview.1
 safesharp --project src/App/App.csproj --format html --output artifacts/ownership.html
 safesharp --solution App.sln --format sarif --output artifacts/ownership.sarif
 ```
@@ -17,7 +17,7 @@ For a package built from this checkout:
 ```sh
 dotnet pack src/SafeSharp.Tool/SafeSharp.Tool.csproj -c Release -o artifacts/packages
 dotnet tool install --tool-path artifacts/tools SafeSharp.Tool \
-  --add-source artifacts/packages --version 0.2.0-preview.1
+  --add-source artifacts/packages --version 0.3.0-preview.1
 artifacts/tools/safesharp --project samples/SafeSharp.Sample/SafeSharp.Sample.csproj \
   --format html --output artifacts/sample-ownership.html
 ```
@@ -80,7 +80,7 @@ The HTML report includes:
 - Resource identities, ownership obligations, resource/completion kinds, possible lifecycle states, aliases, moved field projections, reserved and active loans, activation sites, reborrow parents, and suspension permissions.
 - Nullability, potentially absent references and loans, resource coverage of projections, and explicit infeasible-state markers for pruned branches.
 - Diagnostic metadata and diagrams of the recorded dependency service, implementation, and lifetime paths for captive-service diagnostics.
-- Declared lifetime-region graphs with required-return and candidate-source roles, outlives constraints, equivalence components and recorded proof metadata. Isolated regions remain visible.
+- Lifetime-region graphs with required-return and candidate-source roles, assumed constraints, distinct required edges, region bindings, equivalence components and recorded proof metadata. Isolated regions remain visible.
 
 The report has no network dependency, external JavaScript library, or graph-rendering service. SVG diagrams are rendered by the browser. The method filter and zoom controls use a fixed inline script; source text is never interpolated into JavaScript. Source names, diagnostic text, graph labels, and metadata cross explicit HTML/XML escaping boundaries. With JavaScript disabled, all methods and the native `<details>` inspectors remain available.
 
@@ -109,7 +109,7 @@ report
         index, instruction, liveBefore[], liveAfter[], before, after
 ```
 
-Each state contains `isReachable`, `places`, `resources`, and `loans`. Places expose `mayBeNull`; references expose `mayBeAbsent`, `coversResource`, and field-move projections; loans expose `mayBeAbsent`, `phase`, activation evidence, kind and reborrow parent. Resources distinguish ordinary resources from asynchronous disposal completions and retain the IDs of disposed resources represented by each completion. The JSON includes all captured facts; the writer does not infer new aliases or invent histories. Flag values such as `Alive, Disposed` or `Reserved, Active` represent joined possibilities, rather than one concrete object's simultaneous runtime state.
+Each state contains `isReachable`, `places`, `resources`, and `loans`. Places expose `mayBeNull`; references expose `mayBeAbsent`, `coversResource`, and field-move projections; loans expose `mayBeAbsent`, `phase`, activation evidence, kind and reborrow parent. Resources distinguish ordinary resources, asynchronous disposal completions and asynchronous result carriers. Completion facts retain disposed resource IDs; result carriers expose `resultState`, `producedResourceId` and `producedResourceIds` for the cached output alternatives. Those IDs refer to actual resource/loan identities in the computed state. The JSON includes all captured facts; the writer does not infer new aliases or invent histories. Flag values such as `Alive, Disposed` or `Reserved, Active` represent joined possibilities, rather than one concrete object's simultaneous runtime state.
 
 `Disposed` records a recognized disposal invocation. The analyzer's release obligation is discharged before an exception from the disposer body propagates; it does not establish that partial or throwing cleanup released every underlying resource successfully.
 
@@ -138,9 +138,9 @@ safesharp --project App.csproj --format mermaid --output ownership.mmd
 
 Each method becomes a subgraph, and each successor relation becomes an edge. Captive-service diagnostics with a recorded `SafeSharp.DependencyPath` additionally produce a dependency-witness subgraph. These edges preserve the reported path; they do not reconstruct every service registration in a container. Service and lifetime labels appear when the corresponding metadata paths have matching lengths.
 
-Lifetime diagnostics carrying `SafeSharp.RegionNames` and `SafeSharp.RegionConstraints` additionally produce a region subgraph. Its edges are the declared outlives constraints. The renderer preserves isolated names, cycles and source/required roles; it does not add reflexive edges, transitive closure edges or nonexistent proof paths. `SafeSharp.RegionProof` and `SafeSharp.RegionComponents` remain recorded evidence beside the graph. Non-region origins use explicit tokens such as `<Unknown>`, `<Local>` and `<Null>`, so they cannot be confused with valid declared region names.
+Lifetime diagnostics carrying `SafeSharp.RegionNames` and `SafeSharp.RegionConstraints` additionally produce a region subgraph. Its solid edges are the declared outlives assumptions. When `SafeSharp.RegionRequirements` is supplied, dashed edges show the exact callback/input/result requirements. `SafeSharp.RegionRequirementReasons` and `SafeSharp.RegionBindings` retain the source interpretation without changing topology. The renderer preserves isolated names, cycles and source/required roles; it does not add reflexive edges, transitive closure edges or nonexistent proof paths. `SafeSharp.RegionProof` and `SafeSharp.RegionComponents` remain recorded evidence beside the graph. Non-region origins use explicit tokens such as `<Unknown>`, `<Local>` and `<Null>`, so they cannot be confused with valid declared region names.
 
-Region graph previews are bounded at 64 names, 256 distinct edges and 65,536 characters per property. Malformed or oversized metadata produces an explicit unavailable-preview explanation while the raw properties remain available. No partial graph is presented as the complete constraint set. The JSON and SARIF diagnostic properties retain the original evidence independently of these visualization limits.
+Region graph previews are bounded at 64 names, 256 combined distinct assumption/requirement edges and 65,536 characters per property. Malformed or oversized metadata produces an explicit unavailable-preview explanation while the raw properties remain available. No partial graph is presented as the complete constraint set. The JSON and SARIF diagnostic properties retain the original evidence independently of these visualization limits.
 
 Node identifiers are generated independently from source names. DOT string quoting and Mermaid entity escaping prevent names from becoming graph directives. The raw Mermaid output is intended for a Mermaid-capable renderer; it contains no Markdown fences. For a large solution, use the HTML method selector or consume the JSON to focus on selected methods.
 
@@ -173,8 +173,26 @@ With the constructor above, `AnalysisReport` creates presentation diagnostics fr
 
 Snapshot capture deliberately remains opt-in in the core engine. The compiler analyzer's fast path needs diagnostics, not a retained state copy for every instruction. The CLI captures snapshots for JSON and HTML explainability and therefore uses more memory in those formats. SARIF, DOT, and Mermaid generation omit those unneeded state copies; diagnostic evidence and the actual CFG remain available.
 
+## Delegate and async example
+
+[Async and delegate report](examples/async-delegates.html) is generated from [AsyncDelegateExamples.cs.txt](../samples/AsyncDelegateExamples.cs.txt). It includes valid and invalid delegate conversions, explicit outlives assumptions, a possible abandoned factory result, and repeated receipt of a disposed payload.
+
+```sh
+dotnet run --project src/SafeSharp.Tool -c Release -- \
+  --source samples/AsyncDelegateExamples.cs.txt --format html \
+  --output docs/examples/async-delegates.html --fail-on none
+```
+
+The report uses computed diagnostics, graph edges and snapshots. Opening the file does not execute its illustrative unsafe C# input.
+
+## Async result evidence
+
+An `AsyncFactoryCarrier` represents the obligation to receive or transfer a possible owned factory result, or a known binding to an existing payload. `Deferred` result state means successful production has not yet materialized its result in the analysis; `Materialized` records the cached value. Flag combinations preserve joined alternatives. A pending owned factory lost at an exit has Possible certainty because execution may fault before producing the result.
+
+After a successful receive, the cached output ID is stable across aliases and repeated receives. The output retains its own disposal and transfer state. `Task.FromResult`, `ValueTask.FromResult` and `ValueTask<T>(T)` bind the already evaluated value and preserve its loans; they do not create a second owned resource. Disposing the task itself does not dispose the contained resource. The HTML state inspector and JSON snapshots expose these facts. See [async result ownership](async-result-ownership.md) for the instruction protocol and exact modeled framework operations.
+
 ## Verification
 
-The reporting test suite runs real core analysis before checking serialized states, loan phases, activation evidence and completion obligations. It also covers declared region graphs, equivalence cycles, disconnected names, malformed/oversized metadata, all-format determinism under a different process culture, exact URI and UTF-16 coordinate handling, missing snapshots, budget failure, authoritative host severity/suppression, arbitrary diagnostic metadata, Unicode/control-character round trips, cancellation, and HTML/DOT/Mermaid injection boundaries. The CLI is additionally exercised against standalone files, MSBuild projects, and the installed local tool package.
+The reporting test suite runs real core analysis before checking serialized states, loan phases, activation evidence and completion obligations. It also covers asynchronous result identity, exact assumed/required region graphs, equivalence cycles, disconnected names, malformed/oversized metadata, all-format determinism under a different process culture, exact URI and UTF-16 coordinate handling, missing snapshots, budget failure, authoritative host severity/suppression, arbitrary diagnostic metadata, Unicode/control-character round trips, cancellation, and HTML/DOT/Mermaid injection boundaries. The CLI is additionally exercised against standalone files, MSBuild projects, and the installed local tool package.
 
 For the semantic guarantees and their scope, see [the Rust design comparison](rust-design.md), [contracts and semantic analysis](contracts-and-semantics.md), and [the diagnostic reference](diagnostics.md).

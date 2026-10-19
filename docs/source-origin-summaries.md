@@ -63,7 +63,7 @@ Nested functions and delegates can retain mutable captured cells. The solver gat
 
 The following boundaries remain explicit:
 
-- Bodies containing exception handlers or finalizers retain opaque inferred origins. Normal CFG edges alone cannot prove values returned by catches or replacements performed by cleanup continuations.
+- Bodies containing catch or finally regions retain opaque inferred origins. Normal CFG edges alone cannot prove values returned by catches or replacements performed by cleanup continuations.
 - Ref-returning methods, ref-return calls, and ref-return getters require explicit contracts. This domain does not infer interprocedural storage-return postconditions.
 - Field, property, and array-element storage is external to the local origin map. The analysis does not infer a fresh transferable owner merely because a ref to an external field was assigned an allocation.
 - Unknown target operations, dynamic invocation/construction/member access, function-pointer calls, and address-taking retain opaque summaries rather than silently preserving an earlier origin. Event accessor calls invalidate captured variable cells.

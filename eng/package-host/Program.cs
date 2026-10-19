@@ -10,6 +10,7 @@ using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.Diagnostics;
 using Microsoft.CodeAnalysis.Text;
 using SafeSharp.Core;
+using SafeSharp.Core.Regions;
 using SafeSharp.Reporting;
 
 if (args.Length != 2)
@@ -32,6 +33,15 @@ using (var report = JsonDocument.Parse(AnalysisReportRenderer.Render(new Analysi
     Require(report.RootElement.GetProperty("diagnostics").EnumerateArray().Any(item => item.GetProperty("id").GetString() == "SS0001"),
         "Packaged Reporting did not serialize the Core diagnostic.");
 
+var universal = new UniversalRegionSolver().Solve(new UniversalRegionProblem(
+    new RegionProblem(["a", "b"]), ["input"],
+    [new RegionConstraint("b", "input", site, "input shortening"),
+     new RegionConstraint("input", "a", site, "promised output")]));
+Require(universal.IsComplete && !universal.IsCompatible && universal.Failures.Length == 1 &&
+    universal.Failures[0].Longer == "b" && universal.Failures[0].Shorter == "a" &&
+    universal.Failures[0].Proof.Steps.Length == 2,
+    "Packaged universal solver did not retain the shortest unpromised relation proof.");
+
 var loader = new PackageAssemblyLoader();
 var reference = new AnalyzerFileReference(Path.GetFullPath(args[0]), loader);
 var loadFailures = new List<string>();
@@ -40,7 +50,7 @@ var analyzers = reference.GetAnalyzers(LanguageNames.CSharp);
 Require(loadFailures.Count == 0 && !analyzers.IsEmpty,
     "Packaged analyzers did not load on Roslyn 4.14: " + string.Join("; ", loadFailures));
 var declaredRules = analyzers.SelectMany(analyzer => analyzer.SupportedDiagnostics).Select(rule => rule.Id).ToHashSet(StringComparer.Ordinal);
-Require(new[] { "SS0001", "SS0017", "SS0021", "SS0024", "SS0041", "SS0044", "SS0045" }.All(declaredRules.Contains),
+Require(new[] { "SS0001", "SS0017", "SS0021", "SS0024", "SS0041", "SS0044", "SS0045", "SS0047" }.All(declaredRules.Contains),
     "Packaged analyzer discovery lost an analyzer family.");
 
 var codeFixAssembly = loader.LoadFromPath(Path.GetFullPath(args[1]));
@@ -89,7 +99,82 @@ Require((await AnalyzeAsync(changedCompilation, analyzers)).All(diagnostic => di
 Require((await changed.GetTextAsync()).ToString().Contains("_ = Compute();", StringComparison.Ordinal),
     "The packaged code fix did not preserve and acknowledge the computation.");
 
-Console.WriteLine("Package host: Roslyn 4.14 discovered every analyzer family; MEF exported the code fix; SS0024 was fixed in a live compilation; Core and Reporting packages executed.");
+var callbackSource = CSharpSyntaxTree.ParseText("""
+    using SafeSharp;
+    [return: Lifetime("a"), Borrowed]
+    delegate object Select([Borrowed, Lifetime("a")] object first, [Borrowed, Lifetime("b")] object second);
+    static class Callbacks
+    {
+        [return: Lifetime("y"), Borrowed]
+        static object Second([Borrowed, Lifetime("x")] object first, [Borrowed, Lifetime("y")] object second) => second;
+        static Select Invalid() => Second;
+        static Select InvalidLambda() => ([Borrowed] object first, [Borrowed] object second) => second;
+        static Select ValidLambda() => ([Borrowed] object first, [Borrowed] object second) => first;
+    }
+    """, CSharpParseOptions.Default.WithLanguageVersion(LanguageVersion.CSharp13), "Callbacks.cs");
+var callbacks = compilation.RemoveAllSyntaxTrees().AddSyntaxTrees(callbackSource);
+AssertCompiles(callbacks);
+var callbackDiagnostics = (await AnalyzeAsync(callbacks, analyzers)).Where(diagnostic => diagnostic.Id == "SS0047").ToArray();
+Require(callbackDiagnostics.Length == 2 && callbackDiagnostics.All(diagnostic => diagnostic.AdditionalLocations.Count > 0) &&
+    callbackDiagnostics.Any(diagnostic => diagnostic.Properties.TryGetValue("SafeSharp.RegionQuantification", out var binder) &&
+        binder == "one universal delegate binder"),
+    "Packaged delegate method-group/lambda analysis or universal evidence failed on Roslyn 4.14.");
+
+// Exercise the new lowering and source summaries on the minimum supported Roslyn
+// host, independently of the newer compiler and Workspaces used by the SDK/CLI.
+var asyncSource = CSharpSyntaxTree.ParseText("""
+    using System.IO;
+    using System.Threading.Tasks;
+    static class AsyncFactories
+    {
+        private static Task<MemoryStream> Open() => Task.FromResult(new MemoryStream());
+        public static async Task Safe()
+        {
+            var pending = Open();
+            var configured = pending.ConfigureAwait(false);
+            using var stream = await configured;
+            _ = stream.Length;
+        }
+        public static void Ignored() { var pending = Open(); }
+        public static async Task Repeated()
+        {
+            var pending = Open();
+            var first = await pending;
+            first.Dispose();
+            var second = await pending;
+            _ = second.Length;
+        }
+    }
+    """, CSharpParseOptions.Default.WithLanguageVersion(LanguageVersion.CSharp13), "AsyncFactories.cs");
+var asyncCompilation = compilation.RemoveAllSyntaxTrees().AddSyntaxTrees(asyncSource);
+AssertCompiles(asyncCompilation);
+var asyncDiagnostics = await AnalyzeAsync(asyncCompilation, analyzers);
+Require(MethodDiagnostics(asyncCompilation, asyncDiagnostics, "AsyncFactories", "Open").Length == 0 &&
+    MethodDiagnostics(asyncCompilation, asyncDiagnostics, "AsyncFactories", "Safe").Length == 0,
+    "Packaged Roslyn 4.14 analysis rejected a transferred producer or a safely disposed stored async result.");
+var ignored = MethodDiagnostics(asyncCompilation, asyncDiagnostics, "AsyncFactories", "Ignored");
+Require(ignored.Length == 1 && ignored[0].Id == "SS0003" &&
+    ignored[0].Properties.TryGetValue("SafeSharp.Certainty", out var productionCertainty) && productionCertainty == "Possible" &&
+    ignored[0].GetMessage().Contains("factory may produce", StringComparison.Ordinal),
+    "Packaged Roslyn 4.14 analysis lost the ignored carrier's possible production obligation.");
+var repeated = MethodDiagnostics(asyncCompilation, asyncDiagnostics, "AsyncFactories", "Repeated");
+Require(repeated.Any(diagnostic => diagnostic.Id == "SS0001" &&
+        diagnostic.Properties.TryGetValue("SafeSharp.Certainty", out var certainty) && certainty == "Definite") &&
+    repeated.All(diagnostic => diagnostic.Id != "SS0003"),
+    "Packaged Roslyn 4.14 analysis did not retain disposal of the same output across repeated awaits.");
+
+Console.WriteLine("Package host: Roslyn 4.14 discovered every analyzer family and checked delegate method groups/lambdas and stored/repeated async results; MEF exported the code fix; SS0024 was fixed in a live compilation; Core ownership/universal proofs and Reporting packages executed.");
+
+static Diagnostic[] MethodDiagnostics(Compilation compilation, ImmutableArray<Diagnostic> diagnostics, string typeName, string methodName)
+{
+    var methods = compilation.GetTypeByMetadataName(typeName)?.GetMembers(methodName).OfType<IMethodSymbol>()
+        .Where(method => method.Parameters.IsEmpty).ToArray() ?? [];
+    Require(methods.Length == 1 && methods[0].DeclaringSyntaxReferences.Length == 1,
+        "The package-host fixture must contain one exact method: " + typeName + "." + methodName + "().");
+    var declaration = methods[0].DeclaringSyntaxReferences[0];
+    return diagnostics.Where(diagnostic => diagnostic.Location.SourceTree == declaration.SyntaxTree &&
+        declaration.Span.Contains(diagnostic.Location.SourceSpan)).ToArray();
+}
 
 static async Task<ImmutableArray<Diagnostic>> AnalyzeAsync(Compilation compilation, ImmutableArray<DiagnosticAnalyzer> analyzers)
 {

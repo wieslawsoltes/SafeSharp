@@ -1,12 +1,12 @@
 # Diagnostic reference
 
-SafeSharp implements **39 Roslyn diagnostics across five analyzers** for ownership, borrowing, disposal, explicit lifetime regions, concurrency contracts, and dependency injection. They run during compiler and IDE analysis. The ownership engine computes effects over Roslyn control-flow graphs; separate semantic, boundary, lifetime, and concurrency analyzers check their corresponding declarations, implementation obligations, and call boundaries.
+SafeSharp implements **40 Roslyn diagnostics across five analyzers** for ownership, borrowing, disposal, explicit lifetime regions, concurrency contracts, and dependency injection. They run during compiler and IDE analysis. The ownership engine computes effects over Roslyn control-flow graphs; separate semantic, boundary, lifetime, and concurrency analyzers check their corresponding declarations, implementation obligations, and call boundaries.
 
 Every rule below is implemented. “Implemented” describes the stated check within the documented model, not equivalence to Rust's language-level guarantees. `Ownership.Move`, `Borrow`, and `BorrowMut` are metadata-bearing passthrough methods; C# still permits aliasing and value-type copies at runtime. See [implementation status](implementation-status.md), [architecture](architecture.md), [contracts](contracts-and-semantics.md), and [Rust design references](rust-design.md) for the analysis domain and its limits.
 
 ## Rule matrix
 
-“Info” appears as a suggestion in typical IDE configurations. Every diagnostic can be configured with `dotnet_diagnostic.<ID>.severity`. Within SS0001–SS0046, only SS0018–SS0019 and SS0035–SS0039 are unassigned.
+“Info” appears as a suggestion in typical IDE configurations. Every diagnostic can be configured with `dotnet_diagnostic.<ID>.severity`. Within SS0001–SS0047, only SS0018–SS0019 and SS0035–SS0039 are unassigned.
 
 | ID | Implemented check | Analyzer | Default | Enabled |
 | --- | --- | --- | --- | --- |
@@ -49,6 +49,7 @@ Every rule below is implemented. “Implemented” describes the stated check wi
 | [SS0044](#ss0044) | Invalid Send/Sync declaration or generic composition | Concurrency | Warning | Yes |
 | [SS0045](#ss0045) | Captured value does not satisfy its concurrency boundary | Concurrency | Warning | Yes |
 | [SS0046](#ss0046) | Cleanup, concurrency or borrowed escape analysis is incomplete | Semantic / Concurrency | Info | Yes |
+| [SS0047](#ss0047) | Callback violates an annotated delegate lifetime contract | Lifetime | Warning | Yes |
 
 The public analyzer classes and descriptor categories are:
 
@@ -122,6 +123,8 @@ void ReadData()
 ```
 
 Use `using var stream = File.OpenRead("data.bin");`, `await using` for asynchronous cleanup, or a try/finally release. An API returning ownership should declare `ReturnsOwned`; a consuming argument should declare `Consumes` or `Owned`. A normal C# assignment copies a reference and does not independently discharge the obligation.
+
+A stored owned Task/ValueTask factory can leave a possible result-production obligation. Dropping that carrier without receiving, transferring or otherwise discharging its modeled ownership receives SS0003 with Possible certainty: the factory may still fault before producing a resource. A successfully received result has its own identity and lifecycle; repeat receipt preserves it. Pending result carriers lost on overwrite receive SS0011. These are result ownership findings; SS0017 specifically covers asynchronous disposal completions. See [async result ownership](async-result-ownership.md).
 
 Unannotated external results and ordinary borrowed inputs are not automatically assumed to be locally owned. Use SS0033 to audit unknown factory boundaries. SS0030 complements this exit analysis with an advisory for recognized manual cleanup that an earlier exception can bypass.
 
@@ -742,6 +745,32 @@ Inspect recursive helpers, deeply expanding structures, or complex callback alia
 Aggregate checks additionally bound tracked members to 512, active summaries to 32, cached summaries to 256, and CFG continuation contexts to 8,192. Concurrency checks bound recursive type and delegate alias depth to 128 and each source-visible affinity traversal to 128 distinct types. Borrowed escape checks bound expression depth to 256 and charge propagation work to the per-method contract budget. Their budgets are separate from ownership fixed-point and lifetime-region limits. Existing SS0021 findings may accompany an incomplete aggregate result.
 
 SS0046 is informational and enabled by default. The CLI treats it as incomplete analysis even if its visible diagnostic is suppressed. See [aggregate limits](aggregate-concurrency.md#analysis-limits), [concurrency limits](aggregate-concurrency.md#what-these-contracts-establish), and [borrowed escape analysis](borrowed-escape.md).
+
+## SS0047
+
+**Callback does not satisfy its annotated delegate contract.** A method group, anonymous function or distinct typed delegate conversion cannot preserve the target's explicit lifetime, ownership or borrowing promise for every caller lifetime allowed by that delegate.
+
+This check activates when the target delegate declares named lifetime regions or an owned return. Borrowing, consuming or no-escape annotations alone do not activate SS0047.
+
+```csharp
+[return: Lifetime("a"), Borrowed]
+delegate Resource Pick(
+    [Borrowed, Lifetime("a")] Resource first,
+    [Borrowed, Lifetime("b")] Resource second);
+
+[return: Lifetime("y"), Borrowed]
+static Resource Second(
+    [Borrowed, Lifetime("x")] Resource first,
+    [Borrowed, Lifetime("y")] Resource second) => second;
+
+Pick callback = Second; // SS0047: the result requires b : a, which Pick never promised.
+```
+
+Use a callback returning the promised input, or declare an appropriate `[Outlives("b", "a")]` relationship on the delegate when every caller can honor it. Preserve its explicit borrowing, consuming and no-escape parameter modes. A captured receiver remains independent of arbitrary future delegate inputs; a task's own provenance does not prove the lifetime of its eventual payload.
+
+The primary location is the callback conversion, or the invalid returned expression for a lambda analyzed under its target promise. Related locations identify declarations and origins. Universal failures carry exact assumed/required edges, generated-to-source region bindings and a deterministic shortest proof. Graphs distinguish assumptions from requirements. Budget exhaustion receives SS0043 and does not accept a partial result.
+
+This implements one universal outlives binder, including input shortening, output covariance and writable ref/out invariance. Nested universes, implied type bounds and full Rust higher-ranked type/trait solving remain outside the model. See [delegate lifetime contracts](lifetime-delegates.md) and the [public universal solver](universal-regions.md).
 
 ## Configuration and adoption
 

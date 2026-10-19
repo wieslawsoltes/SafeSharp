@@ -36,7 +36,7 @@ A cleanup statement being present somewhere in a method is insufficient. The che
 | --- | --- |
 | Branches and early returns | Every feasible modeled normal exit must release each obligation. Constant booleans and direct null tests refine branches. |
 | Loops | A worklist retains obligations across back edges. Distinct initial and replacement resources remain separate. |
-| `using`, `await using`, `try`/`finally` | Roslyn's finally regions execute through explicit continuation contexts, including returns and nested finalizers. |
+| `using`, `await using`, `try`/`finally` | Roslyn's finally regions execute through explicit continuation contexts, including returns and nested finally blocks. |
 | Local aliases and casts | Aliases of an exact tracked resource preserve its obligation identity. Cleanup of a different owner instance is insufficient. |
 | Replacement and clearing | Assigning a new resource does not release the previous resource; clearing a live field to `null` also leaves its obligation outstanding. |
 | Direct source helpers | Summaries carry guaranteed releases, writes, replacement obligations, outstanding async work, and conservative exceptional effects. Disposable parameters and `ref`/`out` storage are mapped to caller arguments. |
@@ -69,7 +69,7 @@ Summaries are specialized by constant boolean arguments, which supports the usua
 
 The aggregate abstraction tracks explicit member and parameter resource identities. It does not provide whole-program heap alias analysis, symbolic collection-element ownership, arbitrary custom awaiter semantics, or constructor-to-dispose state invariants. For example, a private `_disposed` flag is not automatically related to an earlier cleanup invocation. An idempotent implementation guarded only by that flag may need a directly provable null-and-cleanup pattern or a reviewed diagnostic suppression. Correlations between different aliases or unrelated conditions may be lost at joins.
 
-Exception routing is conservative: potentially matching catch bodies are explored, filter side effects are not credited as guaranteed cleanup, and helper cleanup on an unhandled exceptional path may lose precision around pending finalizers. Unknown external or recursive helper side effects are an interprocedural trust boundary. Normal-exit checking does not prove physical cleanup after an unhandled exception, process termination, reflection, unsafe memory access, native callbacks, or concurrent mutation of the same fields. See [the architecture boundaries](architecture.md) for the core flow engine's separate exception model.
+Exception routing is conservative: potentially matching catch bodies are explored, filter side effects are not credited as guaranteed cleanup, and helper cleanup on an unhandled exceptional path may lose precision around pending finally continuations. Unknown external or recursive helper side effects are an interprocedural trust boundary. Normal-exit checking does not prove physical cleanup after an unhandled exception, process termination, reflection, unsafe memory access, native callbacks, or concurrent mutation of the same fields. See [the architecture boundaries](architecture.md) for the core flow engine's separate exception model.
 
 SS0021 includes `SafeSharp.CleanupProof=normalExitMustRelease`, `SafeSharp.CleanupOwner`, and `SafeSharp.CleanupEntrypoints` diagnostic properties. Related locations preserve cleanup entrypoints, representative exits, and the member declaration. The CLI preserves these properties in JSON, SARIF, and HTML reports.
 

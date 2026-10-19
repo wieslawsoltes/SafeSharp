@@ -302,7 +302,8 @@ Reduce unnecessary signature/body complexity or increase a measured, appropriate
 | Explicit framework async-result contracts and payload provenance through aliases/joins | Implemented for the modeled `Task<T>`/`ValueTask<T>` producers and wrappers. |
 | Omitted inherited contracts and positional region/parameter renaming | Implemented. |
 | Basic inherited input and returned-lifetime compatibility | Implemented. |
-| Full type-level region inference, higher-ranked binders/universes/placeholders | Not implemented. |
+| One universal outlives binder for annotated delegate conversions | Implemented; input shortening, result covariance, ref/out invariance and independent captured receivers. See [delegate contracts](lifetime-delegates.md). |
+| Full type-level region inference, nested higher-ranked universes/placeholders | Not implemented. |
 | Complete generic variance, nested type-lifetime tests, automatic closure lifetime generalization | Not implemented. |
 | Arbitrary heap/container/native aliases and every external library effect | Require models/contracts; unknown origins are not accepted as proofs. |
 | Arbitrary custom awaiters/builders and unmodeled task combinators | Payload origins remain unknown. |
@@ -322,3 +323,9 @@ The implementation is original C#. It adopts the explicit outlives-constraint an
 - [Rust compiler `RegionInferenceContext`](https://doc.rust-lang.org/beta/nightly-rustc/rustc_borrowck/region_infer/struct.RegionInferenceContext.html) exposes `constraint_sccs`, `solve`, `eval_outlives`, and `constraint_path_between_regions`, with links to the corresponding Rust implementation.
 
 SafeSharp's named-region graph is intentionally smaller: it does not represent rustc's full set of MIR points, universe placeholders, type tests, or higher-ranked region constraints. Its BFS witness generation is a diagnostic/provenance service over the explicit graph, while its separate C# control-flow analysis checks actual returned origins against the solved promises.
+
+## Universal delegate conversions
+
+An annotated delegate supplies arbitrary caller regions plus its declared `[Outlives]` assumptions. SS0047 checks that a method group, lambda or distinct typed delegate conversion preserves these relationships and its ownership/borrowing modes. `[Outlives]` accepts delegate declarations; delegate signatures have no implicit `this` region. Unknown async payload provenance cannot satisfy a result promise merely because the task carrier is known. The [delegate guide](lifetime-delegates.md) documents examples, exact source evidence and limitations.
+
+The public `UniversalRegionProblem` / `UniversalRegionSolver` / `UniversalRegionSolution` API is independent of Roslyn. It uses the same compact region forests and shared bounded work counter for assumed closure, required closure and universal-pair comparison. See [universal regions](universal-regions.md) for the compatibility condition and API, and [region performance](region-performance.md) for lazy proof storage.

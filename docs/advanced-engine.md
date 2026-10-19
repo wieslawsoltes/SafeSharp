@@ -129,6 +129,14 @@ The graphs never turn proof paths, reflexive implications, missing constraints, 
 
 The HTML graph is a self-contained SVG with accessible labels, a legend, and complete region/edge tables. DOT and Mermaid use generated identifiers and retain diagnostic metadata as separate notes. Every format escapes source-derived labels, and JSON/SARIF preserve the original properties exactly.
 
-Graph previews accept at most **64 named regions**, **256 distinct declared edges**, and **65,536 characters per graph-input property**. Malformed endpoints, missing essential metadata, empty named-region sets, and larger inputs produce an explicit explanation followed by the diagnostic properties. The reporter does not draw a partial graph that could conceal a required edge. These presentation bounds do not change the analyzer's region-solver budgets.
+Graph previews accept at most **64 named regions**, **256 combined distinct assumption/requirement edges**, and **65,536 characters per graph-input property**. Malformed endpoints, missing essential metadata, empty named-region sets, and larger inputs produce an explicit explanation followed by the diagnostic properties. The reporter does not draw a partial graph that could conceal a required edge. These presentation bounds do not change the analyzer's region-solver budgets.
 
 The [region-report tests](../tests/SafeSharp.Tests/Reporting/RegionReportTests.cs) verify exact topology, empty and disconnected graphs, cycles and self edges, role collisions, malicious metadata escaping, bounded fallbacks, deterministic output, accessible SVG identifiers, and machine-report property preservation.
+
+## Stored asynchronous results
+
+`BeginAsyncFactory`, `ObserveAsyncFactory`, `ReceiveAsyncResult` and `BindAsyncResult` distinguish an asynchronous carrier from its produced value. The analysis materializes a deferred factory's output on the successful receive continuation; this does not delay the actual .NET task's execution. Known completed producers retain existing resources and loans. Cached results preserve disposal/move history across repeated receipt, and transfer of a carrier also handles its materialized output. Possible unreceived output obligations use SS0003/SS0011, while SS0017 remains specific to disposal completions. See [async result ownership](async-result-ownership.md) for the full transfer table and supported boundaries.
+
+## Universal delegate evidence
+
+SS0047 checks annotated delegate conversions with a separate assumed universal graph and required callback graph. The [universal solver](universal-regions.md) rejects a requirement path that relates independent caller regions without a corresponding assumption. HTML, DOT and Mermaid draw declared assumptions as solid edges and exact requirements as dashed edges. The shortest proof and generated-to-signature name bindings remain available as diagnostic metadata. The [delegate guide](lifetime-delegates.md) covers shortened inputs, returned loans, invariant ref/out slots and captured receivers.

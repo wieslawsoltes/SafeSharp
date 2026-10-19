@@ -7,25 +7,31 @@
 
 SafeSharp combines a compiler-independent dataflow engine with Roslyn semantic analysis and explicit API contracts. It tracks resource identity across aliases, checks shared and exclusive loans, expires loans at their last use, follows ownership transfers, and explains violations with exact source locations and computed control-flow/state graphs.
 
-The current implementation is **`0.2.0-preview.1`**. Its design is informed by Rust's MIR borrow checker and non-lexical lifetimes. It is an independent C# implementation, with a [pinned Rust source reference and explicit support matrix](docs/rust-design.md). It does **not** establish Rust-equivalent memory safety for arbitrary C#: reflection, unmodeled calls, native code, and unrestricted heap aliasing remain outside the proof boundary.
+The current implementation is **`0.3.0-preview.1`**. Its design is informed by Rust's MIR borrow checker and non-lexical lifetimes. It is an independent C# implementation, with a [pinned Rust source reference and explicit support matrix](docs/rust-design.md). It does **not** establish Rust-equivalent memory safety for arbitrary C#: reflection, unmodeled calls, native code, and unrestricted heap aliasing remain outside the proof boundary.
 
 ## What is implemented
 
 | Area | Analysis |
 | --- | --- |
 | Resource ownership | Use after disposal, repeated disposal, leaks, lost ownership on overwrite, owned results, consuming parameters, explicit moves, and aliases invalidated by moves. |
-| Borrowing | Shared/exclusive loans, two-phase implicit receiver/argument borrows, stable evaluated call values, reborrows, mutation/disposal conflicts, projected overlap, and backward control-flow loan liveness. |
+| Borrowing | Shared/exclusive loans, two-phase implicit receiver/argument borrows, stable evaluated call values, reborrows, mutation/disposal conflicts, projected overlap, and indexed backward control-flow loan liveness with hybrid bitsets and cached block effects. |
 | Borrowed escapes | Bounded CFG may-origin analysis follows aliases, ref slots, allocation containers and captured cells into persistent storage, returned containers/delegates, and explicit no-escape contract violations. |
-| Named lifetimes | `[Lifetime]` and `[Outlives]`, bounded region solving, equivalent regions, shortest implication proofs, returned-value provenance, inherited promises, and multi-input returned-loan alternatives. |
+| Named lifetimes | `[Lifetime]` and `[Outlives]`, bounded region solving, equivalent regions, shortest implication proofs, returned-value provenance, inherited promises, multi-input returned-loan alternatives, and universally quantified annotated delegate conversions. |
 | Control flow | Forward fixed points over branches and loops; nullable guards; explicit throw/rethrow; typed catches and filters; implicit fault markers; finally and using cleanup continuations; return validation after cleanup. |
-| Async and views | Deferred disposal completion obligations through aliases, branches and supported awaitable wrappers; `await using`; suspension restrictions; `[NoSuspend]`; pool leases and modeled `Memory`/`Span` views. |
-| API and aggregates | CFG origin summaries for factories and owned `out` results; inherited contracts; every-normal-exit aggregate cleanup with helper summaries, separate sync/async entrypoints, copyable owners, and `[MustUse]`. |
+| Async and views | Stored Task/ValueTask result ownership, cached payload and loan identity, completed producers, deferred disposal completion obligations through aliases and branches; `await using`; suspension restrictions; `[NoSuspend]`; pool leases and modeled `Memory`/`Span` views. |
+| API and aggregates | CFG origin summaries with aliased reference storage and separate async payload provenance; factories and owned `out` results; inherited contracts; every-normal-exit aggregate cleanup with helper summaries, separate sync/async entrypoints, copyable owners, and `[MustUse]`. |
 | Services and callbacks | Scoped resource owners, scope escape/invalidation, singleton-to-scoped dependency paths, constructor/factory registration analysis, escaping callbacks, and declared thread-affinity checks. |
 | Concurrency | Explicit `[Send]` / `[Sync]` composition, generic requirements, sharing and transfer callback boundaries, and declared thread affinity. |
-| Evidence | Definite/possible certainty, instruction states, live places, reservation/activation sites, pending/completed cleanup, CFGs, declared region graphs, and dependency witnesses. |
+| Evidence | Definite/possible certainty, instruction states, live places, reservation/activation sites, pending/completed cleanup, cached async results, CFGs, assumed/required region graphs, and dependency witnesses. |
 | Integration | Compiler/IDE diagnostics, EditorConfig severity and budgets, six NuGet packages, an optional safe code fix, a standalone .NET tool, and CI/release workflows. |
 
-There are **39 diagnostic rules**. Their exact triggers, defaults, examples, remedies, and limitations are in the [diagnostic reference](docs/diagnostics.md). The engine reports budget exhaustion explicitly; an incomplete result does not count as a successful analysis.
+There are **40 diagnostic rules**. Their exact triggers, defaults, examples, remedies, and limitations are in the [diagnostic reference](docs/diagnostics.md). The engine reports budget exhaustion explicitly; an incomplete result does not count as a successful analysis.
+
+## Engine performance
+
+The core interns place and region identities, uses sparse/dense immutable liveness sets, summarizes block effects, and retains compact predecessor forests for lazy shortest region proofs. The [reproducible benchmark harness and raw results](docs/performance.md) compare against the previous main revision with independent correctness checks.
+
+On the recorded .NET 10 Linux host, the selected synthetic liveness cases improved by **1.16–129.80×**. A 256-region chain with selected proof queries improved by **307.50×**, while materializing every proof path on a 128-region chain improved by **2.04×**. These are measured engine workloads, not whole-build speedups. Graph construction, source analysis, snapshots and report output have separate costs.
 
 ## Add the analyzer
 
@@ -33,9 +39,9 @@ Build the packages locally or download the package artifact from [CI](https://gi
 
 ```xml
 <ItemGroup>
-  <PackageReference Include="SafeSharp.Analyzers" Version="0.2.0-preview.1" PrivateAssets="all" />
-  <PackageReference Include="SafeSharp.Contracts" Version="0.2.0-preview.1" />
-  <PackageReference Include="SafeSharp.CodeFixes" Version="0.2.0-preview.1" PrivateAssets="all" />
+  <PackageReference Include="SafeSharp.Analyzers" Version="0.3.0-preview.1" PrivateAssets="all" />
+  <PackageReference Include="SafeSharp.Contracts" Version="0.3.0-preview.1" />
+  <PackageReference Include="SafeSharp.CodeFixes" Version="0.3.0-preview.1" PrivateAssets="all" />
 </ItemGroup>
 ```
 
@@ -97,7 +103,7 @@ The compiler analyzer performs no report-file I/O. The separate tool uses the sa
 
 ```sh
 dotnet tool install SafeSharp.Tool --tool-path .tools \
-  --version 0.2.0-preview.1 --add-source artifacts/packages
+  --version 0.3.0-preview.1 --add-source artifacts/packages
 
 .tools/safesharp --project samples/SafeSharp.Sample/SafeSharp.Sample.csproj \
   --format html --output artifacts/ownership.html
@@ -108,13 +114,15 @@ dotnet tool install SafeSharp.Tool --tool-path .tools \
 
 | Format | Output |
 | --- | --- |
-| HTML | Self-contained interactive CFG/state inspector with SVG graphs, method selection, issue filtering, lifetime constraints, loan phases, and source evidence. |
+| HTML | Self-contained interactive CFG/state inspector with SVG graphs, method selection, issue filtering, lifetime assumptions and requirements, loan phases, cached async payloads, and source evidence. |
 | JSON | Machine-readable diagnostics, resource/loan facts, graph edges, and instruction snapshots. |
 | SARIF 2.1.0 | Source locations, rule metadata, related locations, and abstract provenance for analysis integrations. |
-| DOT | Control-flow, declared region, and service-dependency witness diagrams for Graphviz. |
+| DOT | Control-flow, declared/required region, and service-dependency witness diagrams for Graphviz. |
 | Mermaid | The same graph relationships as portable text for Markdown documentation and review. |
 
 Report edges and states come from the computed analysis. Evidence is abstract provenance, not a fabricated executable path. Project-mode reports honor analyzer configuration. CLI exit codes distinguish findings (`1`), errors/incomplete analysis (`2`), and cancellation (`130`); `--fail-on none` does not hide incomplete analysis. See the [reporting guide](docs/reporting.md).
+
+The [async and delegate example report](docs/examples/async-delegates.html) shows universal lifetime requirements, abandoned factory results, and cached payload identity across repeated awaits. Its [source fixture](samples/AsyncDelegateExamples.cs.txt) includes both accepted and rejected cases.
 
 Download and open the generated [example HTML report](docs/examples/ownership.html) for computed method graphs, ownership and lifetime diagnostics, and per-instruction state inspection from the included unsafe examples. The reporting guide includes the regeneration command.
 
@@ -151,9 +159,10 @@ dotnet restore SafeSharp.sln
 dotnet build SafeSharp.sln -c Release --no-restore
 dotnet test tests/SafeSharp.Tests/SafeSharp.Tests.csproj -c Release --no-build
 python tests/cli/verify.py --tool src/SafeSharp.Tool/bin/Release/net10.0/SafeSharp.Tool.dll
+dotnet run --project benchmarks/SafeSharp.Benchmarks -c Release -- liveness --iterations 1 --warmup 0 --json artifacts/benchmarks/smoke.json
 dotnet pack SafeSharp.sln -c Release --no-build -o artifacts/packages
 python eng/verify-packages.py artifacts/packages
-python eng/smoke-consumer.py artifacts/packages --version 0.2.0-preview.1
+python eng/smoke-consumer.py artifacts/packages --version 0.3.0-preview.1
 ```
 
 The regression suites exercise real Roslyn compilations and reject invalid test fixtures or analyzer crashes. Coverage includes core lattice/liveness behavior, positive and negative analyzer cases, exceptional control flow, contracts, service graphs, code-fix results, deterministic/escaped reports, and configured CLI behavior. Package tests restore a clean external consumer, verify both a safe build and a failing unsafe build, and install and invoke the packaged tool. CI runs the build/test/package pipeline on Linux, Windows, and macOS.
@@ -164,7 +173,7 @@ All six packages include README/license/repository metadata and portable symbol 
 
 SafeSharp is a preview analysis system. The implemented rules require the documented effects and contracts to describe actual runtime behavior. A recognized disposal invocation discharges the modeled obligation even if the disposer throws; it does not prove successful physical cleanup. Unhandled implicit faults are a labeled boundary with a separate exception-safety advisory. Aggregate cleanup is checked on every modeled normal exit, with bounded source-helper summaries. This excludes a claim about successful physical cleanup after arbitrary exceptional termination.
 
-Named lifetime solving, two-phase borrowing, and explicit `Send`/`Sync` conventions are implemented. Full Rust lifetime quantification, higher-ranked regions, general trait solving, `Pin`, unsafe pointer provenance, symbolic heap/index reasoning, and whole-program verification remain outside this model. C# definite-assignment and ref-safety rules remain the C# compiler's responsibility. The [Rust comparison](docs/rust-design.md#semantic-differences-and-unsupported-rust-guarantees) records these limits alongside implemented capabilities and pinned source links.
+Named lifetime solving, one universal delegate binder, two-phase borrowing, and explicit `Send`/`Sync` conventions are implemented. Nested higher-ranked universes, full type/trait lifetime inference, `Pin`, unsafe pointer provenance, symbolic heap/index reasoning, and whole-program verification remain outside this model. C# definite-assignment and ref-safety rules remain the C# compiler's responsibility. The [Rust comparison](docs/rust-design.md#semantic-differences-and-unsupported-rust-guarantees) records these limits alongside implemented capabilities and pinned source links.
 
 Contributions should define the effect being added, include both valid and invalid regression cases, and update the diagnostic/support documentation. Broader guarantees should follow demonstrated analysis coverage.
 

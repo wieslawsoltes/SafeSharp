@@ -2,14 +2,14 @@
 
 ## Packages
 
-The current package version is `0.2.0-preview.1`. Building a package does not publish it. Until a NuGet release is published, install the packages from `artifacts/packages` or a downloaded CI artifact. Use a clean package output directory when changing versions so consumer validation cannot select an older build.
+The current package version is `0.3.0-preview.1`. Building a package does not publish it. Until a NuGet release is published, install the packages from `artifacts/packages` or a downloaded CI artifact. Use a clean package output directory when changing versions so consumer validation cannot select an older build.
 
 ```xml
 <ItemGroup>
-  <PackageReference Include="SafeSharp.Analyzers" Version="0.2.0-preview.1" PrivateAssets="all" />
-  <PackageReference Include="SafeSharp.Contracts" Version="0.2.0-preview.1" />
+  <PackageReference Include="SafeSharp.Analyzers" Version="0.3.0-preview.1" PrivateAssets="all" />
+  <PackageReference Include="SafeSharp.Contracts" Version="0.3.0-preview.1" />
   <!-- Optional IDE fix for explicitly acknowledging MustUse results. -->
-  <PackageReference Include="SafeSharp.CodeFixes" Version="0.2.0-preview.1" PrivateAssets="all" />
+  <PackageReference Include="SafeSharp.CodeFixes" Version="0.3.0-preview.1" PrivateAssets="all" />
 </ItemGroup>
 ```
 
@@ -26,12 +26,12 @@ dotnet test tests/SafeSharp.Tests/SafeSharp.Tests.csproj -c Release --no-build
 python tests/cli/verify.py --tool src/SafeSharp.Tool/bin/Release/net10.0/SafeSharp.Tool.dll
 dotnet pack SafeSharp.sln -c Release --no-build -o artifacts/packages
 python eng/verify-packages.py artifacts/packages
-python eng/smoke-consumer.py artifacts/packages --version 0.2.0-preview.1
+python eng/smoke-consumer.py artifacts/packages --version 0.3.0-preview.1
 ```
 
-The consumer smoke check restores real NuGet packages in an isolated SDK project and package cache. Its safe example exercises named return lifetimes, observed deferred disposal, and valid Send/Sync structure. The unsafe example must fail with `SS0001`, `SS0017`, `SS0021`, `SS0027`, `SS0041`, `SS0044`, and `SS0045`, covering ownership, cleanup, aliased borrowed retention, regions and concurrency. It then installs the packaged .NET tool and checks the same findings and exit code in both standalone source and MSBuild project modes. Project mode exercises the packaged build host and installed-SDK resolution, suppressed exhaustion from an MSBuild budget property exposed by the package, and EditorConfig precedence over that property.
+The consumer smoke check restores real NuGet packages in an isolated SDK project and package cache. Its safe example exercises named return and delegate lifetimes, stored factory results, observed deferred disposal, and valid Send/Sync structure. The unsafe example must fail with `SS0001`, `SS0003`, `SS0017`, `SS0021`, `SS0027`, `SS0041`, `SS0044`, `SS0045`, and `SS0047`, covering ownership, possible async production loss, cleanup, aliased borrowed retention, universal delegate regions and concurrency. It then installs the packaged .NET tool and checks the same findings, universal relation evidence, cached async result IDs and exit code in both standalone source and MSBuild project modes. Project mode exercises the packaged build host and installed-SDK resolution, suppressed exhaustion from an MSBuild budget property exposed by the package, and EditorConfig precedence over that property.
 
-The separate `eng/package-host` fixture loads the packaged analyzer assembly through Roslyn's analyzer discovery API, composes the packaged C# code-fix export with MEF, obtains a real `SS0024` diagnostic, applies its registered action, and recompiles the changed document. It retains the changed syntax tree instead of reparsing the resulting text, so malformed contextual tokens cannot be hidden by a fresh parse. The same fixture executes an ownership graph and serializes its finding through the `SafeSharp.Core` and `SafeSharp.Reporting` NuGet packages. These checks cover all six packages and catch missing dependencies, omitted analyzer entries and export/load failures that direct unit tests do not.
+The separate `eng/package-host` fixture loads the packaged analyzer assembly through Roslyn 4.14's analyzer discovery API, composes the packaged C# code-fix export with MEF, obtains a real `SS0024` diagnostic, applies its registered action, and recompiles the changed document. It retains the changed syntax tree instead of reparsing the resulting text, so malformed contextual tokens cannot be hidden by a fresh parse. The same fixture executes ownership and universal-region graphs through the `SafeSharp.Core` package and serializes an ownership finding through `SafeSharp.Reporting`. It checks valid and invalid delegate method groups/lambdas, safely disposed stored results, possible unreceived factory obligations, and disposal retained across repeated awaits on the minimum supported Roslyn host. These checks cover all six packages and catch missing dependencies, omitted analyzer entries and export/load failures that direct unit tests do not.
 
 Package verification checks that all six IDs share one release version, all six matching symbol packages contain portable PDB metadata, bundled SafeSharp assemblies match the corresponding library packages byte for byte, analyzer packages contribute no runtime dependencies, and the tool supplies its build host without bundling SDK-owned MSBuild assemblies into its runtime directory.
 
@@ -54,7 +54,7 @@ safesharp_max_tracked_resources = 2048
 safesharp_report_possible_issues = true
 safesharp_check_suspension = true
 
-# Named region solving and return provenance; exhaustion produces SS0043.
+# Named regions, universal delegate relations and return provenance; exhaustion produces SS0043.
 safesharp_max_regions = 256
 safesharp_max_region_constraints = 4096
 safesharp_max_region_steps = 100000
@@ -86,8 +86,10 @@ The repository contains a complete `release.yml` workflow using NuGet OIDC trust
 2. Under **Trusted Publishing**, create a GitHub policy with repository owner `wieslawsoltes`, repository `SafeSharp`, workflow filename `release.yml` (filename only), and environment `nuget`.
 3. Give the policy permission to create/update the intended `SafeSharp.*` package IDs, and select the correct package owner.
 4. In GitHub repository settings, create the Actions environment `nuget` and set the repository or environment variable `NUGET_USER` to the nuget.org **profile name**, not an email address.
-5. Dispatch **release-nuget** with a version such as `0.2.0-preview.1`, or push a matching `v0.2.0-preview.1` tag. The tag must identify the intended reviewed main commit.
+5. Dispatch **release-nuget** with a version such as `0.3.0-preview.1`, or push a matching `v0.3.0-preview.1` tag. The tag must identify the intended reviewed main commit.
 
 The workflow validates the version, restores, builds, tests, packs all six packages, validates their contents, exercises a real package consumer, and uploads the package artifact. Only then does `NuGet/login` exchange the workflow identity for a short-lived API key and publish packages/symbols. NuGet account policy creation and the first publication are separate account operations; neither happens just by committing this workflow.
 
 References: [NuGet trusted publishing](https://learn.microsoft.com/en-us/nuget/nuget-org/trusted-publishing), [analyzer package layout](https://learn.microsoft.com/en-us/nuget/guides/analyzers-conventions), [Roslyn analyzer configuration](https://learn.microsoft.com/en-us/dotnet/fundamentals/code-analysis/configuration-options).
+
+The benchmark console project is excluded from all NuGet packages. CI compiles and runs its independent liveness equivalence checks with one informational timing sample. Correctness and package compatibility are gates; wall-clock speed ratios are recorded measurements, not pass/fail assertions. See [performance](performance.md).

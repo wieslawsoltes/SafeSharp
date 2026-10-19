@@ -58,10 +58,16 @@ with tempfile.TemporaryDirectory(prefix="safesharp-consumer-") as temporary:
     (root / "Consumer.cs").write_text('''using System.IO;
 using System.Threading.Tasks;
 using SafeSharp;
+[return: Lifetime("a"), Borrowed]
+public delegate MemoryStream StreamSelector([Borrowed, Lifetime("a")] MemoryStream first, [Borrowed, Lifetime("b")] MemoryStream second);
 public static class Consumer {
     public static void Good() { using var stream = new MemoryStream(); var view = First(stream); _ = view.Length; }
     [return: Lifetime("a")] private static MemoryStream First([Lifetime("a")] MemoryStream stream) => stream;
     public static async Task GoodAsync() { var stream = new MemoryStream(); var completion = stream.DisposeAsync(); await completion.ConfigureAwait(false); }
+    private static Task<MemoryStream> OpenAsync() => Task.FromResult(new MemoryStream());
+    public static async Task GoodResult() { var pending = OpenAsync(); var configured = pending.ConfigureAwait(false); using var stream = await configured; _ = stream.Length; }
+    [return: Lifetime("x"), Borrowed] private static MemoryStream SelectFirst([Borrowed, Lifetime("x")] MemoryStream first, [Borrowed, Lifetime("y")] MemoryStream second) => first;
+    public static StreamSelector GoodCallback() => SelectFirst;
 }
 [Send, Sync] public sealed class Snapshot { public readonly int Value; public Snapshot(int value) { Value = value; } }
 ''', encoding="utf-8")
@@ -76,9 +82,16 @@ public static class Consumer {
 using System.IO;
 using System.Threading.Tasks;
 using SafeSharp;
+[return: Lifetime("a"), Borrowed]
+public delegate MemoryStream StreamSelector([Borrowed, Lifetime("a")] MemoryStream first, [Borrowed, Lifetime("b")] MemoryStream second);
 public static class Consumer {
     public static void Bad() { var stream = new MemoryStream(); stream.Dispose(); stream.WriteByte(1); }
     public static void Pending() { var stream = new MemoryStream(); var pending = stream.DisposeAsync(); }
+    [ReturnsOwned] private static Task<MemoryStream> OpenAsync() => Task.FromResult(new MemoryStream());
+    public static void PendingResult() { var pending = OpenAsync(); }
+    public static async Task RepeatResult() { var pending = OpenAsync(); var stream = await pending; stream.Dispose(); var repeated = await pending; _ = repeated.Length; }
+    [return: Lifetime("y"), Borrowed] private static MemoryStream SelectSecond([Borrowed, Lifetime("x")] MemoryStream first, [Borrowed, Lifetime("y")] MemoryStream second) => second;
+    public static StreamSelector BadCallback() => SelectSecond;
     public static object? Retained;
     public static void Retain([Borrowed] object value) { var alias = value; Retained = alias; }
     [return: Lifetime("a")] public static MemoryStream Wrong([Lifetime("a")] MemoryStream first, [Lifetime("b")] MemoryStream second) => second;
@@ -93,7 +106,7 @@ public sealed class IncompleteOwner : IDisposable {
 }
 ''', encoding="utf-8")
     bad = run(["build", "Consumer.csproj", "--no-restore", "--nologo", "-v", "minimal"], root, expected=1)
-    expected_rules = {"SS0001", "SS0017", "SS0021", "SS0027", "SS0041", "SS0044", "SS0045"}
+    expected_rules = {"SS0001", "SS0003", "SS0017", "SS0021", "SS0027", "SS0041", "SS0044", "SS0045", "SS0047"}
     if any("error " + rule not in bad for rule in expected_rules) or any(code in bad for code in ("AD0001", "AD0002", "CS8032", "CS8034")):
         raise SystemExit("Bad consumer did not exercise every packaged analyzer family\n" + bad)
     run(["tool", "install", "SafeSharp.Tool", "--version", args.version, "--tool-path", str(root / "tools"),
@@ -115,6 +128,49 @@ public sealed class IncompleteOwner : IDisposable {
                diagnostic.get("properties", {}).get("SafeSharp.DoesNotEscape") != "false" or
                not diagnostic.get("relatedLocations") for diagnostic in borrowed):
             raise SystemExit(f"Packaged tool {mode} report lost borrowed-escape certainty or provenance")
+        delegates = [diagnostic for diagnostic in payload["diagnostics"] if diagnostic["id"] == "SS0047"]
+        if any(diagnostic.get("properties", {}).get("SafeSharp.RegionQuantification") != "one universal delegate binder" or
+               not diagnostic.get("properties", {}).get("SafeSharp.RegionRequirements") or
+               not diagnostic.get("properties", {}).get("SafeSharp.RegionBindings") or
+               not diagnostic.get("relatedLocations") for diagnostic in delegates):
+            raise SystemExit(f"Packaged tool {mode} report lost universal delegate evidence")
+        pending_results = [diagnostic for diagnostic in payload["diagnostics"] if diagnostic["id"] == "SS0003" and
+                           diagnostic.get("method") == "Consumer.PendingResult()"]
+        if len(pending_results) != 1 or pending_results[0].get("certainty") != "Possible" or \
+                "factory may produce" not in pending_results[0]["message"]:
+            raise SystemExit(f"Packaged tool {mode} report lost possible async production obligations")
+        repeated_methods = [method for method in payload["methods"] if method["name"] == "Consumer.RepeatResult()"]
+        if len(repeated_methods) != 1:
+            raise SystemExit(f"Packaged tool {mode} report lost the repeated-result method")
+        # OpenAsync's completed producer and Bad's ordinary use-after-dispose must
+        # not satisfy these checks on behalf of the caller's two deferred receives.
+        receives = [step for block in repeated_methods[0]["blocks"] for step in block.get("steps", [])
+                    if step["instruction"]["kind"] == "ReceiveAsyncResult"]
+        if len(receives) != 2:
+            raise SystemExit(f"Packaged tool {mode} report did not retain both repeated-result receives")
+        received_ids = []
+        received_states = []
+        for step in sorted(receives, key=lambda item: item["instruction"]["source"]["start"]):
+            resources = step["after"]["resources"]
+            carriers = [resource for resource in resources if resource.get("kind") == "AsyncFactoryCarrier"]
+            if len(carriers) != 1 or carriers[0].get("resultState") != "Materialized" or \
+                    len(carriers[0].get("producedResourceIds", [])) != 1:
+                raise SystemExit(f"Packaged tool {mode} report lost the caller's cached result identity")
+            result_id = carriers[0]["producedResourceIds"][0]
+            result_places = [place for place in step["after"]["places"] if place["place"] == step["instruction"]["target"]]
+            if len(result_places) != 1 or {reference["resourceId"] for reference in result_places[0]["references"]} != {result_id}:
+                raise SystemExit(f"Packaged tool {mode} report did not bind the received alias to the cached output")
+            results = [resource for resource in resources if resource["id"] == result_id and resource["ownership"] == "Owned"]
+            if len(results) != 1:
+                raise SystemExit(f"Packaged tool {mode} report lost owned async output metadata")
+            received_ids.append(result_id)
+            received_states.append(results[0]["status"])
+        if received_ids[0] != received_ids[1] or received_states != ["Alive", "Disposed"]:
+            raise SystemExit(f"Packaged tool {mode} report recreated ownership after disposal of an awaited output")
+        if not any(diagnostic["id"] == "SS0001" and diagnostic.get("method") == "Consumer.RepeatResult()" and
+                   diagnostic.get("resourceId") == received_ids[0] and diagnostic.get("certainty") == "Definite"
+                   for diagnostic in payload["diagnostics"]):
+            raise SystemExit(f"Packaged tool {mode} report lost the repeated-result use-after-dispose diagnostic")
 
     # The analyzer's buildTransitive props must expose MSBuild budget defaults to
     # compiler analysis, and a file's EditorConfig setting must take precedence.
@@ -154,4 +210,4 @@ public sealed class IncompleteOwner : IDisposable {
          "-p:SafeSharpPackageVersion=" + args.version], host)
     host_output = run([str(host / "bin/Debug/net10.0/PackageHost.dll"), str(analyzer_path), str(code_fixes_path)], host)
     print(host_output.strip())
-    print("NuGet consumer: fresh package cache; valid lifetime/async/concurrency contracts accepted; SS0001/17/21/27/41/44/45 enforced; installed CLI source/project modes and packaged MSBuild-budget/EditorConfig precedence verified.")
+    print("NuGet consumer: fresh package cache; valid lifetime/delegate/async/concurrency contracts accepted; SS0001/03/17/21/27/41/44/45/47 enforced; universal proofs and cached async identities retained; installed CLI source/project modes and packaged MSBuild-budget/EditorConfig precedence verified.")
