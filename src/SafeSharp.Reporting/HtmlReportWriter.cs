@@ -185,9 +185,11 @@ public sealed class HtmlReportWriter : IAnalysisReportWriter
     {
         if (!state.IsReachable)
             writer.Write("<p class=\"notice\">This state is infeasible under the modeled path constraints. Retained facts below are abstract debugging data.</p>");
-        TableStart(writer, "Resources", "Resource", "Ownership", "Status", "Owner scopes");
+        TableStart(writer, "Resources", "Resource", "Kind / ownership", "Status", "Owner scopes / completion provenance");
         foreach (var resource in state.Resources.OrderBy(resource => resource.Id, StringComparer.Ordinal))
-            Row(writer, resource.Id, resource.Ownership.ToString(), resource.Status.ToString(), string.Join(", ", resource.OwnerResourceIds.OrderBy(id => id, StringComparer.Ordinal)));
+            Row(writer, resource.Id, resource.Kind + " / " + resource.Ownership, resource.Status.ToString(),
+                string.Join(", ", resource.OwnerResourceIds.OrderBy(id => id, StringComparer.Ordinal)) +
+                (resource.DisposedResourceIds.IsEmpty ? "" : "completion for: " + string.Join(", ", resource.DisposedResourceIds.OrderBy(id => id, StringComparer.Ordinal))));
         TableEnd(writer);
         TableStart(writer, "Places and aliases", "Place", "Resource", "Availability", "Loan / projection");
         foreach (var place in state.Places.OrderBy(place => place.Place, StringComparer.Ordinal))

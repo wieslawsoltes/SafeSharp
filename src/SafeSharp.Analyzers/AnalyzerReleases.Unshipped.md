@@ -20,6 +20,7 @@ SS0013 | Ownership | Warning | Read during exclusive borrow
 SS0014 | Ownership | Warning | Disposal during borrow
 SS0015 | Ownership | Warning | Ownership analysis budget exceeded
 SS0016 | Ownership | Warning | NoSuspend contract
+SS0017 | Ownership | Warning | Asynchronous disposal completion is not observed
 SS0020 | SafeSharp.Ownership | Warning | Aggregate ownership requires a disposal contract
 SS0021 | SafeSharp.Ownership | Warning | Owned member has no release reachable from disposal
 SS0022 | SafeSharp.Ownership | Warning | Ownership-bearing structs remain copyable

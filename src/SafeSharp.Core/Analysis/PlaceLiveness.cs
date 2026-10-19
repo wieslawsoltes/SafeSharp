@@ -70,6 +70,7 @@ internal sealed class PlaceLiveness
             live.RemoveWhere(place => PlaceRelations.IsStrictDescendant(place, instruction.Target));
         }
         if (instruction.Source is not null && instruction.Kind != InstructionKind.Nop) live.Add(instruction.Source);
+        if (instruction.Kind == InstructionKind.MergeAlias && instruction.Target is not null) live.Add(instruction.Target);
         if (instruction.Owner is not null) live.Add(instruction.Owner);
     }
 }

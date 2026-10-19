@@ -38,7 +38,8 @@ public sealed class OwnershipAnalysisEngine
         foreach (var block in blocks.Values)
         foreach (var successor in block.Successors) predecessors[successor].Add(block.Id);
 
-        var resourceCount = blocks.Values.Sum(block => block.Instructions.Count(instruction => instruction.Kind == InstructionKind.Allocate));
+        var resourceCount = blocks.Values.Sum(block => block.Instructions.Count(instruction =>
+            instruction.Kind is InstructionKind.Allocate or InstructionKind.BeginAsyncDispose));
         if (resourceCount > options.MaxTrackedResources) return BudgetResult(graph, "tracked-resource", 0);
         var liveness = PlaceLiveness.Compute(blocks, predecessors, options.MaxIterations, cancellationToken);
         if (liveness.BudgetExceeded) return BudgetResult(graph, "backward liveness", 0);
@@ -108,12 +109,19 @@ public sealed class OwnershipAnalysisEngine
             foreach (var resource in exitState.Resources.Values.OrderBy(resource => resource.Id, StringComparer.Ordinal))
             {
                 if (resource.Ownership != ResourceOwnership.Owned || (resource.Flags & InstructionFlags.SuppressLeak) != 0
-                    || (resource.Status & ResourceStatus.Alive) == 0) continue;
-                var certainty = resource.Status == ResourceStatus.Alive ? IssueCertainty.Definite : IssueCertainty.Possible;
-                collector.Add("SS0003", certainty == IssueCertainty.Definite
-                    ? "Owned resource is not disposed or transferred before the method exits."
-                    : "Owned resource may reach a method exit without disposal or ownership transfer.", resource.Origin, certainty,
-                    resource.Id, OwnershipTransfer.Evidence(resource).Concat(new[] { new AnalysisEvidence("exit", "A reachable exit retains ownership.", graph.Site) }));
+                    || !resource.HasOutstandingObligation) continue;
+                var certainty = resource.Status == resource.OutstandingStatus ? IssueCertainty.Definite : IssueCertainty.Possible;
+                var completion = resource.Kind == ResourceKind.AsyncDisposalCompletion;
+                var message = completion
+                    ? certainty == IssueCertainty.Definite
+                        ? "Asynchronous disposal completion is not observed or transferred before the method exits."
+                        : "Asynchronous disposal completion may reach a method exit without being observed or transferred."
+                    : certainty == IssueCertainty.Definite
+                        ? "Owned resource is not disposed or transferred before the method exits."
+                        : "Owned resource may reach a method exit without disposal or ownership transfer.";
+                collector.Add(completion ? "SS0017" : "SS0003", message, resource.Origin, certainty,
+                    resource.Id, OwnershipTransfer.Evidence(resource).Concat(new[] { new AnalysisEvidence("exit", completion
+                        ? "A reachable exit retains a pending disposal completion." : "A reachable exit retains ownership.", graph.Site) }));
             }
         }
         return new AnalysisResult(graph, collector.ToImmutable(), snapshots.ToImmutable(), iterations, false);
@@ -142,16 +150,20 @@ internal sealed class IssueCollector
     {
         var ids = instruction.Kind switch
         {
-            InstructionKind.Alias => new[] { "SS0004", "SS0011" },
-            InstructionKind.Move => new[] { "SS0001", "SS0004", "SS0005", "SS0008", "SS0011", "SS0012" },
-            InstructionKind.BorrowShared or InstructionKind.BorrowExclusive or InstructionKind.ReserveExclusiveBorrow => new[] { "SS0001", "SS0004", "SS0006", "SS0011", "SS0012" },
+            InstructionKind.Allocate => new[] { "SS0011", "SS0017" },
+            InstructionKind.Alias or InstructionKind.MergeAlias => new[] { "SS0004", "SS0011", "SS0017" },
+            InstructionKind.Move => new[] { "SS0001", "SS0004", "SS0005", "SS0008", "SS0011", "SS0012", "SS0017" },
+            InstructionKind.BorrowShared or InstructionKind.BorrowExclusive or InstructionKind.ReserveExclusiveBorrow => new[] { "SS0001", "SS0004", "SS0006", "SS0011", "SS0012", "SS0017" },
             InstructionKind.ActivateBorrow => new[] { "SS0001", "SS0004", "SS0006", "SS0012" },
             InstructionKind.Read => new[] { "SS0001", "SS0004", "SS0012", "SS0013" },
             InstructionKind.Write => new[] { "SS0001", "SS0004", "SS0007", "SS0012" },
             InstructionKind.Dispose => new[] { "SS0002", "SS0004", "SS0009", "SS0012", "SS0014" },
+            InstructionKind.BeginAsyncDispose when (instruction.Flags & InstructionFlags.DisposalAlreadyInvoked) != 0 => new[] { "SS0011", "SS0017" },
+            InstructionKind.BeginAsyncDispose => new[] { "SS0002", "SS0004", "SS0009", "SS0011", "SS0012", "SS0014", "SS0017" },
+            InstructionKind.CompleteAsyncDispose => new[] { "SS0004" },
             InstructionKind.Escape or InstructionKind.Return => new[] { "SS0001", "SS0004", "SS0005", "SS0008", "SS0012" },
             InstructionKind.Suspend => new[] { "SS0010", "SS0016" },
-            InstructionKind.Forget => new[] { "SS0011" },
+            InstructionKind.Forget => new[] { "SS0011", "SS0017" },
             _ => Array.Empty<string>()
         };
         currentChecks = new HashSet<string>(StringComparer.Ordinal);

@@ -180,10 +180,12 @@ public sealed class JsonReportWriter : IAnalysisReportWriter
         {
             json.StartObject();
             json.Property("id", resource.Id);
+            json.Property("kind", resource.Kind.ToString());
             json.Property("ownership", resource.Ownership.ToString());
             json.Property("status", resource.Status.ToString());
             json.Name("origin"); WriteSite(json, resource.Origin);
             json.Name("ownerResourceIds"); WriteStrings(json, resource.OwnerResourceIds);
+            json.Name("disposedResourceIds"); WriteStrings(json, resource.DisposedResourceIds);
             json.EndObject();
         }
         json.EndArray();

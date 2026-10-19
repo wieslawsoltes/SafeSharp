@@ -6,7 +6,11 @@ namespace SafeSharp.Core;
 [Flags]
 public enum ResourceStatus
 {
-    None = 0, Absent = 1, Alive = 2, Disposed = 4, Transferred = 8, Escaped = 16
+    None = 0, Absent = 1, Alive = 2, Disposed = 4, Transferred = 8, Escaped = 16,
+    /// <summary>The asynchronous disposal awaitable has not been observed or transferred.</summary>
+    Pending = 32,
+    /// <summary>The asynchronous disposal completion has been observed.</summary>
+    Completed = 64
 }
 
 [Flags]
@@ -52,13 +56,16 @@ public sealed class PlaceSnapshot
 public sealed class ResourceSnapshot
 {
     internal ResourceSnapshot(string id, ResourceOwnership ownership, ResourceStatus status,
-        SourceSite origin, ImmutableArray<string> ownerResourceIds)
+        SourceSite origin, ImmutableArray<string> ownerResourceIds, ResourceKind kind = ResourceKind.Resource,
+        ImmutableArray<string> disposedResourceIds = default)
     {
         Id = id;
         Ownership = ownership;
         Status = status;
         Origin = origin;
         OwnerResourceIds = ownerResourceIds;
+        Kind = kind;
+        DisposedResourceIds = disposedResourceIds.IsDefault ? ImmutableArray<string>.Empty : disposedResourceIds;
     }
 
     public string Id { get; }
@@ -66,6 +73,9 @@ public sealed class ResourceSnapshot
     public ResourceStatus Status { get; }
     public SourceSite Origin { get; }
     public ImmutableArray<string> OwnerResourceIds { get; }
+    public ResourceKind Kind { get; }
+    /// <summary>Resources whose cleanup produced this completion; these are provenance, not owning scopes.</summary>
+    public ImmutableArray<string> DisposedResourceIds { get; }
 }
 
 public sealed class LoanSnapshot

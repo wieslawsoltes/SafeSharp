@@ -152,7 +152,8 @@ internal sealed class AbstractState : IEquatable<AbstractState>
                 reference.ResourceId, reference.Availability, reference.LoanId, reference.Projection,
                 reference.MovedPaths.OrderBy(path => path, StringComparer.Ordinal).ToImmutableArray(), reference.MayBeAbsent, reference.CoversResource)).ToImmutableArray(), CanBeNull(pair.Key))).ToImmutableArray(),
         Resources.Values.OrderBy(resource => resource.Id, StringComparer.Ordinal).Select(resource => new ResourceSnapshot(
-            resource.Id, resource.Ownership, resource.Status, resource.Origin, resource.OwnerIds.OrderBy(id => id, StringComparer.Ordinal).ToImmutableArray())).ToImmutableArray(),
+            resource.Id, resource.Ownership, resource.Status, resource.Origin, resource.OwnerIds.OrderBy(id => id, StringComparer.Ordinal).ToImmutableArray(),
+            resource.Kind, resource.DisposedResourceIds.OrderBy(id => id, StringComparer.Ordinal).ToImmutableArray())).ToImmutableArray(),
         Loans.Values.OrderBy(loan => loan.Id, StringComparer.Ordinal).Select(loan => new LoanSnapshot(loan.Id, loan.ResourceId,
             loan.Holder, loan.Kind, loan.Origin, loan.ParentIds.OrderBy(id => id, StringComparer.Ordinal).FirstOrDefault(), loan.Projection,
             loan.AllowsSuspension, loan.MayBeAbsent, loan.Phase, loan.ActivationEvidence.Values.Select(evidence => evidence.Site)
@@ -259,7 +260,8 @@ internal sealed class ReferenceFact : IEquatable<ReferenceFact>
 internal sealed class ResourceFact : IEquatable<ResourceFact>
 {
     internal ResourceFact(string id, ResourceOwnership ownership, ResourceStatus status, SourceSite origin,
-        InstructionFlags flags, ImmutableHashSet<string> ownerIds, ImmutableDictionary<string, AnalysisEvidence>? evidence = null)
+        InstructionFlags flags, ImmutableHashSet<string> ownerIds, ImmutableDictionary<string, AnalysisEvidence>? evidence = null,
+        ResourceKind kind = ResourceKind.Resource, ImmutableHashSet<string>? disposedResourceIds = null)
     {
         Id = id;
         Ownership = ownership;
@@ -268,6 +270,8 @@ internal sealed class ResourceFact : IEquatable<ResourceFact>
         Flags = flags;
         OwnerIds = ownerIds;
         Evidence = evidence ?? ImmutableDictionary.Create<string, AnalysisEvidence>(StringComparer.Ordinal);
+        Kind = kind;
+        DisposedResourceIds = disposedResourceIds ?? ImmutableHashSet.Create<string>(StringComparer.Ordinal);
     }
 
     internal string Id { get; }
@@ -277,16 +281,21 @@ internal sealed class ResourceFact : IEquatable<ResourceFact>
     internal InstructionFlags Flags { get; }
     internal ImmutableHashSet<string> OwnerIds { get; }
     internal ImmutableDictionary<string, AnalysisEvidence> Evidence { get; }
-    internal ResourceFact WithStatus(ResourceStatus status) => new(Id, Ownership, status, Origin, Flags, OwnerIds, Evidence);
+    internal ResourceKind Kind { get; }
+    internal ImmutableHashSet<string> DisposedResourceIds { get; }
+    internal ResourceStatus OutstandingStatus => Kind == ResourceKind.AsyncDisposalCompletion ? ResourceStatus.Pending : ResourceStatus.Alive;
+    internal bool HasOutstandingObligation => (Status & OutstandingStatus) != 0;
+    internal ResourceFact WithStatus(ResourceStatus status) => new(Id, Ownership, status, Origin, Flags, OwnerIds, Evidence, Kind, DisposedResourceIds);
     internal ResourceFact Transition(ResourceStatus status, string kind, string message, SourceSite site)
     {
         var evidence = new AnalysisEvidence(kind, message, site);
-        return new ResourceFact(Id, Ownership, status, Origin, Flags, OwnerIds, Evidence.SetItem(EvidenceFacts.Key(evidence), evidence));
+        return new ResourceFact(Id, Ownership, status, Origin, Flags, OwnerIds, Evidence.SetItem(EvidenceFacts.Key(evidence), evidence), Kind, DisposedResourceIds);
     }
     internal ResourceFact Join(ResourceFact other) => new(Id, Ownership, Status | other.Status, Origin, Flags | other.Flags,
-        OwnerIds.Union(other.OwnerIds), Evidence.SetItems(other.Evidence));
+        OwnerIds.Union(other.OwnerIds), Evidence.SetItems(other.Evidence), Kind, DisposedResourceIds.Union(other.DisposedResourceIds));
     public bool Equals(ResourceFact? other) => other is not null && Id == other.Id && Ownership == other.Ownership && Status == other.Status
-        && Flags == other.Flags && OwnerIds.SetEquals(other.OwnerIds) && EvidenceFacts.Equal(Evidence, other.Evidence);
+        && Flags == other.Flags && Kind == other.Kind && OwnerIds.SetEquals(other.OwnerIds) && DisposedResourceIds.SetEquals(other.DisposedResourceIds)
+        && EvidenceFacts.Equal(Evidence, other.Evidence);
     public override bool Equals(object? obj) => obj is ResourceFact other && Equals(other);
     public override int GetHashCode() => StringComparer.Ordinal.GetHashCode(Id) ^ (int)Status;
 }

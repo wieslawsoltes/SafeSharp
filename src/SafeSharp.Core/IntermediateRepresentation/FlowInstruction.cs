@@ -10,10 +10,17 @@ public enum InstructionKind
     /// <summary>Creates an exclusive reservation which permits reads and shared loans until activation.</summary>
     ReserveExclusiveBorrow,
     /// <summary>Activates the reserved loan referenced by Source, including through aliases.</summary>
-    ActivateBorrow
+    ActivateBorrow,
+    /// <summary>Invokes disposal on Source and creates an owned completion obligation in Target.</summary>
+    BeginAsyncDispose,
+    /// <summary>Observes the asynchronous disposal completion referenced by Source.</summary>
+    CompleteAsyncDispose,
+    /// <summary>Joins the current Target value with Source as alternative alias origins.</summary>
+    MergeAlias
 }
 
 public enum ResourceOwnership { Owned, Borrowed, External, Scoped }
+public enum ResourceKind { Resource, AsyncDisposalCompletion }
 public enum BorrowKind { Shared, Exclusive }
 
 /// <summary>Possible phases of a loan. A joined state can retain both reserved and active alternatives.</summary>
@@ -34,7 +41,9 @@ public enum InstructionFlags
     /// <summary>A frontend exception boundary. The ownership engine treats it as metadata; a CFG frontend expands its handlers.</summary>
     MayThrow = 128,
     /// <summary>The allocation result or input can be null; an absent resource alternative is retained.</summary>
-    MayBeNull = 256
+    MayBeNull = 256,
+    /// <summary>BeginAsyncDispose creates only the completion because the frontend already emitted the disposal invocation before an exception boundary.</summary>
+    DisposalAlreadyInvoked = 512
 }
 
 /// <summary>
@@ -59,12 +68,15 @@ public sealed class FlowInstruction
         Description = description;
         if ((kind == InstructionKind.Allocate || kind == InstructionKind.Alias ||
             kind == InstructionKind.BorrowShared || kind == InstructionKind.BorrowExclusive ||
-            kind == InstructionKind.ReserveExclusiveBorrow) && string.IsNullOrEmpty(target))
+            kind == InstructionKind.ReserveExclusiveBorrow || kind == InstructionKind.BeginAsyncDispose ||
+            kind == InstructionKind.MergeAlias) && string.IsNullOrEmpty(target))
             throw new ArgumentException("This instruction requires a target place.", nameof(target));
         if ((kind == InstructionKind.Alias || kind == InstructionKind.Move || kind == InstructionKind.BorrowShared ||
             kind == InstructionKind.BorrowExclusive || kind == InstructionKind.Read || kind == InstructionKind.Write ||
             kind == InstructionKind.Dispose || kind == InstructionKind.Escape ||
-            kind == InstructionKind.ReserveExclusiveBorrow || kind == InstructionKind.ActivateBorrow) && string.IsNullOrEmpty(source))
+            kind == InstructionKind.ReserveExclusiveBorrow || kind == InstructionKind.ActivateBorrow ||
+            kind == InstructionKind.BeginAsyncDispose || kind == InstructionKind.CompleteAsyncDispose ||
+            kind == InstructionKind.MergeAlias) && string.IsNullOrEmpty(source))
             throw new ArgumentException("This instruction requires a source place.", nameof(source));
     }
 

@@ -26,14 +26,24 @@ internal sealed class OwnershipTransfer
                 break;
             case InstructionKind.Alias:
                 CheckMoved(state, instruction, references, issues);
-                CheckOverwrite(state, instruction, instruction.Target!, references, issues);
+                CheckOverwrite(state, instruction, instruction.Target!, references, issues, liveAfter);
                 state.Assign(instruction.Target!, references, sourceMayBeNull);
+                break;
+            case InstructionKind.MergeAlias:
+                CheckMoved(state, instruction, references.Concat(state.Resolve(instruction.Target)).ToArray(), issues);
+                CheckOverwrite(state, instruction, instruction.Target!, references, issues, liveAfter);
+                var sourceChoice = state.Clone();
+                sourceChoice.Assign(instruction.Target!, references, sourceMayBeNull);
+                // Expire each alternative before joining: unselected temporary loans are only possibly live.
+                sourceChoice.ExpireLoans(liveAfter);
+                state.ExpireLoans(liveAfter);
+                state.JoinAlternative(sourceChoice);
                 break;
             case InstructionKind.Move:
                 CheckUse(state, instruction, references, issues);
                 CheckLoans(state, instruction, references, "SS0005", "Ownership cannot move while a loan remains live.", _ => true, false, issues);
                 CheckBorrowedEscape(state, instruction, references, issues);
-                if (instruction.Target is not null) CheckOverwrite(state, instruction, instruction.Target, references, issues);
+                if (instruction.Target is not null) CheckOverwrite(state, instruction, instruction.Target, references, issues, liveAfter);
                 foreach (var reference in references)
                 {
                     InvalidateAliases(state, reference, instruction.Site, !reference.CoversResource);
@@ -49,7 +59,7 @@ internal sealed class OwnershipTransfer
             case InstructionKind.BorrowShared:
             case InstructionKind.BorrowExclusive:
             case InstructionKind.ReserveExclusiveBorrow:
-                Borrow(state, instruction, references, blockId, instructionIndex, issues);
+                Borrow(state, instruction, references, blockId, instructionIndex, liveAfter, issues);
                 break;
             case InstructionKind.ActivateBorrow:
                 ActivateBorrow(state, instruction, references, issues);
@@ -64,15 +74,20 @@ internal sealed class OwnershipTransfer
                 CheckLoans(state, instruction, references, "SS0007", "Mutation conflicts with a live shared or exclusive loan.", _ => true, true, issues, allowOwnExclusive: true);
                 break;
             case InstructionKind.Dispose:
+                Dispose(state, instruction, references, issues);
+                break;
+            case InstructionKind.BeginAsyncDispose:
+                if ((instruction.Flags & InstructionFlags.DisposalAlreadyInvoked) == 0)
+                    Dispose(state, instruction, references, issues);
+                BeginAsyncDispose(state, instruction, references, blockId, instructionIndex, liveAfter, issues);
+                break;
+            case InstructionKind.CompleteAsyncDispose:
                 CheckMoved(state, instruction, references, issues);
-                CheckDisposed(state, instruction, references, "SS0002", "Resource is disposed more than once.", issues);
-                CheckScope(state, instruction, references, issues);
-                CheckBorrowedDisposal(state, instruction, references, issues);
-                CheckLoans(state, instruction, references, "SS0014", "The owner cannot be disposed while a loan remains live.", _ => true, false, issues);
                 foreach (var reference in references)
-                    if (reference.Projection.Length == 0 && state.Resources.TryGetValue(reference.ResourceId, out var resource))
-                        state.Resources[reference.ResourceId] = resource.Transition(TransferStatus(resource.Status, ResourceStatus.Disposed,
-                            !reference.CoversResource), "dispose", "Resource disposal occurs here.", instruction.Site);
+                    if (reference.Projection.Length == 0 && state.Resources.TryGetValue(reference.ResourceId, out var completion) &&
+                        completion.Kind == ResourceKind.AsyncDisposalCompletion)
+                        state.Resources[reference.ResourceId] = completion.Transition(TransferStatus(completion.Status, ResourceStatus.Completed,
+                            !reference.CoversResource), "completion", "Asynchronous disposal completion is observed here.", instruction.Site);
                 break;
             case InstructionKind.Escape:
             case InstructionKind.Return:
@@ -94,7 +109,7 @@ internal sealed class OwnershipTransfer
             case InstructionKind.Forget:
                 if (instruction.Target is not null)
                 {
-                    CheckOverwrite(state, instruction, instruction.Target, Array.Empty<ReferenceFact>(), issues);
+                    CheckOverwrite(state, instruction, instruction.Target, Array.Empty<ReferenceFact>(), issues, liveAfter);
                     state.Forget(instruction.Target);
                 }
                 break;
@@ -144,16 +159,58 @@ internal sealed class OwnershipTransfer
     private static void Allocate(AbstractState state, FlowInstruction instruction, int blockId, int index, ISet<string> liveAfter, IssueCollector? issues)
     {
         var id = instruction.ResourceId ?? "allocation:" + blockId + ":" + index;
-        CheckOverwrite(state, instruction, instruction.Target!, Array.Empty<ReferenceFact>(), issues);
         var owners = state.Resolve(instruction.Owner).Select(reference => reference.ResourceId).ToImmutableHashSet(StringComparer.Ordinal);
         var mayBeNull = (instruction.Flags & InstructionFlags.MayBeNull) != 0;
         var resource = new ResourceFact(id, instruction.Ownership, ResourceStatus.Alive | (mayBeNull ? ResourceStatus.Absent : ResourceStatus.None), instruction.Site, instruction.Flags, owners);
+        TrackAllocation(state, instruction, resource, mayBeNull, liveAfter, issues);
+    }
+
+    private static void BeginAsyncDispose(AbstractState state, FlowInstruction instruction, ReferenceFact[] references,
+        int blockId, int index, ISet<string> liveAfter, IssueCollector? issues)
+    {
+        var id = instruction.ResourceId ?? "completion:" + blockId + ":" + index;
+        var evidence = ImmutableDictionary.CreateBuilder<string, AnalysisEvidence>(StringComparer.Ordinal);
+        foreach (var fact in FactsFor(state, references)) evidence[EvidenceFacts.Key(fact)] = fact;
+        var start = new AnalysisEvidence("async-disposal", "Cleanup was invoked; its completion still needs to be observed or transferred.", instruction.Site);
+        evidence[EvidenceFacts.Key(start)] = start;
+        var completion = new ResourceFact(id, ResourceOwnership.Owned, ResourceStatus.Pending, instruction.Site, InstructionFlags.None,
+            ImmutableHashSet.Create<string>(StringComparer.Ordinal), evidence.ToImmutable(), ResourceKind.AsyncDisposalCompletion,
+            references.Select(reference => reference.ResourceId).ToImmutableHashSet(StringComparer.Ordinal));
+        TrackAllocation(state, instruction, completion, false, liveAfter, issues);
+    }
+
+    private static void Dispose(AbstractState state, FlowInstruction instruction, ReferenceFact[] references, IssueCollector? issues)
+    {
+        CheckMoved(state, instruction, references, issues);
+        CheckDisposed(state, instruction, references, "SS0002", "Resource is disposed more than once.", issues);
+        CheckScope(state, instruction, references, issues);
+        CheckBorrowedDisposal(state, instruction, references, issues);
+        CheckLoans(state, instruction, references, "SS0014", "The owner cannot be disposed while a loan remains live.", _ => true, false, issues);
+        foreach (var reference in references)
+            if (reference.Projection.Length == 0 && state.Resources.TryGetValue(reference.ResourceId, out var resource) &&
+                resource.Kind == ResourceKind.Resource)
+                state.Resources[reference.ResourceId] = resource.Transition(TransferStatus(resource.Status, ResourceStatus.Disposed,
+                    !reference.CoversResource), "dispose", "Resource disposal occurs here.", instruction.Site);
+        // Disposing an awaitable object is not equivalent to awaiting its asynchronous cleanup operation.
+    }
+
+    private static void TrackAllocation(AbstractState state, FlowInstruction instruction, ResourceFact resource, bool mayBeNull,
+        ISet<string> liveAfter, IssueCollector? issues)
+    {
+        var id = resource.Id;
+        CheckOverwrite(state, instruction, instruction.Target!, Array.Empty<ReferenceFact>(), issues, liveAfter);
         // Allocation-site abstraction must not reactivate a disposed instance still reachable through an older alias.
         // Strong updates are safe only when this place is the only local representative of the site.
         if (state.Resources.TryGetValue(id, out var previous))
         {
+            if (previous.Kind != resource.Kind) throw new ArgumentException("A resource identity cannot change its resource kind.", nameof(instruction));
             var retained = liveAfter.Where(place => place != instruction.Target && !PlaceRelations.IsStrictDescendant(place, instruction.Target!))
                 .SelectMany(state.Resolve).Any(reference => reference.ResourceId == id && (reference.Availability & ReferenceAvailability.Available) != 0);
+            if (previous.Kind == ResourceKind.AsyncDisposalCompletion && previous.HasOutstandingObligation)
+                issues?.Add("SS0017", retained
+                    ? "A completion from an earlier execution of this disposal site may still be pending."
+                    : "A repeated asynchronous disposal abandons an unobserved completion from an earlier iteration.", instruction.Site,
+                    Certainty(!retained && previous.Status == ResourceStatus.Pending, instruction), previous.Id, Evidence(previous));
             if (retained) resource = resource.Join(previous);
             else if (issues is not null && previous.Ownership == ResourceOwnership.Owned && (previous.Status & ResourceStatus.Alive) != 0
                 && (previous.Flags & InstructionFlags.SuppressLeak) == 0)
@@ -165,7 +222,7 @@ internal sealed class OwnershipTransfer
     }
 
     private static void Borrow(AbstractState state, FlowInstruction instruction, ReferenceFact[] references,
-        int blockId, int index, IssueCollector? issues)
+        int blockId, int index, ISet<string> liveAfter, IssueCollector? issues)
     {
         CheckUse(state, instruction, references, issues);
         var kind = instruction.Kind == InstructionKind.BorrowShared ? BorrowKind.Shared : BorrowKind.Exclusive;
@@ -188,7 +245,7 @@ internal sealed class OwnershipTransfer
                         (state.Loans[reference.LoanId!].Kind == BorrowKind.Shared || state.Loans[reference.LoanId!].Phase == BorrowPhase.Reserved)), instruction),
                     sharedParents[0].ResourceId, FactsFor(state, sharedParents));
         }
-        CheckOverwrite(state, instruction, instruction.Target!, references, issues);
+        CheckOverwrite(state, instruction, instruction.Target!, references, issues, liveAfter);
         var borrowed = new List<ReferenceFact>();
         foreach (var reference in references)
         {
@@ -329,21 +386,28 @@ internal sealed class OwnershipTransfer
     }
 
     private static void CheckOverwrite(AbstractState state, FlowInstruction instruction, string target,
-        IReadOnlyCollection<ReferenceFact> incoming, IssueCollector? issues)
+        IReadOnlyCollection<ReferenceFact> incoming, IssueCollector? issues, ISet<string>? liveAfter = null)
     {
         if (issues is null) return;
         var old = state.Resolve(target);
         foreach (var reference in old)
         {
-            if (reference.LoanId is not null || reference.DefinitelyMoved || incoming.Any(value => value.ResourceId == reference.ResourceId)
+            if (reference.LoanId is not null || reference.DefinitelyMoved
                 || !state.Resources.TryGetValue(reference.ResourceId, out var resource) || resource.Ownership != ResourceOwnership.Owned
-                || (resource.Flags & InstructionFlags.SuppressLeak) != 0 || (resource.Status & ResourceStatus.Alive) == 0) continue;
-            var retained = state.Places.Where(pair => pair.Key != target && !PlaceRelations.IsStrictDescendant(pair.Key, target))
-                .SelectMany(pair => pair.Value.Values).Where(value => value.ResourceId == resource.Id && value.LoanId is null && !value.DefinitelyMoved
+                || (resource.Flags & InstructionFlags.SuppressLeak) != 0 || !resource.HasOutstandingObligation) continue;
+            var completion = resource.Kind == ResourceKind.AsyncDisposalCompletion;
+            var carried = incoming.Where(value => value.ResourceId == resource.Id).ToArray();
+            if (carried.Any(value => !completion || value.CoversResource && !value.MayBeMoved && value.Projection.Length == 0)) continue;
+            var otherReferences = completion && liveAfter is not null
+                ? liveAfter.Where(place => place != target && !PlaceRelations.IsStrictDescendant(place, target)).SelectMany(state.Resolve)
+                : state.Places.Where(pair => pair.Key != target && !PlaceRelations.IsStrictDescendant(pair.Key, target)).SelectMany(pair => pair.Value.Values);
+            var retained = otherReferences.Where(value => value.ResourceId == resource.Id && value.LoanId is null && !value.DefinitelyMoved
                     && (value.Availability & ReferenceAvailability.Available) != 0).ToArray();
             if (retained.Any(value => value.CoversResource && !value.MayBeMoved && value.Projection.Length == 0)) continue;
-            issues.Add("SS0011", "Overwriting this place loses the last known owner of an undisposed resource.", instruction.Site,
-                Certainty(resource.Status == ResourceStatus.Alive && !reference.MayBeAbsent && old.Count == 1 && retained.Length == 0, instruction),
+            issues.Add(completion ? "SS0017" : "SS0011", completion
+                    ? "Overwriting this place loses an asynchronous disposal completion before it is observed or transferred."
+                    : "Overwriting this place loses the last known owner of an undisposed resource.", instruction.Site,
+                Certainty(resource.Status == resource.OutstandingStatus && !reference.MayBeAbsent && old.Count == 1 && retained.Length == 0 && carried.Length == 0, instruction),
                 resource.Id, Evidence(resource).Concat(reference.Evidence.Values));
         }
     }
@@ -410,11 +474,13 @@ internal sealed class OwnershipTransfer
     }
 
     private static IssueCertainty Certainty(bool definite, FlowInstruction instruction) => definite && (instruction.Flags & InstructionFlags.Conditional) == 0
+        && instruction.Kind != InstructionKind.MergeAlias
         ? IssueCertainty.Definite : IssueCertainty.Possible;
 
     internal static IEnumerable<AnalysisEvidence> Evidence(ResourceFact resource)
     {
-        yield return new AnalysisEvidence("origin", resource.Ownership + " resource originates here.", resource.Origin);
+        yield return new AnalysisEvidence("origin", resource.Kind == ResourceKind.AsyncDisposalCompletion
+            ? "The asynchronous disposal completion originates here." : resource.Ownership + " resource originates here.", resource.Origin);
         foreach (var item in resource.Evidence.Values) yield return item;
     }
 
