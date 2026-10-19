@@ -30,12 +30,26 @@ internal static class SymbolFacts
         {
             if (method.AssociatedSymbol is { } associated) yield return associated;
             for (var overridden = method.OverriddenMethod; overridden is not null; overridden = overridden.OverriddenMethod)
+            {
                 yield return overridden;
+                if (overridden.AssociatedSymbol is { } overriddenMember) yield return overriddenMember;
+            }
             foreach (var @interface in method.ContainingType.AllInterfaces)
-            foreach (var member in @interface.GetMembers().OfType<IMethodSymbol>())
-                if (method.ContainingType.FindImplementationForInterfaceMember(member) is IMethodSymbol implementation &&
-                    SymbolEqualityComparer.Default.Equals(implementation.OriginalDefinition, method.OriginalDefinition))
-                    yield return member;
+            {
+                foreach (var member in @interface.GetMembers().OfType<IMethodSymbol>())
+                    if (method.ContainingType.FindImplementationForInterfaceMember(member) is IMethodSymbol implementation &&
+                        OverridesOrEquals(method, implementation))
+                    {
+                        yield return member;
+                        if (member.AssociatedSymbol is { } interfaceMember) yield return interfaceMember;
+                    }
+                // Property contracts belong to the property, even when the call is lowered to its getter.
+                if (method.AssociatedSymbol is IPropertySymbol property)
+                    foreach (var member in @interface.GetMembers().OfType<IPropertySymbol>())
+                        if (method.ContainingType.FindImplementationForInterfaceMember(member) is IPropertySymbol implementation &&
+                            OverridesOrEquals(property, implementation))
+                            yield return member;
+            }
         }
         else if (symbol is INamedTypeSymbol type)
         {
@@ -47,7 +61,8 @@ internal static class SymbolFacts
         type?.ToDisplayString() == name || type?.AllInterfaces.Any(i => i.ToDisplayString() == name) == true ||
         (type is ITypeParameterSymbol parameter && parameter.ConstraintTypes.Any(t => Implements(t, name)));
 
-    public static bool IsDisposable(ITypeSymbol? type) => Implements(type, "System.IDisposable") || Implements(type, "System.IAsyncDisposable");
+    public static bool IsDisposable(ITypeSymbol? type) => Implements(type, "System.IDisposable") || Implements(type, "System.IAsyncDisposable") ||
+        type is INamedTypeSymbol { IsRefLikeType: true } named && named.GetMembers().OfType<IMethodSymbol>().Any(method => IsDispose(method) || IsDisposeAsync(method));
 
     public static bool IsTracked(ITypeSymbol? type) => IsDisposable(type) || HasAttribute(type, "Owned") || HasAttribute(type, "NoSuspend") || IsMemoryView(type);
 
@@ -69,13 +84,58 @@ internal static class SymbolFacts
         }
     }
 
-    public static bool IsDispose(IMethodSymbol method) => method.Parameters.Length == 0 &&
-        (method.Name == "Dispose" || method.ExplicitInterfaceImplementations.Any(m => m.Name == "Dispose")) &&
-        (Implements(method.ContainingType, "System.IDisposable") || method.ContainingType.IsRefLikeType);
+    public static bool IsDispose(IMethodSymbol method) => IsParameterlessInstanceMethod(method) && method.ReturnsVoid &&
+        (IsInterfaceDisposalMethod(method, "System.IDisposable", "Dispose") ||
+         method.ContainingType.IsRefLikeType && method.Name == "Dispose");
 
-    public static bool IsDisposeAsync(IMethodSymbol method) => method.Parameters.Length == 0 &&
-        (method.Name == "DisposeAsync" || method.ExplicitInterfaceImplementations.Any(m => m.Name == "DisposeAsync")) &&
-        (Implements(method.ContainingType, "System.IAsyncDisposable") || method.ContainingType.IsRefLikeType);
+    public static bool IsDisposeAsync(IMethodSymbol method) => IsParameterlessInstanceMethod(method) && !method.ReturnsVoid &&
+        (IsInterfaceDisposalMethod(method, "System.IAsyncDisposable", "DisposeAsync") ||
+         method.ContainingType.IsRefLikeType && method.Name == "DisposeAsync" && HasAwaitablePattern(method.ReturnType));
+
+    private static bool IsParameterlessInstanceMethod(IMethodSymbol method) =>
+        !method.IsStatic && !method.IsGenericMethod && method.Parameters.Length == 0 && !method.ReturnsByRef && !method.ReturnsByRefReadonly &&
+        method.MethodKind is MethodKind.Ordinary or MethodKind.ExplicitInterfaceImplementation;
+
+    private static bool IsInterfaceDisposalMethod(IMethodSymbol method, string interfaceName, string memberName)
+    {
+        if (method.ContainingType.TypeKind == TypeKind.Interface && method.ContainingType.ToDisplayString() == interfaceName)
+            return method.Name == memberName;
+        foreach (var @interface in method.ContainingType.AllInterfaces.Where(type => type.ToDisplayString() == interfaceName))
+        foreach (var member in @interface.GetMembers(memberName).OfType<IMethodSymbol>())
+            if (method.ContainingType.FindImplementationForInterfaceMember(member) is IMethodSymbol implementation &&
+                OverridesOrEquals(method, implementation)) return true;
+        return false;
+    }
+
+    private static bool OverridesOrEquals(IMethodSymbol method, IMethodSymbol implementation)
+    {
+        // A same-name method can hide the interface implementation; only the actual virtual slot releases it.
+        for (IMethodSymbol? candidate = method; candidate is not null; candidate = candidate.OverriddenMethod)
+            if (SymbolEqualityComparer.Default.Equals(candidate.OriginalDefinition, implementation.OriginalDefinition)) return true;
+        return false;
+    }
+
+    private static bool OverridesOrEquals(IPropertySymbol property, IPropertySymbol implementation)
+    {
+        for (IPropertySymbol? candidate = property; candidate is not null; candidate = candidate.OverriddenProperty)
+            if (SymbolEqualityComparer.Default.Equals(candidate.OriginalDefinition, implementation.OriginalDefinition)) return true;
+        return false;
+    }
+
+    private static bool HasAwaitablePattern(ITypeSymbol type)
+    {
+        if (type is not INamedTypeSymbol named) return false;
+        for (INamedTypeSymbol? current = named; current is not null; current = current.BaseType)
+        foreach (var getAwaiter in current.GetMembers("GetAwaiter").OfType<IMethodSymbol>())
+        {
+            if (!IsParameterlessInstanceMethod(getAwaiter) || getAwaiter.ReturnType is not INamedTypeSymbol awaiter ||
+                !Implements(awaiter, "System.Runtime.CompilerServices.INotifyCompletion")) continue;
+            if (awaiter.GetMembers("IsCompleted").OfType<IPropertySymbol>().Any(property => !property.IsStatic &&
+                    property.Parameters.Length == 0 && property.GetMethod is not null && property.Type.SpecialType == SpecialType.System_Boolean) &&
+                awaiter.GetMembers("GetResult").OfType<IMethodSymbol>().Any(IsParameterlessInstanceMethod)) return true;
+        }
+        return false;
+    }
 
     public static bool IsServiceResolution(IMethodSymbol method) =>
         (method.Name is "GetService" or "GetRequiredService" or "GetKeyedService" or "GetRequiredKeyedService") &&

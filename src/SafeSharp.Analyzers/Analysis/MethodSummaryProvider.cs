@@ -47,6 +47,9 @@ internal sealed class MethodSummaryProvider
                 MethodDeclarationSyntax m => m.ExpressionBody?.Expression,
                 LocalFunctionStatementSyntax l => l.ExpressionBody?.Expression,
                 AccessorDeclarationSyntax a => a.ExpressionBody?.Expression,
+                PropertyDeclarationSyntax p => p.ExpressionBody?.Expression,
+                IndexerDeclarationSyntax i => i.ExpressionBody?.Expression,
+                ArrowExpressionClauseSyntax a => a.Expression,
                 _ => null
             };
             if (expressionBody is not null) expressions.Add(expressionBody);

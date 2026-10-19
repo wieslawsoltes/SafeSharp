@@ -91,13 +91,22 @@ public sealed class BoundarySafetyAnalyzer : DiagnosticAnalyzer
     private static bool IsDiscarded(IInvocationOperation invocation)
     {
         IOperation current = invocation;
-        while (current.Parent is IConversionOperation or IParenthesizedOperation) current = current.Parent;
-        if (current.Parent is IExpressionStatementOperation) return true;
-        if (current.Parent is ISimpleAssignmentOperation { Target: IDiscardOperation }) return true;
-        // ConfigureAwait does not observe completion on its own.
-        if (current.Parent is IInvocationOperation configure && configure.TargetMethod.Name == "ConfigureAwait")
-            return configure.Parent is IExpressionStatementOperation;
-        return false;
+        while (true)
+        {
+            if (current.Parent is IConversionOperation or IParenthesizedOperation)
+            {
+                current = current.Parent;
+                continue;
+            }
+            // Configuring an awaitable changes scheduling, without observing its completion.
+            if (current.Parent is IInvocationOperation configure && configure.TargetMethod.Name == "ConfigureAwait" &&
+                ReferenceEquals(configure.Instance, current))
+            {
+                current = configure;
+                continue;
+            }
+            return current.Parent is IExpressionStatementOperation or ISimpleAssignmentOperation { Target: IDiscardOperation };
+        }
     }
 
     private static void AnalyzeAcquisition(SyntaxNodeAnalysisContext context)
@@ -118,12 +127,13 @@ public sealed class BoundarySafetyAnalyzer : DiagnosticAnalyzer
         {
             context.CancellationToken.ThrowIfCancellationRequested();
             var statement = block.Statements[index];
-            if (statement is TryStatementSyntax guarded && guarded.Finally is { } cleanup &&
-                cleanup.Block.Statements.Any(s => DirectlyDisposes(s, local, context))) return;
-            if (DirectlyDisposes(statement, local, context))
+            var release = statement is TryStatementSyntax guarded && guarded.Finally is { } cleanup
+                ? cleanup.Block.Statements.FirstOrDefault(s => DirectlyDisposes(s, local, context))
+                : DirectlyDisposes(statement, local, context) ? statement : null;
+            if (release is not null)
             {
                 if (firstHazard is not null)
-                    context.ReportDiagnostic(Diagnostic.Create(ExceptionSafety, variable.GetLocation(), new[] { firstHazard.GetLocation(), statement.GetLocation() },
+                    context.ReportDiagnostic(Diagnostic.Create(ExceptionSafety, variable.GetLocation(), new[] { firstHazard.GetLocation(), release.GetLocation() },
                         properties: null, messageArgs: new object[] { local.Name }));
                 return;
             }

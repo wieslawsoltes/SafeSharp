@@ -73,6 +73,8 @@ internal sealed class OperationLowerer
     {
         foreach (var parameter in _method.Parameters)
         {
+            // An out parameter has no incoming value; writes target the caller's storage.
+            if (parameter.RefKind == RefKind.Out) continue;
             if (!SymbolFacts.IsTracked(parameter.Type) && !HasOwnershipContract(parameter) &&
                 !SymbolFacts.Implements(parameter.Type, "System.IServiceProvider")) continue;
             var ownership = SymbolFacts.HasAttribute(parameter, "Owned") || SymbolFacts.HasAttribute(parameter, "Consumes")
@@ -254,7 +256,8 @@ internal sealed class OperationLowerer
         else
         {
             Add(InstructionKind.Alias, assignment, target: target, source: source);
-            if (assignment.Target is IFieldReferenceOperation or IPropertyReferenceOperation or IArrayElementReferenceOperation)
+            if (assignment.Target is IFieldReferenceOperation or IPropertyReferenceOperation or IArrayElementReferenceOperation ||
+                assignment.Target is IParameterReferenceOperation { Parameter.RefKind: RefKind.Out or RefKind.Ref })
                 Add(InstructionKind.Escape, assignment, source: source, flags: InstructionFlags.Transfer, description: "store into a longer-lived object");
             ForgetTemporary(source, assignment);
         }

@@ -23,6 +23,7 @@ Analyzer/CodeFixes target .NET Standard 2.0 and Roslyn 4.14 APIs. Use a compiler
 dotnet restore SafeSharp.sln
 dotnet build SafeSharp.sln -c Release --no-restore
 dotnet test tests/SafeSharp.Tests/SafeSharp.Tests.csproj -c Release --no-build
+python tests/cli/verify.py --tool src/SafeSharp.Tool/bin/Release/net10.0/SafeSharp.Tool.dll
 dotnet pack SafeSharp.sln -c Release --no-build -o artifacts/packages
 python eng/verify-packages.py artifacts/packages
 python eng/smoke-consumer.py artifacts/packages --version 0.1.0-preview.1
@@ -51,6 +52,15 @@ safesharp_check_suspension = true
 ```
 
 Budgets are per method. Invalid settings fall back to defaults, and excessively large budgets are clamped. `safesharp_report_possible_issues = false` hides path-ambiguous findings; it does not strengthen the analysis guarantee. Use ordinary `#pragma warning`, `SuppressMessage`, or EditorConfig suppressions only after assessing the related acquisition and effect evidence. Generated source is skipped, and analysis honors cancellation. The analyzer never writes graph files during an IDE/build compilation.
+
+The analyzer package exposes `SafeSharpMaxIterations` and `SafeSharpMaxTrackedResources` as compiler-visible MSBuild properties. Set them in a project or `Directory.Build.props` for shared defaults; file-specific EditorConfig budget values take precedence. For example:
+
+```xml
+<PropertyGroup>
+  <SafeSharpMaxIterations>10000</SafeSharpMaxIterations>
+  <SafeSharpMaxTrackedResources>2048</SafeSharpMaxTrackedResources>
+</PropertyGroup>
+```
 
 The CLI uses the workspace's analyzer configuration and distinguishes configured diagnostics from raw engine evidence. An exhausted core or service-analysis budget makes a CLI report incomplete and returns exit code 2 even when ordinary warnings are suppressed. See [reporting](reporting.md) for formats and command options.
 

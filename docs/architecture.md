@@ -51,6 +51,10 @@ The caller's disposal obligation is discharged when the recognized cleanup opera
 
 Boundary summaries recognize explicit consuming, borrowing, mutation and return contracts. Source inference is deliberately restricted to direct unambiguous returned allocations, returned parameters, and simple direct disposal effects. It is not a whole-program virtual-dispatch or recursive effect proof. Known BCL factories, pools, memory-owner views and dependency-injection resolution methods supply additional summaries.
 
+An implementation that omits parameter annotations inherits the interface or overridden declaration's contracts. Parameter relationships are mapped by ordinal, so renaming a parameter does not disconnect an inherited returned borrow. Incompatible explicit parameter modes produce `SS0034`. Getter summaries consult associated base/interface property annotations. Expression-bodied properties and indexers participate in direct fresh-result inference and receive the same report graphs as ordinary methods.
+
+Cleanup recognition resolves the actual `IDisposable`/`IAsyncDisposable` interface implementation and its virtual overrides; a same-name unrelated method does not release a resource. Valid disposal patterns on ref structs are also recognized. Assignments through `ref`/`out` parameters store into caller-visible locations and transfer modeled ownership just as a longer-lived heap store does; `out` parameters have no incoming value. This transfer model does not infer arbitrary output ownership or retained aliases for unknown external calls, and explicit contracts remain necessary at those boundaries.
+
 The service analyzer builds a separate constructor-dependency graph from annotated lifetimes and supported registration syntax. It detects transitive singleton capture of scoped dependencies and retains the dependency path as metadata. Container-created values remain borrowed/container-owned. A local scope relationship allows the ownership engine to detect service use after scope disposal. Factories, custom containers, runtime registration mutation, keyed matching and reflection require the documented qualifications.
 
 ## Extension points

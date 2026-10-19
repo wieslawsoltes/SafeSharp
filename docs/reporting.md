@@ -62,6 +62,13 @@ Report output goes to stdout unless `--output` is supplied. Progress and errors 
 
 ## HTML ownership inspector
 
+The repository includes a [generated example ownership report](examples/ownership.html) from [`samples/UnsafeExamples.cs.txt`](../samples/UnsafeExamples.cs.txt). Download the HTML file and open it locally to inspect the actual diagnostics, CFGs, and captured states. It is a generated sample, and its source locations retain the absolute checkout path used during generation. Regenerate it in your own checkout with:
+
+```sh
+safesharp --source samples/UnsafeExamples.cs.txt --format html \
+  --output docs/examples/ownership.html --fail-on none
+```
+
 The HTML report includes:
 
 - Summary counts and an explicit incomplete-analysis status.
@@ -71,11 +78,12 @@ The HTML report includes:
 - An SVG graph of the actual lowered basic blocks and successor edges. Select a block to jump to its state inspector; scroll to pan and use the zoom controls to adjust scale.
 - Every captured instruction with the state before and after it, plus the engine's actual live-before/live-after place sets.
 - Resource identities, ownership obligations, possible lifecycle states, aliases, moved field projections, active loans, reborrow parents, and suspension permissions.
-- Diagnostic metadata, including the recorded dependency service, implementation, and lifetime paths for captive-service diagnostics.
+- Nullability, potentially absent references and loans, resource coverage of projections, and explicit infeasible-state markers for pruned branches.
+- Diagnostic metadata and diagrams of the recorded dependency service, implementation, and lifetime paths for captive-service diagnostics.
 
 The report has no network dependency, external JavaScript library, or graph-rendering service. SVG diagrams are rendered by the browser. The method filter and zoom controls use a fixed inline script; source text is never interpolated into JavaScript. Source names, diagnostic text, graph labels, and metadata cross explicit HTML/XML escaping boundaries. With JavaScript disabled, all methods and the native `<details>` inspectors remain available.
 
-A graph node shows a short preview for readability. Complete instructions remain in the tables and JSON. A block with no captured snapshot is explicitly marked: it can be unreachable, or the caller may have disabled snapshot capture. An empty captured state and an absent snapshot are different facts.
+A graph node shows a short preview for readability. Complete instructions remain in the tables and JSON. A block with no captured snapshot is explicitly marked: it can be unreachable, or the caller may have disabled snapshot capture. An empty captured state and an absent snapshot are different facts. When an assumption makes a captured state infeasible, the node is marked `PRUNED` and the state inspector identifies its retained facts as abstract debugging data.
 
 ## JSON interchange format
 
@@ -100,7 +108,7 @@ report
         index, instruction, liveBefore[], liveAfter[], before, after
 ```
 
-Each state contains `places`, `resources`, and `loans`. The JSON includes all captured facts; the writer does not infer new aliases or invent histories. Flag values such as `Alive, Disposed` represent joined possibilities, rather than one concrete object's simultaneous runtime state.
+Each state contains `isReachable`, `places`, `resources`, and `loans`. Places expose `mayBeNull`; references expose `mayBeAbsent`, `coversResource`, and field-move projections; loans expose `mayBeAbsent` along with their kind and reborrow parent. The JSON includes all captured facts; the writer does not infer new aliases or invent histories. Flag values such as `Alive, Disposed` represent joined possibilities, rather than one concrete object's simultaneous runtime state.
 
 `Disposed` records a recognized disposal invocation. The analyzer's release obligation is discharged before an exception from the disposer body propagates; it does not establish that partial or throwing cleanup released every underlying resource successfully.
 
@@ -125,7 +133,9 @@ safesharp --project App.csproj --format dot --output ownership.dot
 safesharp --project App.csproj --format mermaid --output ownership.mmd
 ```
 
-Each method becomes a subgraph, and each successor relation becomes an edge. Node identifiers are generated independently from source names. DOT string quoting and Mermaid entity escaping prevent names from becoming graph directives. The raw Mermaid output is intended for a Mermaid-capable renderer; it contains no Markdown fences. For a large solution, use the HTML method selector or consume the JSON to focus on selected methods.
+Each method becomes a subgraph, and each successor relation becomes an edge. Captive-service diagnostics with a recorded `SafeSharp.DependencyPath` additionally produce a dependency-witness subgraph. These edges preserve the reported path; they do not reconstruct every service registration in a container. Service and lifetime labels appear when the corresponding metadata paths have matching lengths.
+
+Node identifiers are generated independently from source names. DOT string quoting and Mermaid entity escaping prevent names from becoming graph directives. The raw Mermaid output is intended for a Mermaid-capable renderer; it contains no Markdown fences. For a large solution, use the HTML method selector or consume the JSON to focus on selected methods.
 
 ## Reuse the reporting library
 

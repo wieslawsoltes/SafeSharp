@@ -1,6 +1,6 @@
 # Ownership contracts and semantic analysis
 
-SafeSharp has two complementary analysis layers. The ownership engine follows resource identities, moves, loans, liveness, and control-flow transitions. `SafeSharpSemanticAnalyzer` checks declarations and relationships that cross method boundaries: aggregate ownership, callback escape, thread affinity, and dependency injection lifetimes. Both run as Roslyn diagnostics while the compiler analyzes C#.
+SafeSharp has three complementary analyzers. The ownership engine follows resource identities, moves, loans, liveness, and control-flow transitions. `SafeSharpSemanticAnalyzer` checks declarations and relationships that cross method boundaries: aggregate ownership, callback escape, thread affinity, and dependency injection lifetimes. `BoundarySafetyAnalyzer` checks exception/disposal boundaries, inherited parameter contract compatibility, and opt-in audits for unsafe operations and unknown factories. All run as Roslyn diagnostics while the compiler analyzes C#. The [complete diagnostic reference](diagnostics.md) documents all 31 implemented rules.
 
 `SafeSharp.Contracts` targets .NET Standard 2.0 and has no Roslyn dependency. Its attributes are ordinary metadata. `Ownership.Move`, `Ownership.Borrow`, and `Ownership.BorrowMut` return their input unchanged. These methods do not clear variables, wrap objects, perform reference counting, restrict runtime access, or make C# a language with affine types. Suppressing the analyzer also suppresses the corresponding checks.
 
@@ -24,7 +24,7 @@ All contracts live in namespace `SafeSharp`. Analyzer matching resolves the actu
 | `ThreadSafe` | Class, struct | A trusted declaration that sharing and use across threads are supported. |
 | `ServiceLifetime(Transient/Scoped/Singleton)` | Class, interface | A service lifetime known without a dependency on a specific DI library. |
 
-Thread-affinity and thread-safety contracts propagate through base types and generic type constraints. They describe access capabilities and must not be placed together on the same effective type. Other declaration contracts are not automatically inherited by overrides: callers and implementations should expose compatible contracts explicitly.
+Thread-affinity and thread-safety contracts propagate through base types and generic type constraints. They describe access capabilities and must not be placed together on the same effective type. The ownership adapter inherits parameter and method contracts from implemented interfaces and overridden methods, including associated getter-property contracts. Parameters are matched by ordinal, and named returned-borrow sources are remapped when an implementation renames its parameter. Omitted implementation annotations inherit the declaration's mode; an explicit incompatible parameter mode receives [SS0034](diagnostics.md#ss0034). This compatibility check does not establish full behavioral subtyping for arbitrary method effects.
 
 ```csharp
 using SafeSharp;

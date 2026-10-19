@@ -113,6 +113,8 @@ dotnet tool install SafeSharp.Tool --tool-path .tools \
 
 Report edges and states come from the computed analysis. Evidence is abstract provenance, not a fabricated executable path. Project-mode reports honor analyzer configuration. CLI exit codes distinguish findings (`1`), errors/incomplete analysis (`2`), and cancellation (`130`); `--fail-on none` does not hide incomplete analysis. See the [reporting guide](docs/reporting.md).
 
+Download and open the generated [example HTML report](docs/examples/ownership.html) for seven method graphs, four ownership diagnostics, and per-instruction state inspection from the included unsafe examples. The reporting guide includes the regeneration command.
+
 ## Architecture and packages
 
 ```mermaid
