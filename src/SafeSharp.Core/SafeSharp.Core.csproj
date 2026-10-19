@@ -4,6 +4,6 @@
     <Description>Reusable control-flow ownership and non-lexical loan analysis engine, independent of Roslyn.</Description>
   </PropertyGroup>
   <ItemGroup>
-    <PackageReference Include="System.Collections.Immutable" Version="9.0.0" />
+    <PackageReference Include="System.Collections.Immutable" Version="10.0.13" />
   </ItemGroup>
 </Project>
