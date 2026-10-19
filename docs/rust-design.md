@@ -1,0 +1,141 @@
+# Rust design references and the C# ownership model
+
+SafeSharp is an independent C# analysis implementation informed by Rust's borrow-checker architecture. The reusable engine works over explicit ownership effects and a finite control-flow graph, with forward ownership dataflow, backward place liveness, and source-grounded diagnostic evidence. It does not embed rustc, translate the Rust compiler, or change the C# language's assignment and garbage-collection semantics.
+
+## Reference baseline
+
+Source references are pinned to **Rust 1.91.0**, commit **`f8297e351a40c1439a467bbbb6879088047f50b3`**, instead of a moving development branch. The official `1.91.0` annotated tag was resolved through GitHub to that commit. This is a reproducible design reference, not a claim that the implementation matches every rule in that release or tracks the latest Rust compiler.
+
+| Reference | Design subject | SafeSharp relationship |
+| --- | --- | --- |
+| [`rustc_borrowck/src/lib.rs`](https://github.com/rust-lang/rust/blob/f8297e351a40c1439a467bbbb6879088047f50b3/compiler/rustc_borrowck/src/lib.rs) | Borrow-checking query and coordinated analyses | Separate language lowering, dataflow solving, and diagnostics. |
+| [`rustc_borrowck/src/dataflow.rs`](https://github.com/rust-lang/rust/blob/f8297e351a40c1439a467bbbb6879088047f50b3/compiler/rustc_borrowck/src/dataflow.rs) | Borrow and initialization analysis domains | A reusable finite abstract domain with fixed-point iteration. |
+| [`rustc_borrowck/src/places_conflict.rs`](https://github.com/rust-lang/rust/blob/f8297e351a40c1439a467bbbb6879088047f50b3/compiler/rustc_borrowck/src/places_conflict.rs) | Place projections and overlap | Resource identity and field-projection conflict checks. |
+| [Rust Compiler Development Guide: borrow checking](https://rustc-dev-guide.rust-lang.org/borrow-check.html) | MIR as a lowered analysis representation | Roslyn `IOperation` and CFG are lowered to compiler-independent ownership instructions. |
+| [Rust RFC 2094: non-lexical lifetimes](https://rust-lang.github.io/rfcs/2094-nll.html) | Lifetimes determined by control flow and use | Backward liveness expires modeled loans after their last relevant use. |
+| [Rust Compiler Development Guide: region inference](https://rustc-dev-guide.rust-lang.org/borrow-check/region-inference.html) | Region constraints and outlives relationships | Informs the lifetime model; universal and higher-ranked region solving are not implemented. |
+| [Rust Compiler Development Guide: two-phase borrows](https://rustc-dev-guide.rust-lang.org/borrow-check/two-phase-borrows.html) | Reservation followed by activation | A documented boundary; SafeSharp's exclusive loans are activated at their explicit creation. |
+| [Polonius: loan analysis](https://rust-lang.github.io/polonius/rules/loans.html) | Loan propagation, invalidation, and origin relations | Related design literature; SafeSharp uses its own abstract-state solver, not the Polonius engine. |
+
+No Rust implementation code was copied into SafeSharp. References in source comments identify the ideas being adapted. The authoritative descriptions above explain Rust; the source files and tests in this repository define what SafeSharp actually computes.
+
+## Lowering and analysis pipeline
+
+```mermaid
+flowchart TD
+  R["Roslyn symbols and operations"] --> F["Control-flow lowering"]
+  C["Contracts and method effects"] --> F
+  F --> G["Ownership instructions and CFG"]
+  G --> L["Backward place liveness"]
+  G --> O["Forward ownership fixed point"]
+  L --> O
+  O --> D["Diagnostics and source evidence"]
+  O --> S["Optional state snapshots"]
+  S --> V["JSON and graph reports"]
+  D --> V
+```
+
+Roslyn performs C# binding and type checking. SafeSharp's frontend identifies resource construction, aliases, explicit moves and loans, calls with known ownership effects, disposal, transfers, escaping references, and suspension points. Each effect becomes a `FlowInstruction` in an `AnalysisGraph`. A custom language frontend can generate that same representation without a Roslyn dependency.
+
+The graph preserves the edges supplied by the frontend. The engine does not reinterpret source expressions, discover omitted exception edges, or assume that an arbitrary library call is pure. The Roslyn frontend models explicit throws and rethrows, typed catches, filters, and cleanup continuations. Potentially throwing operations are split at explicit effect markers and routed to visible handlers/finalizers. Filter search occurs before inner finally cleanup; a throwing filter follows its false path. A missing frontend effect cannot be recovered by a sophisticated graph solver; soundness claims must therefore include the lowering and the external contracts, not just the core lattice.
+
+### Forward ownership state
+
+The abstract state has three cooperating parts:
+
+1. **Places** map local or projected identities to possible resource references. A reference records availability, loan identity, projection, and moved subprojections. C# aliases remain connected to the same resource identity.
+2. **Resources** carry ownership obligations and possible lifecycle states: absent, alive, disposed, transferred, or escaped. An allocation site can also be associated with owner scope resource identities.
+3. **Loans** record a shared or exclusive borrow, the resource/projection being borrowed, its holder, origin, parent loan, and suspension policy.
+
+The solver joins predecessor states and iterates to a fixed point. A state can record alternatives such as alive on one branch and disposed on another. The checker reports whether a misuse is definite or possible within the abstract model. Allocation-existence information prevents an allocation that occurs in one branch from being treated as an undisposed concrete allocation on an unrelated branch where it never existed. Explicit null/non-null assumptions prune infeasible guard edges and refine nullable-reference facts.
+
+Resources are abstract allocation identities. They are not runtime addresses, and one loop allocation site may summarize multiple concrete instances. Liveness permits a strong refresh of a loop allocation when old aliases are dead, avoiding contamination of a new `using` iteration by a previous iteration's disposed state. It does not establish general concrete instance cardinality. A field projection expresses a place-access relationship; an independently disposable child field requires its own resource identity when the frontend models a separate disposal obligation. Disposing or transferring a projected field must not automatically discharge the containing object's obligation.
+
+### Backward liveness and loan expiry
+
+The liveness analysis computes place sets at block boundaries and before/after each instruction, over the actual control-flow successors. The forward analysis uses those sets to remove loans whose holders no longer have a relevant future use. This permits an owner to be used after a temporary borrowed view's last use, without requiring a new lexical block.
+
+Reborrows retain parent-loan information. A live child can preserve the restrictions associated with its borrow ancestry. Field projections support conflicts on overlapping paths and independence of distinct modeled fields; unknown indices or external aliases are not solved symbolically.
+
+This is a concrete non-lexical liveness computation, but it is not Rust's complete region inference. Rust's parametric outlives constraints, universal regions, type-level lifetimes, variance, and higher-ranked bounds require information that ordinary C# APIs do not encode. SafeSharp's returned-borrow contract connects a result to a named input or receiver; it is a narrower, explicit relationship.
+
+### Diagnostics after convergence
+
+The engine solves states before reporting misuse diagnostics. This keeps intermediate worklist states from producing transient findings. Evidence points back to allocations, transfers, disposals, borrow origins, or exits involved in the abstract explanation. Multiple paths can contribute to one joined result.
+
+An evidence list is consequently **provenance**, not a proven execution trace. JSON, HTML, and SARIF retain that distinction. Budget exhaustion produces an explicit incomplete-analysis result instead of treating an unfinished solver as a successful check.
+
+## Mapping ownership into C#
+
+Rust moves are language semantics. C# reference assignments create aliases, and value assignments can copy structs. SafeSharp preserves those C# facts. Ownership transfer is represented by a known consumption contract or the explicit `Ownership.Move` helper:
+
+```csharp
+using SafeSharp;
+
+static void Consume([Consumes] MemoryStream stream)
+{
+    stream.Dispose();
+}
+
+static void Example()
+{
+    var first = new MemoryStream();
+    var alias = first;
+    var second = Ownership.Move(first);
+    Consume(second);
+
+    // The alias still refers to the same resource identity; move/disposal effects
+    // remain visible to analysis, even though the CLR reference itself is non-null.
+    alias.WriteByte(1);
+}
+```
+
+The helpers return their arguments unchanged. They do not create runtime wrappers, clear variables, revoke references, or enforce exclusivity at execution time. The analyzer diagnoses violations in the modeled code. Annotating an API is a contract and must agree with its implementation.
+
+The disposal obligation is an **invocation obligation**. A recognized `Dispose` invocation discharges it before an exception from the disposer body is propagated. This makes `using` cleanup and explicit cleanup consistent in the analysis. It does not prove that a throwing or partially implemented disposer released every underlying resource successfully. The abstract `Disposed` state records the recognized disposal effect, not a verified physical-cleanup postcondition.
+
+Shared and exclusive loans use `Ownership.Borrow`/`Ownership.BorrowMut` or corresponding parameter/return contracts. `[Mutates]` declares receiver mutation where an API's intent is not expressible through ordinary C# reference mutability. `[ReturnsBorrowed("value")]` binds a return to a parameter; `"this"` denotes an instance receiver. Further annotations describe owned results, non-escaping parameters, mandatory result use, suspension restrictions, and thread-affinity conventions. See [contracts and semantic analysis](contracts-and-semantics.md) for their exact use and validation.
+
+## Implemented capability map
+
+| Concern | Implemented mechanism | Scope of the guarantee |
+| --- | --- | --- |
+| Use after disposal | Aliases share an abstract resource lifecycle. | Modeled resource identities and disposal effects. |
+| Repeated disposal | Checks disposed state before a later modeled disposal. | Recognized `Dispose`/`DisposeAsync` effects; API idempotence is not inferred. |
+| Missing disposal | Checks retained owned obligations at modeled exits and overwrites. | Declared/modeled ownership; unmodeled exception behavior is outside this core result. |
+| Use after move | Reference availability and transferred ownership effects. | Explicit moves and consumption contracts; ordinary C# assignments retain alias semantics. |
+| Shared/exclusive borrowing | Loan conflict rules for reads, writes, moves, and disposal. | Known borrowers and modeled place/resource overlap. |
+| Non-lexical loan lifetimes | Backward CFG place liveness and expiry at instruction boundaries. | Intraprocedural liveness plus explicit borrowed-result contracts. |
+| Reborrowing | Parent-loan ancestry and conflict tracking. | Explicit loans represented by the frontend. |
+| Field projections and partial moves | Projection-aware reference and loan state. | Static modeled paths; no complete heap-shape or symbolic index reasoning. |
+| Branches, joins, loops | Bounded fixed-point iteration over a finite domain. | The supplied CFG and abstract allocation identities. |
+| Nullable control flow | Null/non-null assumptions refine references and prune infeasible edges. | Recognized guards and abstract nullable-reference facts. |
+| Exception control flow | Explicit throws/rethrows, typed catches, filter-before-cleanup ordering, nested finally continuations, and marked implicit-fault edges. | Modeled handlers and throw effects; unhandled implicit faults remain an advisory boundary. |
+| Scope-bounded services | Resource owner identities plus disposal/escape checking. | Known scope creation, resolution, and ownership relationships. |
+| Captive dependencies | Semantic service graph traversal and a recorded lifetime witness. | Supported registrations, constructor/factory patterns, and lifetime contracts. |
+| Owned aggregates | Structural checks for disposal contracts and field release paths. | These checks are not all-exit interprocedural proofs of arbitrary destructors. |
+| Suspension | Live-loan and `[NoSuspend]` checks at modeled suspension points. | A static convention; not a coroutine pinning or synchronization proof. |
+| Thread affinity | Semantic checks for supported callback scheduling and declared affinity. | Trusted type contracts and recognized scheduling APIs. |
+| Explainability | Exact spans, related origins, certainty, state snapshots, liveness, graphs. | Actual computed facts; no fabricated executable witnesses. |
+
+## Semantic differences and unsupported Rust guarantees
+
+The following remain explicit boundaries of this release:
+
+- **Deterministic destruction and unwinding.** Rust's `Drop` and C#'s garbage collection/finalization are different runtime mechanisms. A C# disposable object's reachability does not discharge an explicit `Dispose` obligation. SafeSharp models explicit exception routing and marked implicit faults through visible catch/finally regions, including filter search before cleanup. Unhandled implicit faults terminate at a labeled non-normal boundary and remain covered by the `SS0030` exception-safety advisory rather than a claim that every method exit was proved safe. A disposal invocation discharges the modeled obligation even when its body throws; successful physical cleanup and partial disposer implementations remain a proof boundary. Arbitrary library exception specifications and complete asynchronous cleanup behavior are not inferred.
+- **Whole-program aliasing.** Reflection, dynamic dispatch without trustworthy summaries, arbitrary virtual overrides, generated code excluded by policy, external native code, unsafe pointers, custom marshalling, and references hidden in arbitrary collections cannot be proven by this analysis. Known contracts bound the modeled behavior; a lack of diagnostics does not establish that an unknown callee preserves ownership.
+- **Parametric region inference.** There is no implementation of Rust's full universal-region, higher-ranked lifetime, variance, implied-bound, or generic trait lifetime solver. Returned-loan contracts and local liveness are the implemented mechanism.
+- **Language-enforced `Copy`, `Send`, and `Sync`.** C# types do not carry Rust's automatically checked ownership traits. Copyable owned structs can be flagged, and thread-affinity conventions can be checked for recognized operations, but arbitrary races and synchronization correctness are not proven. `[ThreadSafe]` is a trusted contract.
+- **`Pin`, self-references, and address stability.** SafeSharp does not enforce pinning invariants, prove validity of self-referential async state machines, or reason about relocation of native addresses.
+- **Unsafe alias models and interior mutability.** Rust's unsafe-code rules, `UnsafeCell`, raw-pointer provenance, stacked/tree borrowing models, and atomic memory ordering are not reproduced. A shared C# reference is not physically immutable; annotations describe behavior the analysis can model.
+- **Two-phase borrows.** There is no Rust-style reservation/activation phase for implicit receiver borrows. Explicit exclusive loans are active when created.
+- **Symbolic heap and index proofs.** Distinct projected fields can be modeled, but general heap separation, dependent index inequalities, concrete per-iteration instance counting, and collection element ownership require richer domains and contracts.
+- **Contract soundness across a program.** Declaration validation and selected implementation checks do not prove every external annotation or every virtual implementation. C# compiler definite-assignment and ref-safety diagnostics remain the authority for the language's built-in rules.
+
+These boundaries explain which Rust concepts transfer directly and where C# needs an explicit convention or a separate analysis. Development should extend the effect model, add positive and negative conformance cases, and record a narrower guarantee before broadening any claim in the capability table.
+
+## Working on the engine
+
+Keep language lowering in `SafeSharp.Analyzers`, ownership dataflow in `SafeSharp.Core`, and presentation in `SafeSharp.Reporting`. Extend instructions or state domains only when their semantics can be described independently of syntax. Add tests for both the misuse and its valid counterpart, including aliases, joins, loops, and last-use loan expiry. When an analysis needs an approximation, make the lost correlation and its effect on certainty explicit.
+
+The [reporting documentation](reporting.md) explains how to inspect the computed CFG and instruction states. Use those outputs to debug a test case's actual facts; diagrams should reveal solver behavior rather than illustrate an assumed result.

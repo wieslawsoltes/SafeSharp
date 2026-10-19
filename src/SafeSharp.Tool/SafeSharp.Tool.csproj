@@ -8,11 +8,12 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../SafeSharp.Analyzers/SafeSharp.Analyzers.csproj" />
+    <ProjectReference Include="../SafeSharp.Contracts/SafeSharp.Contracts.csproj" />
     <ProjectReference Include="../SafeSharp.Reporting/SafeSharp.Reporting.csproj" />
-    <PackageReference Include="Microsoft.CodeAnalysis.CSharp.Workspaces" Version="4.14.0" />
-    <PackageReference Include="Microsoft.CodeAnalysis.Workspaces.MSBuild" Version="4.14.0" />
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp.Workspaces" Version="5.9.0" />
+    <PackageReference Include="Microsoft.CodeAnalysis.Workspaces.MSBuild" Version="5.9.0" />
     <PackageReference Include="Microsoft.Build.Locator" Version="1.11.2" />
     <!-- MSBuild is loaded from the installed SDK by Locator, never from the tool payload. -->
-    <PackageReference Include="Microsoft.Build.Tasks.Core" Version="17.14.28" ExcludeAssets="runtime" PrivateAssets="all" />
+    <PackageReference Include="Microsoft.Build.Framework" Version="17.14.28" ExcludeAssets="runtime" PrivateAssets="all" />
   </ItemGroup>
 </Project>

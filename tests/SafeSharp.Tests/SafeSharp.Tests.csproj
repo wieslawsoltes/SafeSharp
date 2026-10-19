@@ -8,7 +8,11 @@
     <ProjectReference Include="../../src/SafeSharp.Analyzers/SafeSharp.Analyzers.csproj" />
     <ProjectReference Include="../../src/SafeSharp.Contracts/SafeSharp.Contracts.csproj" />
     <ProjectReference Include="../../src/SafeSharp.Reporting/SafeSharp.Reporting.csproj" />
+    <ProjectReference Include="../../src/SafeSharp.CodeFixes/SafeSharp.CodeFixes.csproj" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.14.0" />
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp.Workspaces" Version="4.14.0" />
+    <PackageReference Include="System.Composition.AttributedModel" Version="9.0.0" />
     <PackageReference Include="xunit" Version="2.9.3" />
     <PackageReference Include="xunit.runner.visualstudio" Version="3.1.1" PrivateAssets="all" />
     <PackageReference Include="coverlet.collector" Version="6.0.4" PrivateAssets="all" />

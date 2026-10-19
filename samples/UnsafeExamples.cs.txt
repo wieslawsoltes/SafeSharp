@@ -1,0 +1,43 @@
+using System;
+using System.Threading.Tasks;
+using SafeSharp;
+
+sealed class Handle : IDisposable
+{
+    [Mutates] public void Mutate() { }
+    public void Read() { }
+    public void Dispose() { }
+}
+
+static class UnsafeExamples
+{
+    static void AliasAfterDisposal()
+    {
+        var owner = new Handle();
+        var alias = owner;
+        owner.Dispose();
+        alias.Read(); // SS0001, with acquisition and disposal evidence.
+    }
+
+    static void BorrowConflict()
+    {
+        using var owner = new Handle();
+        var view = Ownership.Borrow(owner);
+        owner.Mutate(); // SS0007: shared view is still live.
+        view.Read();
+    }
+
+    static async Task Suspension()
+    {
+        using var owner = new Handle();
+        var view = Ownership.Borrow(owner);
+        await Task.Yield(); // SS0010: view crosses suspension.
+        view.Read();
+    }
+
+    static Handle ReturningDisposed()
+    {
+        using var owner = new Handle();
+        return owner; // SS0001 after implicit finally cleanup.
+    }
+}

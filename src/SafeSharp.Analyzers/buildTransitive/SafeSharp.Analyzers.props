@@ -1,6 +1,6 @@
 <Project>
   <ItemGroup>
     <CompilerVisibleProperty Include="SafeSharpMaxIterations" />
-    <CompilerVisibleProperty Include="SafeSharpAnalyzeGeneratedCode" />
+    <CompilerVisibleProperty Include="SafeSharpMaxTrackedResources" />
   </ItemGroup>
 </Project>
