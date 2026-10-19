@@ -72,7 +72,7 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="safesharp-cli-") as temporary:
         directory = Path(temporary)
         source = directory / "Ownership example.cs"
-        source.write_text(SOURCE, encoding="utf-8")
+        source.write_bytes(SOURCE.encode("utf-8"))
         for format_name in ("json", "sarif", "dot", "mermaid", "html"):
             output = directory / ("report." + format_name)
             run(["--source", str(source), "--format", format_name, "--output", str(output),
@@ -191,7 +191,8 @@ sealed class CleanupBudget : IDisposable {
 
         def check_budget(rule: str, fixture: str, configuration: str, expected_severity: str | None,
                          *, properties: str = "", complete: bool = False) -> dict:
-            source.write_text(fixture, encoding="utf-8")
+            # Keep line endings identical to the in-memory text used by the span assertions.
+            source.write_bytes(fixture.encode("utf-8"))
             editorconfig.write_text("root = true\n[*.cs]\n" + configuration, encoding="utf-8")
             project.write_text(project_text.replace("</PropertyGroup>", properties + "</PropertyGroup>"), encoding="utf-8")
             run(["--project", str(project), "--no-restore", "--format", "json", "--output", str(project_output),
