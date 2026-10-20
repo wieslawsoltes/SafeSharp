@@ -69,9 +69,15 @@ for path in sorted(root.glob("*.nupkg")):
                     dependency.attrib["id"]: dependency.attrib.get("version", "")
                     for dependency in group.findall("{*}dependency")}
                     for group in metadata.findall(".//{*}dependencies/{*}group")}
-                for framework, immutable_version in ((".NETStandard2.0", "9.0.0"), ("net10.0", "10.0.13")):
-                    if groups.get(framework, {}).get("System.Collections.Immutable") != immutable_version:
-                        raise SystemExit(f"{identity}: {framework} must preserve its Immutable {immutable_version} dependency contract")
+                if groups.get(".NETStandard2.0", {}).get("System.Collections.Immutable") != "9.0.0":
+                    raise SystemExit(identity + ": .NETStandard2.0 must preserve its Immutable 9.0.0 dependency contract")
+                # .NET 10 prunes framework-provided references from the nuspec.
+                # An explicit native group is still required to prevent NuGet
+                # from falling back to the .NET Standard dependency group.
+                if "net10.0" not in groups:
+                    raise SystemExit(identity + ": an explicit net10.0 dependency group is required")
+                if groups["net10.0"].get("System.Collections.Immutable") not in (None, "10.0.13"):
+                    raise SystemExit(identity + ": net10.0 must use platform-provided Immutable or the selected 10.0.13 package")
             if identity == "SafeSharp.Reporting" and dependencies.get("SafeSharp.Core") != version:
                 raise SystemExit(identity + ": reporting must depend on the matching Core release")
         if identity == "SafeSharp.Tool":
