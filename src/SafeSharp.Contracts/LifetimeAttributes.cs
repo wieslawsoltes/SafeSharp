@@ -37,4 +37,8 @@ public sealed class OutlivesAttribute : Attribute
 
     /// <summary>Gets the region bounded by <see cref="Longer"/>.</summary>
     public string Shorter { get; }
+
+    /// <summary>Gets or sets the nested delegate binder, such as <c>parameter0</c> or <c>result.arg0</c>.</summary>
+    /// <remarks>Null or empty selects the outer method signature. Nested scopes must be introduced by TypeLifetime paths.</remarks>
+    public string? Scope { get; set; }
 }

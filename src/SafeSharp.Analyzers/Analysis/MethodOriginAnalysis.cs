@@ -9,7 +9,7 @@ namespace SafeSharp.Analyzers.Analysis;
 /// Finite may-origin analysis for return values and caller-visible out slots. Value snapshots and
 /// aliases of storage have separate domains: assigning through a ref changes its target, whereas
 /// ref reassignment changes which target is selected. Unknown origins survive control-flow joins.
-/// Effects and lifetime validity are checked by the ownership engine independently of origin inference.
+/// Cleanup and consuming effects invalidate provenance before caller-visible postconditions are inferred.
 /// </summary>
 /// <remarks>
 /// Original C# implementation of place-oriented dataflow ideas, not translated Rust source.
@@ -28,7 +28,6 @@ internal static class MethodOriginAnalysis
     private const int ExternalStorage = -2;
     private const int UnknownStorage = -3;
     private static readonly ImmutableHashSet<string> UnknownOrigins = Origin(Unknown);
-    private static readonly ImmutableHashSet<string> FreshOrigins = Origin(Fresh);
     private static readonly ImmutableHashSet<string> NullOrigins = Origin(Null);
     private static readonly ImmutableHashSet<string> ReceiverOrigins = Origin(Receiver);
     private static readonly ImmutableHashSet<string> EmptyOrigins = ImmutableHashSet<string>.Empty.WithComparer(StringComparer.Ordinal);
@@ -39,17 +38,25 @@ internal static class MethodOriginAnalysis
     internal sealed class Result
     {
         internal Result(ImmutableHashSet<string> returns, ImmutableDictionary<int, ImmutableHashSet<string>> outputs,
-            bool returnsAsyncPayload = false)
-        { Returns = returns; Outputs = outputs; ReturnsAsyncPayload = returnsAsyncPayload; }
+            bool returnsAsyncPayload = false, ImmutableArray<MethodReturnOrigin> returnOrigins = default,
+            ReferenceReturnSummary? referenceReturn = null, ImmutableHashSet<int>? preservedRefParameters = null)
+        {
+            Returns = returns; Outputs = outputs; ReturnsAsyncPayload = returnsAsyncPayload;
+            ReturnOrigins = returnOrigins.IsDefault ? ImmutableArray<MethodReturnOrigin>.Empty : returnOrigins;
+            ReferenceReturn = referenceReturn; PreservedRefParameters = preservedRefParameters ?? ImmutableHashSet<int>.Empty;
+        }
         internal ImmutableHashSet<string> Returns { get; }
         internal ImmutableDictionary<int, ImmutableHashSet<string>> Outputs { get; }
         internal bool ReturnsAsyncPayload { get; }
+        internal ImmutableArray<MethodReturnOrigin> ReturnOrigins { get; }
+        internal ReferenceReturnSummary? ReferenceReturn { get; }
+        internal ImmutableHashSet<int> PreservedRefParameters { get; }
     }
 
     internal static Result Analyze(IMethodSymbol method, IOperation? operation, Func<IMethodSymbol, MethodSummary> summary,
         AsyncResultOriginModel asyncResults, CancellationToken cancellationToken)
     {
-        if (operation is null || method.ReturnsByRef || method.ReturnsByRefReadonly) return Opaque();
+        if (operation is null) return Opaque();
         var graph = ControlFlowLowerer.TryCreate(operation, cancellationToken);
         if (graph is null) return Opaque();
         if (method.MethodKind == MethodKind.LocalFunction)
@@ -57,16 +64,12 @@ internal static class MethodOriginAnalysis
             graph = FindLocalGraph(graph, method, cancellationToken);
             if (graph is null) return Opaque();
         }
-        // A normal-edge proof cannot omit handlers which can return another value or replace an
-        // out slot during cleanup. Explicit contracts remain usable for these bodies.
-        if (HasHandlers(graph.Root)) return Opaque();
-        return new Solver(method, graph, summary, asyncResults, cancellationToken).Analyze();
+        try { return new Solver(method, graph, summary, asyncResults, cancellationToken).Analyze(); }
+        catch (AnalysisBudgetException) { return Opaque(); }
     }
 
     private static Result Opaque() => new(UnknownOrigins, ImmutableDictionary<int, ImmutableHashSet<string>>.Empty);
     private static ImmutableHashSet<string> Origin(string value) => ImmutableHashSet.Create(StringComparer.Ordinal, value);
-    private static bool HasHandlers(ControlFlowRegion region) => region.Kind is ControlFlowRegionKind.TryAndCatch or
-        ControlFlowRegionKind.TryAndFinally || region.NestedRegions.Any(HasHandlers);
 
     private static ControlFlowGraph? FindLocalGraph(ControlFlowGraph graph, IMethodSymbol method, CancellationToken cancellationToken)
     {
@@ -78,18 +81,6 @@ internal static class MethodOriginAnalysis
             if (FindLocalGraph(nested, method, cancellationToken) is { } match) return match;
         }
         return null;
-    }
-
-    private static IEnumerable<int> Successors(BasicBlock block)
-    {
-        if (block.BranchValue?.ConstantValue is { HasValue: true, Value: bool condition } && block.ConditionKind != ControlFlowConditionKind.None)
-        {
-            var selected = condition == (block.ConditionKind == ControlFlowConditionKind.WhenTrue) ? block.ConditionalSuccessor : block.FallThroughSuccessor;
-            if (selected?.Destination is { } destination) yield return destination.Ordinal;
-            yield break;
-        }
-        if (block.FallThroughSuccessor?.Destination is { } first) yield return first.Ordinal;
-        if (block.ConditionalSuccessor?.Destination is { } second && second.Ordinal != block.FallThroughSuccessor?.Destination?.Ordinal) yield return second.Ordinal;
     }
 
     private static IOperation UnwrapParentheses(IOperation operation)
@@ -104,6 +95,9 @@ internal static class MethodOriginAnalysis
         internal Dictionary<int, ImmutableHashSet<int>> References { get; }
         internal Dictionary<int, ImmutableHashSet<int>> CaptureTargets { get; }
         internal Dictionary<int, ImmutableHashSet<string>> Payloads { get; }
+        internal HashSet<int> WrittenStorage { get; }
+        internal HashSet<string> InvalidOrigins { get; }
+        internal HashSet<string> DisposedOrigins { get; }
 
         internal State()
         {
@@ -111,6 +105,9 @@ internal static class MethodOriginAnalysis
             References = new Dictionary<int, ImmutableHashSet<int>>();
             CaptureTargets = new Dictionary<int, ImmutableHashSet<int>>();
             Payloads = new Dictionary<int, ImmutableHashSet<string>>();
+            WrittenStorage = new HashSet<int>();
+            InvalidOrigins = new HashSet<string>(StringComparer.Ordinal);
+            DisposedOrigins = new HashSet<string>(StringComparer.Ordinal);
         }
 
         private State(State source)
@@ -119,6 +116,9 @@ internal static class MethodOriginAnalysis
             References = new Dictionary<int, ImmutableHashSet<int>>(source.References);
             CaptureTargets = new Dictionary<int, ImmutableHashSet<int>>(source.CaptureTargets);
             Payloads = new Dictionary<int, ImmutableHashSet<string>>(source.Payloads);
+            WrittenStorage = new HashSet<int>(source.WrittenStorage);
+            InvalidOrigins = new HashSet<string>(source.InvalidOrigins, StringComparer.Ordinal);
+            DisposedOrigins = new HashSet<string>(source.DisposedOrigins, StringComparer.Ordinal);
         }
 
         internal State Clone() => new(this);
@@ -135,12 +135,20 @@ internal static class MethodOriginAnalysis
         // or hashing source paths, and singleton storage target sets are reused across transfers.
         private readonly Dictionary<ISymbol, int> symbols = new(SymbolEqualityComparer.Default);
         private readonly Dictionary<CaptureId, int> captures = new();
+        private readonly Dictionary<IOperation, int> referenceCallSlots = new();
         private readonly List<ImmutableHashSet<int>> singletons = new();
         private readonly HashSet<int> callerReferences = new();
         private readonly HashSet<int> capturedStorage = new();
+        private bool capturedMayInvalidateResources;
         // Allocation-site identities bound the carrier graph even when a loop repeatedly wraps
         // an earlier carrier. Nested payloads are edges in this graph, never growing string paths.
-        private readonly Dictionary<IOperation, int> carrierSites = new();
+        private readonly Dictionary<(IOperation Operation, int Layer), int> carrierSites = new();
+        private readonly Dictionary<IOperation, ImmutableHashSet<string>> freshSites = new();
+        private readonly HashSet<string> freshTokens = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, ImmutableHashSet<string>> movedOrigins = new(StringComparer.Ordinal);
+        private SourceControlFlowRouter? router;
+        private SourceControlFlowRouter.Context? currentContext;
+        private Action<SourceControlFlowRouter.Context, State>? propagate;
         private readonly Dictionary<string, int> carrierTokens = new(StringComparer.Ordinal);
         private readonly List<ImmutableHashSet<string>> carrierOrigins = new();
         private int remaining = 100_000;
@@ -154,7 +162,8 @@ internal static class MethodOriginAnalysis
         {
             CollectCapturedStorage();
             if (opaque) return Opaque();
-            var states = new State?[graph.Blocks.Length];
+            router = new SourceControlFlowRouter(graph);
+            var states = new Dictionary<int, State>();
             var initial = new State();
             foreach (var parameter in method.Parameters)
             {
@@ -162,52 +171,136 @@ internal static class MethodOriginAnalysis
                 if (parameter.RefKind != RefKind.Out) initial.Values[slot] = Origin(Parameter(parameter.Ordinal));
                 if (parameter.RefKind != RefKind.None) callerReferences.Add(slot);
             }
-            states[0] = initial;
             var pending = new Queue<int>();
-            var queued = new bool[graph.Blocks.Length];
-            pending.Enqueue(0); queued[0] = true;
+            var queued = new HashSet<int>();
+            propagate = (context, incoming) =>
+            {
+                if (router.IsBoundary(context)) return;
+                var changed = !states.TryGetValue(context.Id, out var previous);
+                if (changed) states[context.Id] = incoming.Clone();
+                else changed = Join(previous!, incoming);
+                if (changed && queued.Add(context.Id)) pending.Enqueue(context.Id);
+            };
+            propagate(router.Entry, initial);
             var iterations = 0;
             while (pending.Count > 0)
             {
-                if (!Step() || ++iterations > 4096) return Opaque();
-                var id = pending.Dequeue(); queued[id] = false;
-                var state = states[id]!.Clone();
-                var block = graph.Blocks[id];
+                if (!Step() || ++iterations > 8192) return Opaque();
+                var id = pending.Dequeue(); queued.Remove(id);
+                currentContext = router[id];
+                var state = states[id].Clone();
+                var block = graph.Blocks[currentContext.Ordinal];
                 foreach (var item in block.Operations) Evaluate(item, state);
                 if (block.BranchValue is { } branch)
                 {
-                    var value = Evaluate(branch, state);
                     if (block.FallThroughSuccessor?.Semantics == ControlFlowBranchSemantics.Return ||
                         block.ConditionalSuccessor?.Semantics == ControlFlowBranchSemantics.Return)
-                        state.Values[Returned] = value;
+                    {
+                        if (method.ReturnsByRef || method.ReturnsByRefReadonly)
+                        {
+                            state.References[Returned] = Targets(branch, state, 0);
+                            state.Values[Returned] = ReadTargets(state.References[Returned], state);
+                        }
+                        else state.Values[Returned] = Evaluate(branch, state);
+                    }
+                    else Evaluate(branch, state);
                 }
                 if (opaque) return Opaque();
-                foreach (var successor in Successors(block))
-                {
-                    var changed = states[successor] is null;
-                    if (changed) states[successor] = state.Clone();
-                    else changed = Join(states[successor]!, state);
-                    if (changed && !queued[successor]) { pending.Enqueue(successor); queued[successor] = true; }
-                }
+                foreach (var outgoing in SourceControlFlowRouter.Branches(block))
+                    foreach (var successor in router.Successors(currentContext, outgoing)) propagate(successor, state);
             }
-            if (opaque || states[states.Length - 1] is not { } exit) return Opaque();
+            currentContext = null;
+            State? exit = null;
+            foreach (var pair in states)
+            {
+                if (!router.IsNormalExit(router[pair.Key])) continue;
+                if (exit is null) exit = pair.Value.Clone(); else Join(exit, pair.Value);
+            }
+            if (opaque || exit is null) return Opaque();
             var outputs = ImmutableDictionary.CreateBuilder<int, ImmutableHashSet<string>>();
             foreach (var parameter in method.Parameters)
-                if (parameter.RefKind == RefKind.Out && exit.Values.TryGetValue(Slot(parameter), out var origins)) outputs[parameter.Ordinal] = origins;
+                if (parameter.RefKind is RefKind.Ref or RefKind.Out && exit.Values.TryGetValue(Slot(parameter), out var origins))
+                    outputs[parameter.Ordinal] = ExportValues(origins, exit);
             var returned = exit.Values.TryGetValue(Returned, out var returnedValue) ? returnedValue : UnknownOrigins;
-            var returnsPayload = method.IsAsync && asyncResults.IsCarrier(method.ReturnType);
-            if (!returnsPayload && asyncResults.IsCarrier(method.ReturnType))
+            if ((method.ReturnsByRef || method.ReturnsByRefReadonly) && exit.References.TryGetValue(Returned, out var returnedTargets))
+                returned = ReadTargets(returnedTargets, exit);
+            var shapes = ImmutableHashSet.CreateBuilder<MethodReturnOrigin>();
+            ExportOrigins(returned, exit, method.IsAsync && asyncResults.IsCarrier(method.ReturnType) ? 1 : 0,
+                new HashSet<int>(), shapes);
+            var resultShape = shapes.OrderBy(origin => origin.PayloadDepth).ThenBy(origin => origin.Source, StringComparer.Ordinal).ToImmutableArray();
+            var returnsPayload = resultShape.Any(origin => origin.PayloadDepth > 0);
+            // Compatibility projections describe exactly one effective-result layer. Deeper
+            // structures remain available through ReturnOrigins and cannot manufacture freshness.
+            returned = resultShape.Select(origin => origin.PayloadDepth == (returnsPayload ? 1 : 0) ? origin.Source : Unknown)
+                .ToImmutableHashSet(StringComparer.Ordinal);
+            ReferenceReturnSummary? reference = null;
+            if (method.ReturnsByRef || method.ReturnsByRefReadonly)
             {
-                if (returned.Any(carrierTokens.ContainsKey))
-                {
-                    returned = Payload(returned, exit);
-                    returnsPayload = true;
-                }
-                // A newly allocated task carrier does not establish ownership of its result.
-                // Ordinary parameter/receiver identities keep their carrier provenance instead.
-                else if (returned.Contains(Fresh)) returned = returned.Remove(Fresh).Add(Unknown);
+                var targets = exit.References.TryGetValue(Returned, out var known) ? known : UnknownTargets;
+                var parameters = method.Parameters.Where(parameter => parameter.RefKind != RefKind.None && targets.Contains(Slot(parameter)))
+                    .Select(parameter => parameter.Ordinal).ToImmutableArray();
+                reference = new ReferenceReturnSummary(parameters, targets.Contains(ExternalStorage),
+                    targets.Contains(UnknownStorage) || targets.Any(target => target >= 0 && !callerReferences.Contains(target)));
             }
-            return opaque ? Opaque() : new Result(returned, outputs.ToImmutable(), returnsPayload);
+            var preserved = method.Parameters.Where(parameter => parameter.RefKind != RefKind.None && !exit.WrittenStorage.Contains(Slot(parameter)))
+                .Select(parameter => parameter.Ordinal).ToImmutableHashSet();
+            return opaque ? Opaque() : new Result(returned, outputs.ToImmutable(), returnsPayload, resultShape, reference, preserved);
+        }
+
+        private void Fault(State state)
+        {
+            if (router is null || currentContext is null || propagate is null || !router.HasExceptionalTarget(currentContext)) return;
+            foreach (var successor in router.Exceptions(currentContext)) propagate(successor, state);
+        }
+
+        private ImmutableHashSet<string> FreshAt(IOperation operation)
+        {
+            if (freshSites.TryGetValue(operation, out var value)) return value;
+            var token = "$allocation:" + freshSites.Count;
+            value = Origin(token); freshSites.Add(operation, value); freshTokens.Add(token); return value;
+        }
+
+        private ImmutableHashSet<string> ExportValues(ImmutableHashSet<string> origins, State state) => origins
+            .Select(origin => state.InvalidOrigins.Contains(origin) ? Unknown : freshTokens.Contains(origin) ? Fresh : carrierTokens.ContainsKey(origin) ? Unknown : origin)
+            .ToImmutableHashSet(StringComparer.Ordinal);
+
+        private void ExportOrigins(ImmutableHashSet<string> origins, State state, int depth, HashSet<int> visiting,
+            ImmutableHashSet<MethodReturnOrigin>.Builder result)
+        {
+            foreach (var origin in origins)
+            {
+                if (!Step()) return;
+                if (state.InvalidOrigins.Contains(origin)) { result.Add(new MethodReturnOrigin(Unknown, depth)); continue; }
+                if (carrierTokens.TryGetValue(origin, out var carrier))
+                {
+                    if (depth >= 16 || !visiting.Add(carrier) || !state.Payloads.TryGetValue(carrier, out var payload))
+                        result.Add(new MethodReturnOrigin(Unknown, depth));
+                    else { ExportOrigins(payload, state, depth + 1, visiting, result); visiting.Remove(carrier); }
+                }
+                else result.Add(new MethodReturnOrigin(freshTokens.Contains(origin) ? Fresh : origin, depth));
+            }
+        }
+
+        private void InvalidateOrigins(ImmutableHashSet<string> origins, State state, bool disposed = false)
+        {
+            foreach (var origin in origins)
+                if (origin != Null) state.InvalidOrigins.Add(origin);
+            if (!disposed) return;
+            var resources = ResourceOrigins(origins);
+            state.DisposedOrigins.UnionWith(resources);
+            state.InvalidOrigins.UnionWith(resources);
+            // Move changes the ownership capability, not the object identity. Disposing an old
+            // C# alias still invalidates the value transferred into a suspended return snapshot.
+            foreach (var pair in movedOrigins)
+                if (pair.Value.Overlaps(resources)) state.InvalidOrigins.Add(pair.Key);
+        }
+
+        private ImmutableHashSet<string> ResourceOrigins(ImmutableHashSet<string> origins)
+        {
+            var result = origins;
+            foreach (var origin in origins)
+                if (movedOrigins.TryGetValue(origin, out var source)) result = result.Union(source);
+            return result;
         }
 
         private int Slot(ISymbol symbol)
@@ -220,6 +313,12 @@ internal static class MethodOriginAnalysis
         {
             if (captures.TryGetValue(capture, out var slot)) return slot;
             slot = NewSlot(); captures.Add(capture, slot); return slot;
+        }
+
+        private int ReferenceCallSlot(IOperation operation)
+        {
+            if (referenceCallSlots.TryGetValue(operation, out var slot)) return slot;
+            slot = NewSlot(); referenceCallSlots.Add(operation, slot); return slot;
         }
 
         private int NewSlot()
@@ -271,12 +370,14 @@ internal static class MethodOriginAnalysis
                     {
                         InvalidateCapturedStorage(state);
                         var effect = summary(converter);
+                        Fault(state);
                         return CallResult(conversion, converter, effect, UnknownOrigins,
                             new Dictionary<int, ImmutableHashSet<string>> { [0] = operand }, state);
                     }
                     // Roslyn represents target-typed new() with an object-creation conversion
                     // which is neither identity nor reference. Its equal typed operand is still
                     // the same freshly constructed value; no additional user code is executed.
+                    if (!conversion.IsImplicit && !conversion.IsTryCast) Fault(state);
                     if (conversion.Conversion.IsIdentity || conversion.Conversion.IsReference ||
                         conversion.Operand is IObjectCreationOperation &&
                         SymbolEqualityComparer.Default.Equals(conversion.Operand.Type, conversion.Type))
@@ -286,7 +387,8 @@ internal static class MethodOriginAnalysis
                 case IInstanceReferenceOperation: return ReceiverOrigins;
                 case IObjectCreationOperation creation:
                 {
-                    var arguments = EvaluateCallArguments(creation.Arguments, creation.Constructor is { } constructor ? summary(constructor) : MethodSummary.Unknown, state, depth + 1);
+                    var arguments = EvaluateCallArguments(creation.Arguments, creation.Constructor is { } constructor ? summary(constructor) : MethodSummary.Unknown, state, depth + 1, out var references);
+                    CallFault(creation.Arguments, references, state);
                     if (creation.Initializer is { } initializer) Evaluate(initializer, state, depth + 1);
                     if (creation.Constructor is { } created && arguments.TryGetValue(0, out var argument))
                     {
@@ -296,7 +398,7 @@ internal static class MethodOriginAnalysis
                             return KnownCarrier(argument) ? argument : UnknownOrigins;
                     }
                     if (asyncResults.IsCarrierAllocation(creation.Type)) return UnknownOrigins;
-                    return SymbolFacts.IsTracked(creation.Type) ? FreshOrigins : UnknownOrigins;
+                    return SymbolFacts.IsTracked(creation.Type) ? FreshAt(creation) : UnknownOrigins;
                 }
                 case IVariableDeclaratorOperation declaration when declaration.Initializer is { } initializer:
                 {
@@ -322,6 +424,7 @@ internal static class MethodOriginAnalysis
                     var targets = Targets(assignment.Target, state, depth + 1);
                     var value = Evaluate(assignment.Value, state, depth + 1);
                     if (assignment.Target is IPropertyReferenceOperation) InvalidateCapturedStorage(state);
+                    if (assignment.Target is IPropertyReferenceOperation or IArrayElementReferenceOperation or IFieldReferenceOperation) Fault(state);
                     Write(targets, value, state);
                     return value;
                 }
@@ -337,7 +440,7 @@ internal static class MethodOriginAnalysis
                 {
                     var targets = Targets(increment.Target, state, depth + 1);
                     var original = ReadTargets(targets, state);
-                    if (increment.OperatorMethod is not null) InvalidateCapturedStorage(state);
+                    if (increment.OperatorMethod is not null) { InvalidateCapturedStorage(state); Fault(state); }
                     Write(targets, UnknownOrigins, state);
                     return increment.IsPostfix ? original : UnknownOrigins;
                 }
@@ -372,36 +475,60 @@ internal static class MethodOriginAnalysis
                 {
                     var value = Evaluate(awaited.Operation, state, depth + 1);
                     InvalidateCapturedStorage(state);
+                    Fault(state);
                     return asyncResults.IsAwaitable(awaited.Operation.Type) ? Payload(value, state) : UnknownOrigins;
                 }
                 case IInvocationOperation invocation:
                 {
                     var receiver = invocation.Instance is { } instance ? Evaluate(instance, state, depth + 1) : UnknownOrigins;
                     var effect = summary(invocation.TargetMethod);
-                    var arguments = EvaluateCallArguments(invocation.Arguments, effect, state, depth + 1);
-                    if (invocation.TargetMethod.ReturnsByRef || invocation.TargetMethod.ReturnsByRefReadonly) { opaque = true; return UnknownOrigins; }
+                    var arguments = EvaluateCallArguments(invocation.Arguments, effect, state, depth + 1, out var references);
+                    if (SymbolFacts.IsDispose(invocation.TargetMethod) || SymbolFacts.IsDisposeAsync(invocation.TargetMethod))
+                        InvalidateOrigins(receiver, state, disposed: true);
+                    foreach (var parameter in invocation.TargetMethod.Parameters)
+                        if ((effect.DisposedParameters.Contains(parameter.Ordinal) || parameter.RefKind != RefKind.Out && (SymbolFacts.HasAttribute(parameter, "Consumes") || SymbolFacts.HasAttribute(parameter, "Owned"))) &&
+                            arguments.TryGetValue(parameter.Ordinal, out var consumed)) InvalidateOrigins(consumed, state);
+                    CallFault(invocation.Arguments, references, state);
+                    if (invocation.TargetMethod.ReturnsByRef || invocation.TargetMethod.ReturnsByRefReadonly)
+                        return ReferenceResult(invocation, effect, references, state);
                     return CallResult(invocation, invocation.TargetMethod, effect, receiver, arguments, state);
                 }
                 case IPropertyReferenceOperation property when property.Property.GetMethod is { } getter:
                 {
                     var receiver = property.Instance is { } instance ? Evaluate(instance, state, depth + 1) : UnknownOrigins;
                     var effect = summary(getter);
-                    var arguments = EvaluateCallArguments(property.Arguments, effect, state, depth + 1);
-                    if (getter.ReturnsByRef || getter.ReturnsByRefReadonly) { opaque = true; return UnknownOrigins; }
+                    var arguments = EvaluateCallArguments(property.Arguments, effect, state, depth + 1, out var references);
+                    CallFault(property.Arguments, references, state);
+                    if (getter.ReturnsByRef || getter.ReturnsByRefReadonly) return ReferenceResult(property, effect, references, state);
                     return CallResult(property, getter, effect, receiver, arguments, state);
                 }
                 case IUnaryOperation unary:
                     Evaluate(unary.Operand, state, depth + 1);
-                    if (unary.OperatorMethod is not null) InvalidateCapturedStorage(state);
+                    if (unary.OperatorMethod is not null) { InvalidateCapturedStorage(state); Fault(state); }
                     return UnknownOrigins;
                 case IBinaryOperation binary:
                     Evaluate(binary.LeftOperand, state, depth + 1); Evaluate(binary.RightOperand, state, depth + 1);
-                    if (binary.OperatorMethod is not null) InvalidateCapturedStorage(state);
+                    if (binary.OperatorMethod is not null) { InvalidateCapturedStorage(state); Fault(state); }
+                    else if (binary.IsChecked || binary.OperatorKind is BinaryOperatorKind.Divide or BinaryOperatorKind.Remainder) Fault(state);
                     return UnknownOrigins;
                 case IEventAssignmentOperation eventAssignment:
                     Evaluate(eventAssignment.EventReference, state, depth + 1);
                     Evaluate(eventAssignment.HandlerValue, state, depth + 1);
                     InvalidateCapturedStorage(state);
+                    Fault(state);
+                    return UnknownOrigins;
+                case IFieldReferenceOperation field:
+                    if (field.Instance is { } fieldInstance) Evaluate(fieldInstance, state, depth + 1);
+                    Fault(state);
+                    return UnknownOrigins;
+                case IArrayElementReferenceOperation element:
+                    Evaluate(element.ArrayReference, state, depth + 1);
+                    foreach (var index in element.Indices) Evaluate(index, state, depth + 1);
+                    Fault(state);
+                    return UnknownOrigins;
+                case IArrayCreationOperation array:
+                    foreach (var child in array.ChildOperations) Evaluate(child, state, depth + 1);
+                    Fault(state);
                     return UnknownOrigins;
                 case IDynamicInvocationOperation or IDynamicObjectCreationOperation or IDynamicMemberReferenceOperation or
                     IDynamicIndexerAccessOperation or IFunctionPointerInvocationOperation or IAddressOfOperation:
@@ -416,6 +543,15 @@ internal static class MethodOriginAnalysis
         private ImmutableHashSet<string> CallResult(IOperation operation, IMethodSymbol callee, MethodSummary effect,
             ImmutableHashSet<string> receiver, Dictionary<int, ImmutableHashSet<string>> arguments, State state)
         {
+            if (callee.ContainingType.ToDisplayString() == "SafeSharp.Ownership" && callee.Name == "Move" && arguments.TryGetValue(0, out var transferred))
+            {
+                var moved = FreshAt(operation);
+                var token = moved.Single();
+                var resources = ResourceOrigins(transferred);
+                movedOrigins[token] = movedOrigins.TryGetValue(token, out var previous) ? previous.Union(resources) : resources;
+                if (state.DisposedOrigins.Overlaps(resources)) state.InvalidOrigins.Add(token);
+                return moved;
+            }
             switch (asyncResults.Classify(callee))
             {
                 case AsyncResultOriginOperation.WrapArgument:
@@ -423,8 +559,20 @@ internal static class MethodOriginAnalysis
                 case AsyncResultOriginOperation.PreserveReceiver: return receiver;
                 case AsyncResultOriginOperation.UnwrapReceiver: return Payload(receiver, state);
             }
+            if (!effect.ReturnOrigins.IsEmpty)
+            {
+                var result = EmptyOrigins;
+                foreach (var origin in effect.ReturnOrigins)
+                {
+                    var payload = origin.Source == Fresh ? FreshAt(operation) : origin.Source == Receiver ? receiver :
+                        origin.Source == Null ? NullOrigins : arguments.FirstOrDefault(pair => Parameter(pair.Key) == origin.Source).Value ?? UnknownOrigins;
+                    for (var layer = 0; layer < origin.PayloadDepth; layer++) payload = Carrier(operation, payload, state, layer);
+                    result = result.Union(payload);
+                }
+                return result.IsEmpty ? UnknownOrigins : result;
+            }
             if (effect.ReturnsOwned) return effect.ReturnsAsyncPayload && asyncResults.IsCarrier(callee.ReturnType)
-                ? Carrier(operation, FreshOrigins, state) : FreshOrigins;
+                ? Carrier(operation, FreshAt(operation), state) : FreshAt(operation);
             var origins = ImmutableHashSet.CreateBuilder<string>(StringComparer.Ordinal);
             foreach (var source in effect.BorrowedSources)
             {
@@ -440,14 +588,43 @@ internal static class MethodOriginAnalysis
             return effect.ReturnsAsyncPayload && asyncResults.IsCarrier(callee.ReturnType) ? Carrier(operation, value, state) : value;
         }
 
-        private ImmutableHashSet<string> Carrier(IOperation operation, ImmutableHashSet<string> payload, State state)
+        private ImmutableHashSet<string> ReferenceResult(IOperation operation, MethodSummary effect,
+            Dictionary<int, ImmutableHashSet<int>> references, State state)
+        {
+            var result = ImmutableHashSet<int>.Empty;
+            if (effect.ReferenceReturn is not { } returned) result = UnknownTargets;
+            else
+            {
+                foreach (var ordinal in returned.ParameterOrdinals)
+                    result = result.Union(references.TryGetValue(ordinal, out var targets) ? targets : UnknownTargets);
+                if (returned.IncludesExternalStorage) result = result.Union(ExternalTargets);
+                if (returned.IncludesUnknownStorage) result = result.Union(UnknownTargets);
+            }
+            if (result.IsEmpty) result = UnknownTargets;
+            state.CaptureTargets[ReferenceCallSlot(operation)] = result;
+            return ReadTargets(result, state);
+        }
+
+        private void CallFault(ImmutableArray<IArgumentOperation> arguments, Dictionary<int, ImmutableHashSet<int>> references, State state)
+        {
+            if (router is null || currentContext is null || !router.HasExceptionalTarget(currentContext)) return;
+            var exceptional = state.Clone();
+            // Normal out postconditions do not hold if a call throws after partially writing its
+            // arguments. Locations are the snapshots captured before evaluating later arguments.
+            foreach (var argument in arguments)
+                if (argument.Parameter is { RefKind: RefKind.Ref or RefKind.Out } parameter && references.TryGetValue(parameter.Ordinal, out var targets))
+                    Write(targets, UnknownOrigins, exceptional);
+            Fault(exceptional);
+        }
+
+        private ImmutableHashSet<string> Carrier(IOperation operation, ImmutableHashSet<string> payload, State state, int layer = 0)
         {
             if (!Step(payload.Count + 1)) return UnknownOrigins;
-            if (!carrierSites.TryGetValue(operation, out var slot))
+            if (!carrierSites.TryGetValue((operation, layer), out var slot))
             {
                 slot = carrierSites.Count;
                 var token = "$carrier:" + slot;
-                carrierSites.Add(operation, slot); carrierTokens.Add(token, slot); carrierOrigins.Add(Origin(token));
+                carrierSites.Add((operation, layer), slot); carrierTokens.Add(token, slot); carrierOrigins.Add(Origin(token));
             }
             // A prior loop iteration's carrier can still be reachable through another local.
             // Preserve every possible payload for this allocation site instead of overwriting it.
@@ -499,10 +676,16 @@ internal static class MethodOriginAnalysis
                     return first.Union(second);
                 }
                 case IFieldReferenceOperation field:
-                    if (evaluate && field.Instance is { } fieldInstance) Evaluate(fieldInstance, state, depth + 1);
+                    if (evaluate)
+                    {
+                        if (field.Instance is { } fieldInstance) Evaluate(fieldInstance, state, depth + 1);
+                        Fault(state);
+                    }
                     return ExternalTargets;
+                case IPropertyReferenceOperation property when property.Property.ReturnsByRef || property.Property.ReturnsByRefReadonly:
+                    if (evaluate) Evaluate(property, state, depth + 1);
+                    return state.CaptureTargets.TryGetValue(ReferenceCallSlot(property), out var propertyTargets) ? propertyTargets : UnknownTargets;
                 case IPropertyReferenceOperation property:
-                    if (property.Property.ReturnsByRef || property.Property.ReturnsByRefReadonly) opaque = true;
                     if (evaluate)
                     {
                         if (property.Instance is { } propertyInstance) Evaluate(propertyInstance, state, depth + 1);
@@ -514,10 +697,12 @@ internal static class MethodOriginAnalysis
                     {
                         Evaluate(element.ArrayReference, state, depth + 1);
                         foreach (var index in element.Indices) Evaluate(index, state, depth + 1);
+                        Fault(state);
                     }
                     return ExternalTargets;
                 case IInvocationOperation { TargetMethod.ReturnsByRef: true } or IInvocationOperation { TargetMethod.ReturnsByRefReadonly: true }:
-                    opaque = true; return UnknownTargets;
+                    if (evaluate) Evaluate(operation, state, depth + 1);
+                    return state.CaptureTargets.TryGetValue(ReferenceCallSlot(operation), out var callTargets) ? callTargets : UnknownTargets;
                 default:
                     if (evaluate) Evaluate(operation, state, depth + 1);
                     return UnknownTargets;
@@ -538,6 +723,7 @@ internal static class MethodOriginAnalysis
         {
             if (targets.Contains(UnknownStorage)) { opaque = true; return; }
             var direct = targets.Count == 1;
+            state.WrittenStorage.UnionWith(targets);
             foreach (var target in targets)
             {
                 if (!Step()) return;
@@ -550,43 +736,63 @@ internal static class MethodOriginAnalysis
                     // Different C# ref/in/out formals may denote the same caller storage. A write
                     // definitely replaces its selected formal and may replace all other formals.
                     if (targets.Contains(target)) continue;
+                    state.WrittenStorage.Add(target);
                     state.Values[target] = value.Union(state.Values.TryGetValue(target, out var prior) ? prior : UnknownOrigins);
                 }
         }
 
         private Dictionary<int, ImmutableHashSet<string>> EvaluateCallArguments(ImmutableArray<IArgumentOperation> arguments,
-            MethodSummary effect, State state, int depth)
+            MethodSummary effect, State state, int depth, out Dictionary<int, ImmutableHashSet<int>> references)
         {
             var values = new Dictionary<int, ImmutableHashSet<string>>();
-            var references = new Dictionary<int, ImmutableHashSet<int>>();
+            references = new Dictionary<int, ImmutableHashSet<int>>();
+            foreach (var argument in arguments)
+            {
+                var ordinal = argument.Parameter?.Ordinal ?? -1;
+                if (argument.Parameter is { RefKind: not RefKind.None } && IsAddressable(argument.Value))
+                    references[ordinal] = Targets(argument.Value, state, depth + 1);
+                else values[ordinal] = Evaluate(argument.Value, state, depth + 1);
+            }
+            InvalidateCapturedStorage(state);
+            // Addresses are selected left-to-right. Their incoming values are read when the call
+            // starts, after all argument expressions have run, and before any output is installed.
+            foreach (var pair in references) values[pair.Key] = ReadTargets(pair.Value, state);
             var writes = new Dictionary<int, ImmutableHashSet<string>>();
             var definite = new HashSet<int>();
             foreach (var argument in arguments)
             {
-                var ordinal = argument.Parameter?.Ordinal ?? -1;
-                if (argument.Parameter is { RefKind: not RefKind.None } parameter && IsAddressable(argument.Value))
+                if (argument.Parameter is not { RefKind: RefKind.Ref or RefKind.Out } parameter ||
+                    effect.PreservedRefParameters.Contains(parameter.Ordinal) || !references.TryGetValue(parameter.Ordinal, out var targets)) continue;
+                var replacement = UnknownOrigins;
+                if (effect.OwnedOutputParameters.TryGetValue(parameter.Ordinal, out var nullable))
                 {
-                    var targets = Targets(argument.Value, state, depth + 1);
-                    references[ordinal] = targets;
-                    if (parameter.RefKind is RefKind.Out or RefKind.Ref)
-                    {
-                        var replacement = effect.OwnedOutputParameters.TryGetValue(ordinal, out var nullable) ? FreshOrigins : UnknownOrigins;
-                        if (nullable) replacement = replacement.Add(Null);
-                        AddWrites(targets, replacement, writes, definite);
-                    }
+                    replacement = FreshAt(argument);
+                    if (nullable) replacement = replacement.Add(Null);
                 }
-                else values[ordinal] = Evaluate(argument.Value, state, depth + 1);
+                else if (effect.ReferenceOutputs.TryGetValue(parameter.Ordinal, out var output))
+                {
+                    replacement = EmptyOrigins;
+                    foreach (var origin in output)
+                    {
+                        if (origin == Null) replacement = replacement.Add(Null);
+                        else if (origin.StartsWith("$parameter:", StringComparison.Ordinal) &&
+                            int.TryParse(origin.Substring(11), out var source) && values.TryGetValue(source, out var value))
+                            replacement = replacement.Union(value);
+                        else replacement = replacement.Add(Unknown);
+                    }
+                    if (replacement.IsEmpty) replacement = UnknownOrigins;
+                }
+                AddWrites(targets, replacement, writes, definite);
             }
-            InvalidateCapturedStorage(state);
             // Apply normal-return postconditions together. The order of formal parameters says
             // nothing about a callee's write order when several ref/out actuals share storage.
             foreach (var pair in writes)
             {
                 if (!Step()) break;
+                state.WrittenStorage.Add(pair.Key);
                 state.Values[pair.Key] = definite.Contains(pair.Key) ? pair.Value :
                     pair.Value.Union(state.Values.TryGetValue(pair.Key, out var previous) ? previous : UnknownOrigins);
             }
-            foreach (var pair in references) values[pair.Key] = ReadTargets(pair.Value, state);
             return values;
         }
 
@@ -616,6 +822,15 @@ internal static class MethodOriginAnalysis
             var changed = JoinMap(target.Values, incoming.Values, UnknownOrigins);
             changed |= JoinMap(target.References, incoming.References, UnknownTargets);
             changed |= JoinMap(target.CaptureTargets, incoming.CaptureTargets, UnknownTargets);
+            var writtenCount = target.WrittenStorage.Count;
+            target.WrittenStorage.UnionWith(incoming.WrittenStorage);
+            changed |= target.WrittenStorage.Count != writtenCount;
+            var invalidCount = target.InvalidOrigins.Count;
+            target.InvalidOrigins.UnionWith(incoming.InvalidOrigins);
+            changed |= target.InvalidOrigins.Count != invalidCount;
+            var disposedCount = target.DisposedOrigins.Count;
+            target.DisposedOrigins.UnionWith(incoming.DisposedOrigins);
+            changed |= target.DisposedOrigins.Count != disposedCount;
             // A payload entry absent on one predecessor represents an absent allocation site,
             // not an unknown payload on the carriers which exist on the other predecessor.
             changed |= JoinMap(target.Payloads, incoming.Payloads, EmptyOrigins);
@@ -671,6 +886,14 @@ internal static class MethodOriginAnalysis
                     if (operation is IAnonymousFunctionOperation or ILocalFunctionOperation) continue;
                     if (item.Nested)
                     {
+                        if (operation is IInvocationOperation nestedCall)
+                        {
+                            var target = nestedCall.TargetMethod;
+                            capturedMayInvalidateResources |= SymbolFacts.IsDispose(target) || SymbolFacts.IsDisposeAsync(target) ||
+                                target.MethodKind == MethodKind.DelegateInvoke || target.Parameters.Any(parameter => parameter.RefKind != RefKind.Out &&
+                                    (SymbolFacts.HasAttribute(parameter, "Consumes") || SymbolFacts.HasAttribute(parameter, "Owned"))) ||
+                                !summary(target).DisposedParameters.IsEmpty;
+                        }
                         var symbol = operation switch
                         {
                             ILocalReferenceOperation local => (ISymbol)local.Local,
@@ -691,7 +914,11 @@ internal static class MethodOriginAnalysis
             // Until callback mutation summaries exist, an executable call/suspension invalidates
             // captured cells while already-evaluated argument/receiver snapshots remain intact.
             foreach (var slot in capturedStorage)
-                if (state.Values.ContainsKey(slot)) state.Values[slot] = UnknownOrigins;
+                if (state.Values.TryGetValue(slot, out var captured))
+                {
+                    if (capturedMayInvalidateResources) InvalidateOrigins(captured, state, disposed: true);
+                    state.Values[slot] = UnknownOrigins;
+                }
         }
     }
 }

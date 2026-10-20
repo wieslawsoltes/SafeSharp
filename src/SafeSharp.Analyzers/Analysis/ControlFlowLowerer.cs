@@ -137,7 +137,19 @@ internal static class ControlFlowLowerer
                     if ((instruction.Flags & InstructionFlags.MayThrow) == 0 || !HasExceptionalTarget(context, block.EnclosingRegion)) continue;
                     successors.Add(Intern(context.Ordinal, context.Continuation, context.Returning, context.Exceptional,
                         context.ImplicitException, context.Filter, index + 1, context.ReturnSite).Id);
-                    AddExceptionSuccessors(context, block, true, null, false, successors);
+                    if ((instruction.Flags & InstructionFlags.InvalidatesAggregateReferenceOnThrow) != 0 && instruction.Source is { } written)
+                    {
+                        var exceptionalSuccessors = new List<int>();
+                        AddExceptionSuccessors(context, block, true, null, false, exceptionalSuccessors);
+                        var exceptional = NextId();
+                        _blocks.Add(new FlowBlock(exceptional, new[] {
+                            new FlowInstruction(InstructionKind.InvalidateAggregateReference, instruction.Site, source: written,
+                                description: "a throwing call may already have replaced its writable array elements"),
+                            new FlowInstruction(InstructionKind.ReleaseReference, instruction.Site, target: written)
+                        }, exceptionalSuccessors));
+                        successors.Add(exceptional);
+                    }
+                    else AddExceptionSuccessors(context, block, true, null, false, successors);
                     split = true;
                     break;
                 }

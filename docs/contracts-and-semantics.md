@@ -1,14 +1,14 @@
 # Ownership contracts and semantic analysis
 
-SafeSharp has **five complementary analyzers and 39 implemented diagnostic rules**. All run as Roslyn diagnostics while the compiler analyzes C#.
+SafeSharp has **five complementary analyzers and 42 implemented diagnostic rules**. All run as Roslyn diagnostics while the compiler analyzes C#.
 
 | Analyzer | Responsibility | Descriptor category |
 | --- | --- | --- |
-| `OwnershipAnalyzer` | Resource identities, moves, loans, liveness, disposal, async completion, and control-flow transitions. | `Ownership` |
+| `OwnershipAnalyzer` | Resource identities, reference storage, moves, loans, liveness, disposal, async composition/consumption and control-flow transitions. | `Ownership` |
 | `SafeSharpSemanticAnalyzer` | Aggregate normal-exit cleanup, declaration consistency, borrowed/callback escape, thread affinity, and dependency injection lifetimes. | `SafeSharp.Ownership` |
 | `BoundarySafetyAnalyzer` | Exception/disposal boundaries, inherited parameter ownership compatibility, and opt-in audits of unsafe operations and unknown factories. | `Ownership` |
-| `LifetimeContractAnalyzer` | Explicit named-region declarations, outlives solving, returned provenance, and inherited lifetime/return compatibility. | `SafeSharp.Lifetimes` |
-| `ConcurrencyContractAnalyzer` | Send/Sync composition, generic capability requirements, and captures at declared thread boundaries. | `SafeSharp.Ownership` |
+| `LifetimeContractAnalyzer` | Named/nested lifetime declarations, universe/type-bound solving, returned provenance, delegate conversion and inherited compatibility. | `SafeSharp.Lifetimes` |
+| `ConcurrencyContractAnalyzer` | Send/Sync composition, generic requirements, thread-boundary captures and guarded-access/lock protocols. | `SafeSharp.Ownership` |
 
 The [diagnostic reference](diagnostics.md) provides every rule, its default severity, trigger, and remediation. [Implementation status](implementation-status.md) distinguishes the implemented model from remaining language and library boundaries. `SafeSharpAnalyzerCatalog.Create()` supplies the full analyzer set for a custom Roslyn host.
 
@@ -27,7 +27,9 @@ All contracts live in namespace `SafeSharp`. Analyzer matching resolves the actu
 | `ReturnsOwned` | Method, property | The caller receives ownership of the result. |
 | `ReturnsBorrowed("parameter", mutable: false)` | Method, property | The returned loan is bounded by the named argument's lifetime. `"this"` selects an instance receiver. |
 | `Lifetime("a")` | Parameter, return value | Names the method-scoped borrowed lifetime supplied by an input or promised by a result. |
-| `Outlives("a", "b")` | Method; repeatable | Requires region `a` to remain valid for at least the duration promised by region `b`. |
+| `Outlives("a", "b")` | Method, delegate; repeatable | Requires region `a` to outlive `b`; optional Scope selects an introduced nested callable binder. |
+| `TypeLifetime("a", "arg0")` | Parameter, return value; repeatable | Names borrowed contents at an explicit type path; nested callable paths open binders and `^` names refer to an outer binder. |
+| `TypeOutlives("T", "a")` | Method, delegate; repeatable | Requires a generic type parameter's represented contents to outlive a region; optional Scope selects a nested binder. |
 | `Mutates` | Instance method | The method mutates its receiver. |
 | `DoesNotEscape` | Parameter | The callee must not retain, return, or explicitly transfer ownership of the argument. |
 | `MustUse` | Method, class, struct | An expression-statement result must be used or explicitly discarded. |
@@ -38,6 +40,8 @@ All contracts live in namespace `SafeSharp`. Analyzer matching resolves the actu
 | `Sync` | Class, struct, interface, generic parameter | Declares structural suitability for shared access across threads. |
 | `TransfersToThread` | Delegate-typed parameter | Declares an exclusive transfer boundary for callback captures; requires Send and ownership transfer. |
 | `SharesAcrossThreads` | Delegate-typed parameter | Declares a shared callback boundary; requires Sync and stable captured storage. |
+| `GuardedBy("gate")` | Field, property, return value; repeatable | Access to represented guarded storage/reference requires the matching stable guard capability. |
+| `RequiresLock("gate", LockAccess.Write)` | Method, constructor, delegate; repeatable | Declares a guard precondition, assumed in the body and required at callers; it does not acquire a lock. |
 | `ServiceLifetime(Transient/Scoped/Singleton)` | Class, interface | A service lifetime known without a dependency on a specific DI library. |
 
 Thread-affinity and thread-safety contracts propagate through base types and generic type constraints. They describe access capabilities and must not be placed together on the same effective type. Send and Sync promises additionally apply through annotated interfaces; source implementations are checked against inherited structure. Send and Sync are independent: immutable sharing and exclusive transfer are different requirements, and ThreadSafe remains a trusted synchronization assertion.
@@ -85,7 +89,7 @@ The region `owner` must outlive `view`. Names are scoped to the signature, repea
 
 The reusable `SafeSharp.Core.Regions` solver produces deterministic implications, components, and original-constraint proof paths. `LifetimeContractAnalyzer` checks actual returned origins over CFG assignments, aliases, branches, loops, supported calls, and conservative invalidation of replaced or unknown storage. All possible returned sources must satisfy the promised region, including when several inputs supply a result. A fresh local owner cannot establish an external borrowed lifetime, and an unknown source does not become valid merely because another branch is valid.
 
-SS0040 validates declarations; SS0041 checks returned provenance and named-source promises; SS0042 checks interface/override compatibility; SS0043 reports an incomplete solve or flow analysis; SS0047 checks annotated delegate conversions with one universal binder, input shortening, result covariance and writable-slot invariance. These are explicit method-region proofs rather than Rust's complete higher-ranked type/lifetime system. See [lifetime-region contracts and APIs](lifetime-regions.md), [delegate lifetime contracts](lifetime-delegates.md), [region graphs in reports](advanced-engine.md#declared-lifetime-region-graphs), and the [implementation matrix](implementation-status.md).
+SS0040 validates declarations; SS0041 checks returned provenance and named-source promises; SS0042 checks interface/override compatibility; SS0043 reports an incomplete solve or flow analysis; SS0047 checks annotated delegate conversions. TypeLifetime paths add nested callable binders, explicit outer captures, declared generic variance and array/ref invariance. TypeOutlives and scoped Outlives encode supported explicit/implied obligations. Universe visibility and placeholder leak checks reject an outer capture generalized into an independent inner lifetime. These remain explicit signature contracts, not automatic proofs of arbitrary nested object contents or a complete Rust trait/type system. See [lifetime-region contracts and APIs](lifetime-regions.md), [delegate contracts](lifetime-delegates.md), [type lifetime contracts](type-lifetimes.md), [higher-ranked regions](higher-ranked-regions.md), and the [implementation matrix](implementation-status.md).
 
 ## Async cleanup and deferred completion
 
@@ -100,6 +104,8 @@ await alias.ConfigureAwait(false);
 SS0031 diagnoses a directly dropped disposal expression, including a direct discard or discarded configured awaitable. SS0017 follows the completion itself through supported locals, aliases, branches, overwrites, loops, and returns; storing the completion in an unused local does not establish observation. Await, recognized parameterless synchronous completion operations, and appropriately declared transfer boundaries account for the obligation. Timeout/cancellation waits, reading IsCompleted, and disposing the Task are not unconditional observation.
 
 A synchronous throw before the awaitable is returned creates no completion obligation. Awaiting an asynchronously faulted completion still observes it. This checks the release/observation protocol, not whether a throwing cleanup implementation released every physical resource. See [advanced async ownership](advanced-engine.md#asynchronous-disposal-completion), [SS0017](diagnostics.md#ss0017), and [SS0031](diagnostics.md#ss0031).
+
+ValueTask result/cleanup observation also participates in a separate single-consumption domain. SS0048 diagnoses reuse of the original capability after consumption or transfer; retain the modeled reusable result of AsTask/Preserve when repeated observation is intended. Nested carrier ownership, selected custom awaiter contracts and represented framework compositions are documented in [ValueTask consumption](value-task-consumption.md), [nested async ownership](nested-async-ownership.md), and [task composition](async-task-composition.md).
 
 ## Explicit transfer and sharing boundaries
 
@@ -285,3 +291,9 @@ The implementation is an original C#/Roslyn implementation informed by primary R
 - [.NET dependency injection](https://learn.microsoft.com/en-us/dotnet/core/extensions/dependency-injection/overview): constructor resolution and captive scoped dependencies.
 
 Reflection, dynamic dispatch without contracts, unmodeled native code, unsafe pointer access, arbitrary external library behavior, and user-suppressed diagnostics can bypass these checks. These are capability boundaries of this analyzer, not language-level restrictions. The test suite asserts both violating and accepted programs, exact diagnostic spans, symbol identity, inherited cleanup/lifetime/concurrency contracts, branch and loop obligations, pending completion states, factory versus constructor registration behavior, generic graph substitution, and deterministic concurrent execution. Use the [diagnostic catalog](diagnostics.md), [lifetime model](lifetime-regions.md), [aggregate/concurrency model](aggregate-concurrency.md), [advanced protocols](advanced-engine.md), and [implementation status](implementation-status.md) together when deciding which guarantee a clean result establishes.
+
+## Guarded access and lock preconditions
+
+GuardedBy and RequiresLock attach explicit access obligations to stable receiver/parameter/field paths. The concurrency analyzer checks the corresponding Monitor, System.Threading.Lock or ReaderWriterLockSlim capability and access mode in sequential control flow. Access under a different object's guard cannot satisfy the contract. RequiresLock supplies an assumed precondition for its body and a requirement for callers; it adds no runtime acquisition. SS0049 reports invalid declarations, missing capabilities and supported protocol violations; SS0046 reports incomplete guard analysis.
+
+These checks complement Send/Sync composition. GuardedBy does not relax the existing Sync requirement for readonly/init-only storage with shareable components or an explicit trusted ThreadSafe contract. Guard analysis does not establish general race freedom, deadlock freedom or atomic memory ordering. See [synchronization analysis](synchronization-analysis.md) for exact declaration rules, modeled APIs, aliases, exception/cleanup behavior, inheritance, evidence and limitations.

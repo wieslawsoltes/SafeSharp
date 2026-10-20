@@ -44,3 +44,6 @@ SS0044 | SafeSharp.Ownership | Warning | Invalid concurrency contract
 SS0045 | SafeSharp.Ownership | Warning | Unsafe concurrent capture
 SS0046 | SafeSharp.Ownership | Info | Concurrency, cleanup or borrowed escape analysis incomplete
 SS0047 | SafeSharp.Lifetimes | Warning | Callback violates universally quantified delegate lifetime contract
+SS0048 | Ownership | Warning | ValueTask consumption protocol is not satisfied
+SS0049 | SafeSharp.Ownership | Warning | Synchronization guard is not established
+SS0050 | SafeSharp.Lifetimes | Warning | Direct call does not establish explicit type lifetime requirements

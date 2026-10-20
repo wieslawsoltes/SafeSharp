@@ -25,7 +25,9 @@ internal sealed class PlaceUniverse
             }
             if (instruction.Owner is not null) names.Add(instruction.Owner);
         }
-        Names = names.OrderBy(name => name, StringComparer.Ordinal).ToArray();
+        Names = names.ToArray();
+        // Sort the actual domain once; LINQ's indexed sort also allocates key/index buffers.
+        Array.Sort(Names, StringComparer.Ordinal);
         cancellationToken.ThrowIfCancellationRequested();
         indices = new Dictionary<string, int>(Names.Length, StringComparer.Ordinal);
         for (var index = 0; index < Names.Length; index++)

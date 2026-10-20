@@ -75,12 +75,15 @@ public sealed class HtmlReportWriter : IAnalysisReportWriter
             {
                 var witness = DependencyWitness.FromDiagnostic(diagnostic);
                 var regions = RegionWitness.FromDiagnostic(diagnostic);
+                var synchronization = SynchronizationWitness.FromDiagnostic(diagnostic);
                 writer.Write("<details class=\"evidence\"><summary>");
-                writer.Write(regions is not null ? "Lifetime region graph and diagnostic properties" :
+                writer.Write(synchronization is not null ? "Synchronization evidence and diagnostic properties" :
+                    regions is not null ? "Lifetime region graph and diagnostic properties" :
                     witness is null ? "Diagnostic properties" : "Service dependency witness and diagnostic properties");
                 writer.Write("</summary>");
                 if (witness is not null) WriteDependencyWitness(writer, witness);
                 if (regions is not null) HtmlRegionRenderer.Write(writer, regions, diagnosticIndex, cancellationToken);
+                if (synchronization is not null) SynchronizationGraphRenderer.WriteHtml(writer, synchronization, diagnosticIndex, cancellationToken);
                 TableStart(writer, "Compiler diagnostic metadata", "Property", "Value");
                 foreach (var property in diagnostic.Properties.OrderBy(property => property.Key, StringComparer.Ordinal))
                     Row(writer, property.Key, property.Value ?? "(null)");
@@ -195,7 +198,7 @@ public sealed class HtmlReportWriter : IAnalysisReportWriter
             Row(writer, resource.Id, resource.Kind + " / " + resource.Ownership, resource.Status.ToString(),
                 string.Join(", ", resource.OwnerResourceIds.OrderBy(id => id, StringComparer.Ordinal)) +
                 (resource.DisposedResourceIds.IsEmpty ? "" : "completion for: " + string.Join(", ", resource.DisposedResourceIds.OrderBy(id => id, StringComparer.Ordinal))) +
-                (resource.Kind == ResourceKind.AsyncFactoryCarrier ? " result: " + resource.ResultState +
+                (resource.Kind == ResourceKind.AsyncFactoryCarrier || resource.ResultState != AsyncResultState.None ? " result: " + resource.ResultState +
                     (resource.ProducedResourceIds.IsEmpty ? "" : " (" + string.Join(", ", resource.ProducedResourceIds) + ")") : ""));
         TableEnd(writer);
         TableStart(writer, "Places and aliases", "Place", "Resource", "Availability", "Loan / projection");
@@ -213,6 +216,30 @@ public sealed class HtmlReportWriter : IAnalysisReportWriter
                     (reference.MovedProjections.IsEmpty ? "" : "; moved: " + string.Join(", ", reference.MovedProjections.OrderBy(value => value, StringComparer.Ordinal))));
         }
         TableEnd(writer);
+        if (state.Resources.Any(resource => resource.AsyncComposition != AsyncCompositionKind.None))
+        {
+            TableStart(writer, "Asynchronous compositions", "Carrier", "Operation", "Captured dependencies", "Received result identities");
+            foreach (var resource in state.Resources.Where(resource => resource.AsyncComposition != AsyncCompositionKind.None))
+                Row(writer, resource.Id, resource.AsyncComposition.ToString(), string.Join(", ", resource.DependencyResourceIds),
+                    string.Join(", ", resource.ProducedResourceIds));
+            TableEnd(writer);
+        }
+        if (state.Resources.Any(resource => resource.Kind == ResourceKind.Aggregate))
+        {
+            TableStart(writer, "Aggregate element identities", "Aggregate", "Index", "Resources", "ValueTask capabilities");
+            foreach (var resource in state.Resources.Where(resource => resource.Kind == ResourceKind.Aggregate))
+            foreach (var element in resource.Elements)
+                Row(writer, resource.Id + (resource.SummarizesMultipleAggregates ? " (multiple allocations)" : ""), element.Index,
+                    string.Join(", ", element.ResourceIds), string.Join(", ", element.ValueTaskIds));
+            TableEnd(writer);
+        }
+        if (!state.ReferenceStorage.IsEmpty)
+        {
+            TableStart(writer, "Reference storage", "Reference", "Possible target locations");
+            foreach (var binding in state.ReferenceStorage)
+                Row(writer, binding.Reference, string.Join(", ", binding.Targets));
+            TableEnd(writer);
+        }
         TableStart(writer, "Live loans", "Loan", "Resource / projection", "Holder", "Kind / phase / parent");
         foreach (var loan in state.Loans.OrderBy(loan => loan.Id, StringComparer.Ordinal))
             Row(writer, loan.Id, loan.ResourceId + loan.Projection, loan.Holder,
@@ -220,6 +247,14 @@ public sealed class HtmlReportWriter : IAnalysisReportWriter
                 (loan.AllowsSuspension ? "; suspension allowed" : "") +
                 (loan.ActivationSites.IsEmpty ? "" : "; activation: " + string.Join(", ", loan.ActivationSites.Select(ReportText.Site))));
         TableEnd(writer);
+        if (!state.ValueTasks.IsEmpty)
+        {
+            TableStart(writer, "ValueTask consumption capabilities", "Capability", "State", "Aliases", "Acquisition / consumption evidence");
+            foreach (var valueTask in state.ValueTasks)
+                Row(writer, valueTask.Id, valueTask.State.ToString(), string.Join(", ", valueTask.Places),
+                    string.Join(", ", valueTask.EvidenceSites.Select(ReportText.Site)));
+            TableEnd(writer);
+        }
     }
 
     private static void Liveness(TextWriter writer, string title, IEnumerable<string> values)

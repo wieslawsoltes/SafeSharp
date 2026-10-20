@@ -103,11 +103,12 @@ Fresh ownership is inferred only when every possible non-null returned origin is
 
 Explicit extraction inside one analyzed body can follow more than one known layer. Each extraction removes one carrier layer, so `Task<Task<Resource>>` is not treated as though it were `Task<Resource>`.
 
-The method-summary contract currently exposes one result layer. It does not serialize an arbitrary nested carrier graph across a method boundary. When extracting one layer still leaves nested carrier identities, source inference does not collapse them into the eventual inner resource or advertise a fresh resource result. A subsequent boundary needs a supported one-layer summary or an explicit contract for the value it actually returns.
+The method-summary contract exports bounded terminal provenance together with its carrier depth. Parameter terminals preserve an existing carrier identity, while fresh terminals remain deferred until every required successful receive occurs. Null carriers and carriers containing null remain distinct. The maximum exported depth is 16; cyclic and unrepresentable graphs remain opaque rather than being flattened into a fresh resource. See [nested asynchronous ownership](nested-async-ownership.md).
 
 Further conservative boundaries remain:
 
 - An unknown task parameter, field, or producer has no inferred payload origin.
+- Direct framework Task combinators use the [composition domain](async-task-composition.md). Their dependency and cancellation semantics are not flattened into terminal-depth method summaries.
 - A `ValueTask<T>` backed by an unmodeled `IValueTaskSource<T>` has no inferred payload origin.
 - Custom awaitables and user-defined lookalikes require supported contracts; their `GetAwaiter` names do not establish framework behavior.
 - Handler-bearing bodies, writable effects, ref-returned storage, and opaque callback mutations retain the limits described in [Source origin summaries](source-origin-summaries.md).
