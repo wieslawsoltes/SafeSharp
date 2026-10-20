@@ -69,8 +69,10 @@ for path in sorted(root.glob("*.nupkg")):
                     dependency.attrib["id"]: dependency.attrib.get("version", "")
                     for dependency in group.findall("{*}dependency")}
                     for group in metadata.findall(".//{*}dependencies/{*}group")}
-                if groups.get(".NETStandard2.0", {}).get("System.Collections.Immutable") != "9.0.0":
-                    raise SystemExit(identity + ": .NETStandard2.0 must preserve its Immutable 9.0.0 dependency contract")
+                # This servicing package retains the Immutable 9.0.0.0 API identity;
+                # the package host independently checks the bundled Core assembly references.
+                if groups.get(".NETStandard2.0", {}).get("System.Collections.Immutable") != "9.0.21":
+                    raise SystemExit(identity + ": .NETStandard2.0 must preserve its Immutable 9.0.21 dependency contract")
                 # .NET 10 prunes framework-provided references from the nuspec.
                 # An explicit native group is still required to prevent NuGet
                 # from falling back to the .NET Standard dependency group.
