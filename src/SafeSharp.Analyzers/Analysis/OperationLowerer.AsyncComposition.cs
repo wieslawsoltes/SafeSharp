@@ -1,5 +1,6 @@
 using System.Globalization;
 using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Operations;
 using SafeSharp.Core;
 
@@ -148,6 +149,9 @@ internal sealed partial class OperationLowerer
         var owner = SnapshotCallValue(Evaluate(element.ArrayReference, false), element, "array");
         foreach (var index in element.Indices) Evaluate(index);
         if (owner is not null) Add(InstructionKind.Read, element, source: owner);
+        // CFG captures may evaluate a conditional ref's element before binding its address.
+        // Only actual address syntax takes this conservative path; by-value captures stay exact.
+        if (IsArrayElementAddressSyntax(element)) InvalidateArrayElementAddress(element, owner);
         MarkMayThrow(element);
         if (!TracksOwnershipValue(element.Type)) return ReleaseReceiverSnapshot(owner, element, null);
         var target = Temporary(element);
@@ -157,6 +161,20 @@ internal sealed partial class OperationLowerer
         if (read) Add(InstructionKind.Read, element, source: target);
         target = TrackProducedValueTask(element, target, preserveExisting: true)!;
         return ReleaseReceiverSnapshot(owner, element, target);
+    }
+
+    private void InvalidateArrayElementAddress(IArrayElementReferenceOperation element, string? owner)
+    {
+        if (owner is not null && TracksOwnershipValue(element.Type))
+            Add(InstructionKind.InvalidateAggregateContents, element, source: owner,
+                description: "retain possible original elements when their storage escapes the canonical array cache through a reference");
+    }
+
+    private static bool IsArrayElementAddressSyntax(IArrayElementReferenceOperation element)
+    {
+        var syntax = element.Syntax;
+        while (syntax.Parent is ParenthesizedExpressionSyntax parenthesized) syntax = parenthesized;
+        return syntax.Parent is RefExpressionSyntax || syntax.Parent is ArgumentSyntax argument && argument.RefKindKeyword.RawKind != 0;
     }
 
     private string? AssignArrayElement(ISimpleAssignmentOperation assignment, IArrayElementReferenceOperation element)

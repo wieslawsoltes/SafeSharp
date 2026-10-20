@@ -82,6 +82,16 @@ public sealed class AggregateElementSnapshot
 
 public sealed class ResourceSnapshot
 {
+    // Preserve the original signature for friend assemblies without widening its accessibility.
+    internal ResourceSnapshot(string id, ResourceOwnership ownership, ResourceStatus status,
+        SourceSite origin, ImmutableArray<string> ownerResourceIds, ResourceKind kind,
+        ImmutableArray<string> disposedResourceIds, AsyncResultState resultState,
+        ImmutableArray<string> producedResourceIds)
+        : this(id, ownership, status, origin, ownerResourceIds, kind, disposedResourceIds,
+            resultState, producedResourceIds, 1, AsyncCompositionKind.None, default, default, false)
+    {
+    }
+
     internal ResourceSnapshot(string id, ResourceOwnership ownership, ResourceStatus status,
         SourceSite origin, ImmutableArray<string> ownerResourceIds, ResourceKind kind = ResourceKind.Resource,
         ImmutableArray<string> disposedResourceIds = default, AsyncResultState resultState = AsyncResultState.None,
@@ -160,6 +170,13 @@ public sealed class LoanSnapshot
 
 public sealed class StateSnapshot
 {
+    // Preserve the original signature for friend assemblies without widening its accessibility.
+    internal StateSnapshot(ImmutableArray<PlaceSnapshot> places, ImmutableArray<ResourceSnapshot> resources,
+        ImmutableArray<LoanSnapshot> loans, bool isReachable)
+        : this(places, resources, loans, isReachable, default, default)
+    {
+    }
+
     internal StateSnapshot(ImmutableArray<PlaceSnapshot> places, ImmutableArray<ResourceSnapshot> resources,
         ImmutableArray<LoanSnapshot> loans, bool isReachable = true, ImmutableArray<ValueTaskSnapshot> valueTasks = default, ImmutableArray<ReferenceStorageSnapshot> referenceStorage = default)
     {

@@ -94,6 +94,15 @@ because their source is available: general array-element effect summaries remain
 a boundary. This conservative content invalidation does not infer arbitrary
 callee disposal, retention, or replacement ownership.
 
+Exposing an element's storage through `ref`, `out`, or an explicit `in` argument
+also weakens the represented contents. This includes conditional ref expressions
+lowered through CFG captures. Mutable element references currently use the general
+storage domain rather than a coherent canonical array cell, so a write through
+such a reference must not leave a stale exact cleanup proof in the array cache.
+Values copied before the address exposure and task inputs already captured by a
+composition keep their independent identities. Ordinary by-value conditional
+element reads retain their precision.
+
 ValueTask consumption capabilities also follow represented array elements and
 nested carrier caches. Copying a `ValueTask` out of the same element twice retains
 one capability, and returning an already consumed capability inside an aggregate
@@ -140,7 +149,8 @@ a limit reports `SS0015` rather than silently dropping dependencies.
   failed. It does not infer which individual tasks succeeded from an exception.
 - Unknown-index and external heap contents remain conservative. Precise mutable
   ref aliases into aggregate element caches and arbitrary container ownership
-  contracts require additional storage models. An unrepresented structural
+  contracts require additional storage models; exposing an element address is
+  conservatively invalidated until that integration exists. An unrepresented structural
   projection cannot reuse its enclosing aggregate's element or task-result cache.
 - Runtime readiness, races with concurrent array mutation, custom awaiter or
   builder internals, and scheduler behavior are not proven by this sequential
@@ -158,5 +168,7 @@ a limit reports `SS0015` rather than silently dropping dependencies.
   and [`Task.WaitAsync`](https://learn.microsoft.com/dotnet/api/system.threading.tasks.task.waitasync).
 - [C# 13 overload resolution prefers params span overloads](https://learn.microsoft.com/dotnet/core/compatibility/core-libraries/9.0/params-overloads)
   and [Roslyn collection-expression operations](https://learn.microsoft.com/dotnet/api/microsoft.codeanalysis.operations.icollectionexpressionoperation).
+- [.NET array queries and mutation APIs](https://learn.microsoft.com/dotnet/api/system.array),
+  including [`Initialize`](https://learn.microsoft.com/dotnet/api/system.array.initialize).
 - [.NET `ValueTask<TResult>` consumption contract](https://learn.microsoft.com/dotnet/api/system.threading.tasks.valuetask-1)
   and [C# `await` semantics](https://learn.microsoft.com/dotnet/csharp/language-reference/operators/await).

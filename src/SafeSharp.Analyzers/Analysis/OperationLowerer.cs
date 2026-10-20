@@ -370,6 +370,7 @@ internal sealed partial class OperationLowerer
             case IArrayElementReferenceOperation element:
             {
                 var owner = Evaluate(element.ArrayReference, false);
+                InvalidateArrayElementAddress(element, owner);
                 foreach (var index in element.Indices) Evaluate(index);
                 if (owner is not null && writeReceiver) Add(InstructionKind.Write, element, source: owner);
                 return owner is null ? null : owner + "[" + string.Join(",", element.Indices.Select(i => i.ConstantValue.HasValue ? i.ConstantValue.Value?.ToString() ?? "null" : "*")) + "]";

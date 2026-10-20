@@ -101,6 +101,15 @@ public enum InstructionFlags
 /// </summary>
 public sealed class FlowInstruction
 {
+    /// <summary>Preserves the original CLR constructor signature for previously compiled Core consumers.</summary>
+    public FlowInstruction(InstructionKind kind, SourceSite site, string? target,
+        string? source, string? resourceId, ResourceOwnership ownership, string? owner,
+        InstructionFlags flags, string? description)
+        : this(kind, site, target, source, resourceId, ownership, owner, flags, description,
+            1, AsyncCompositionKind.None, null)
+    {
+    }
+
     public FlowInstruction(InstructionKind kind, SourceSite site, string? target = null,
         string? source = null, string? resourceId = null,
         ResourceOwnership ownership = ResourceOwnership.Owned, string? owner = null,
