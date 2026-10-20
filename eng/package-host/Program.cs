@@ -63,7 +63,7 @@ var analyzers = reference.GetAnalyzers(LanguageNames.CSharp);
 Require(loadFailures.Count == 0 && !analyzers.IsEmpty,
     "Packaged analyzers did not load on Roslyn 4.14: " + string.Join("; ", loadFailures));
 var declaredRules = analyzers.SelectMany(analyzer => analyzer.SupportedDiagnostics).Select(rule => rule.Id).ToHashSet(StringComparer.Ordinal);
-Require(new[] { "SS0001", "SS0017", "SS0021", "SS0024", "SS0041", "SS0044", "SS0045", "SS0047", "SS0048", "SS0049" }.All(declaredRules.Contains),
+Require(new[] { "SS0001", "SS0017", "SS0021", "SS0024", "SS0041", "SS0044", "SS0045", "SS0047", "SS0048", "SS0049", "SS0050" }.All(declaredRules.Contains),
     "Packaged analyzer discovery lost an analyzer family.");
 
 var codeFixAssembly = loader.LoadFromPath(Path.GetFullPath(args[1]));
@@ -180,6 +180,9 @@ Require(repeated.Any(diagnostic => diagnostic.Id == "SS0001" &&
 // a plain object gate exercises Monitor without depending on System.Threading.Lock.
 var boundarySource = CSharpSyntaxTree.ParseText("""
     using System;
+    using System.Collections.Generic;
+    using System.IO;
+    using System.Threading;
     using System.Threading.Tasks;
     using SafeSharp;
     [return: TypeLifetime("fresh", "return")]
@@ -205,6 +208,22 @@ var boundarySource = CSharpSyntaxTree.ParseText("""
             _ = await task;
             _ = await task;
         }
+        static void RequireContents([TypeLifetime("item", "arg0")] List<object> values) { }
+        static void SafeCall([TypeLifetime("a", "arg0")] List<object> values) { RequireContents(values); }
+        static void UnknownCall(List<object> values) { RequireContents(values); }
+        static void SafeArrayReference()
+        {
+            var values = new[] { new MemoryStream() };
+            ref MemoryStream cell = ref values[0];
+            cell.Dispose();
+        }
+        static void DisposedArrayReference()
+        {
+            var values = new[] { new MemoryStream() };
+            ref MemoryStream cell = ref values[0];
+            cell.Dispose();
+            _ = values[0].Length;
+        }
     }
     sealed class GuardedCounter
     {
@@ -213,15 +232,37 @@ var boundarySource = CSharpSyntaxTree.ParseText("""
         public void Safe() { lock (gate) value++; }
         public void Unsafe() { value++; }
     }
+    sealed class GuardedAsyncCounter
+    {
+        private readonly SemaphoreSlim gate = new(1, 1);
+        [GuardedBy(nameof(gate))] private int value;
+        public async Task Safe()
+        {
+            await gate.WaitAsync().ConfigureAwait(false);
+            try { value++; await Task.Yield(); value++; }
+            finally { gate.Release(); }
+        }
+        public void Unsafe() { value++; }
+    }
     """, CSharpParseOptions.Default.WithLanguageVersion(LanguageVersion.CSharp13), "BoundaryContracts.cs");
 var boundaries = compilation.RemoveAllSyntaxTrees().AddSyntaxTrees(boundarySource);
 AssertCompiles(boundaries);
 var boundaryDiagnostics = await AnalyzeAsync(boundaries, analyzers);
-foreach (var method in new[] { "SafeCapture", "ReusableValueTask" })
+foreach (var method in new[] { "SafeCapture", "ReusableValueTask", "SafeCall", "SafeArrayReference" })
     Require(MethodDiagnostics(boundaries, boundaryDiagnostics, "BoundaryContracts", method).Length == 0,
         "Packaged Roslyn 4.14 analysis rejected the valid boundary fixture " + method + ".");
 Require(MethodDiagnostics(boundaries, boundaryDiagnostics, "GuardedCounter", "Safe").Length == 0,
     "Packaged Roslyn 4.14 analysis rejected access protected by its declared Monitor gate.");
+Require(MethodDiagnostics(boundaries, boundaryDiagnostics, "GuardedAsyncCounter", "Safe").Length == 0,
+    "Packaged Roslyn 4.14 analysis rejected a proven binary semaphore permit across suspension.");
+var directCall = MethodDiagnostics(boundaries, boundaryDiagnostics, "BoundaryContracts", "UnknownCall").Single();
+Require(directCall.Id == "SS0050" && directCall.AdditionalLocations.Count > 0 &&
+    new[] { "SafeSharp.CallTarget", "SafeSharp.CallReason", "SafeSharp.CallEvidence" }
+        .All(key => directCall.Properties.TryGetValue(key, out var value) && !string.IsNullOrWhiteSpace(value)),
+    "Packaged Roslyn 4.14 analysis lost direct-call lifetime obligations or their missing-evidence explanation.");
+var arrayReference = MethodDiagnostics(boundaries, boundaryDiagnostics, "BoundaryContracts", "DisposedArrayReference");
+Require(arrayReference.Any(diagnostic => diagnostic.Id == "SS0001") && arrayReference.All(diagnostic => diagnostic.Id != "SS0003"),
+    "Packaged Roslyn 4.14 ref access did not retain the ordinary array element's disposal identity.");
 var nested = MethodDiagnostics(boundaries, boundaryDiagnostics, "BoundaryContracts", "NestedLeak").Single();
 Require(nested.Id == "SS0047" && nested.AdditionalLocations.Count > 0 &&
     new[] { "SafeSharp.RegionUniverses", "SafeSharp.RegionUniversePromotions", "SafeSharp.RegionVisibilityProofs" }
@@ -237,6 +278,10 @@ Require(unguarded.Id == "SS0049" && unguarded.AdditionalLocations.Count > 0 &&
     unguarded.Properties.TryGetValue("SafeSharp.SynchronizationProtocol", out var protocol) && protocol == "Monitor" &&
     unguarded.Properties.ContainsKey("SafeSharp.SynchronizationHeld"),
     "Packaged Roslyn 4.14 analysis lost the unheld guard's contract or protocol evidence.");
+var semaphore = MethodDiagnostics(boundaries, boundaryDiagnostics, "GuardedAsyncCounter", "Unsafe").Single();
+Require(semaphore.Id == "SS0049" && semaphore.AdditionalLocations.Count > 0 &&
+    semaphore.Properties.TryGetValue("SafeSharp.SynchronizationProtocol", out var semaphoreProtocol) && semaphoreProtocol == "SemaphoreSlim",
+    "Packaged Roslyn 4.14 analysis lost the unheld semaphore's protocol evidence.");
 var nestedReport = new AnalysisReport([], [new ReportDiagnostic(nested.Id, nested.GetMessage(),
     new SourceSite("BoundaryContracts.cs", nested.Location.SourceSpan.Start, nested.Location.SourceSpan.Length),
     properties: nested.Properties)]);
@@ -254,14 +299,14 @@ Require(guardHtml.Contains("class=\"synchronization-graph\"", StringComparison.O
     !guardHtml.Contains("Synchronization graph omitted", StringComparison.Ordinal),
     "Packaged Reporting lost the computed Monitor guard requirement or invented an observed capability.");
 
-Console.WriteLine("Package host: Roslyn 4.14 discovered every analyzer family; checked delegates, nested lifetime leaks, stored/repeated async results, ValueTask consumption and Monitor guards; MEF fixed SS0024 in a live compilation; packaged Core ownership/universal/higher-ranked solvers and Reporting executed.");
+Console.WriteLine("Package host: Roslyn 4.14 discovered every analyzer family; checked direct-call and delegate lifetime obligations, nested lifetime leaks, canonical array references, stored/repeated async results, ValueTask consumption, Monitor and asynchronous semaphore guards; MEF fixed SS0024 in a live compilation; packaged Core ownership/universal/higher-ranked solvers and Reporting executed.");
 
 static Diagnostic[] MethodDiagnostics(Compilation compilation, ImmutableArray<Diagnostic> diagnostics, string typeName, string methodName)
 {
     var methods = compilation.GetTypeByMetadataName(typeName)?.GetMembers(methodName).OfType<IMethodSymbol>()
-        .Where(method => method.Parameters.IsEmpty).ToArray() ?? [];
+        .ToArray() ?? [];
     Require(methods.Length == 1 && methods[0].DeclaringSyntaxReferences.Length == 1,
-        "The package-host fixture must contain one exact method: " + typeName + "." + methodName + "().");
+        "The package-host fixture must contain one exact method: " + typeName + "." + methodName + ".");
     var declaration = methods[0].DeclaringSyntaxReferences[0];
     return diagnostics.Where(diagnostic => diagnostic.Location.SourceTree == declaration.SyntaxTree &&
         declaration.Span.Contains(diagnostic.Location.SourceSpan)).ToArray();

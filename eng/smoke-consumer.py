@@ -11,8 +11,16 @@ from xml.sax.saxutils import escape
 parser = argparse.ArgumentParser()
 parser.add_argument("packages")
 parser.add_argument("--version", required=True)
+parser.add_argument("--dependency-feed", type=pathlib.Path,
+                    help="Optional local feed for third-party dependencies; SafeSharp packages still come only from the supplied release feed.")
 args = parser.parse_args()
 feed = pathlib.Path(args.packages).resolve()
+dependency_source = "https://api.nuget.org/v3/index.json"
+if args.dependency_feed is not None:
+    dependency_feed = args.dependency_feed.resolve()
+    if not dependency_feed.is_dir():
+        raise SystemExit(f"Dependency feed does not exist: {dependency_feed}")
+    dependency_source = str(dependency_feed)
 dotnet = os.environ.get("DOTNET_HOST_PATH") or shutil.which("dotnet")
 if not dotnet:
     raise SystemExit("dotnet must be installed and available on PATH or DOTNET_HOST_PATH")
@@ -42,10 +50,10 @@ with tempfile.TemporaryDirectory(prefix="safesharp-consumer-") as temporary:
     environment["PATH"] = str(dotnet.parent) + os.pathsep + environment.get("PATH", "")
     (root / "NuGet.Config").write_text(
         '<configuration><packageSources><clear/><add key="local" value="' + escape(str(feed), {'"': '&quot;'}) +
-        '"/><add key="nuget" value="https://api.nuget.org/v3/index.json"/></packageSources>'
+        '"/><add key="dependencies" value="' + escape(dependency_source, {'"': '&quot;'}) + '"/></packageSources>'
         '<fallbackPackageFolders><clear/></fallbackPackageFolders><packageSourceMapping>'
         '<packageSource key="local"><package pattern="SafeSharp.*"/></packageSource>'
-        '<packageSource key="nuget"><package pattern="*"/></packageSource>'
+        '<packageSource key="dependencies"><package pattern="*"/></packageSource>'
         '</packageSourceMapping></configuration>', encoding="utf-8")
     (root / "Consumer.csproj").write_text(f'''<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup><TargetFramework>net10.0</TargetFramework><OutputType>Library</OutputType><Nullable>enable</Nullable><TreatWarningsAsErrors>true</TreatWarningsAsErrors></PropertyGroup>
@@ -56,7 +64,9 @@ with tempfile.TemporaryDirectory(prefix="safesharp-consumer-") as temporary:
   </ItemGroup>
 </Project>''', encoding="utf-8")
     (root / "Consumer.cs").write_text('''using System;
+using System.Collections.Generic;
 using System.IO;
+using System.Threading;
 using System.Threading.Tasks;
 using SafeSharp;
 [return: Lifetime("a"), Borrowed]
@@ -74,12 +84,20 @@ public static class Consumer {
     [return: TypeLifetime("^x", "return")] private static Func<object> Capture([Lifetime("x")] object value) => () => value;
     public static TiedFactory GoodNestedCallback() => Capture;
     public static async Task GoodValueTask() { var pending = new ValueTask<int>(Task.FromResult(1)); var task = pending.AsTask(); _ = await task; _ = await task; }
+    private static void RequireContents([TypeLifetime("item", "arg0")] List<object> values) { }
+    public static void GoodCall([TypeLifetime("a", "arg0")] List<object> values) { RequireContents(values); }
+    public static void GoodArrayReference() { var values = new[] { new MemoryStream() }; ref MemoryStream cell = ref values[0]; cell.Dispose(); }
 }
 [Send, Sync] public sealed class Snapshot { public readonly int Value; public Snapshot(int value) { Value = value; } }
 public sealed class GuardedCounter {
     private readonly object gate = new object();
     [GuardedBy(nameof(gate))] private int value;
     public void Good() { lock (gate) value++; }
+}
+public sealed class GuardedAsyncCounter {
+    private readonly SemaphoreSlim gate = new(1, 1);
+    [GuardedBy(nameof(gate))] private int value;
+    public async Task Good() { await gate.WaitAsync().ConfigureAwait(false); try { value++; await Task.Yield(); value++; } finally { gate.Release(); } }
 }
 ''', encoding="utf-8")
     good = run(["build", "Consumer.csproj", "--nologo", "-v", "minimal"], root)
@@ -90,7 +108,9 @@ public sealed class GuardedCounter {
     if "analyzers/dotnet/cs/SafeSharp.CodeFixes.dll" not in code_fixes["files"]:
         raise SystemExit("Packaged code fixes did not reach the consumer's analyzer assets")
     (root / "Consumer.cs").write_text('''using System;
+using System.Collections.Generic;
 using System.IO;
+using System.Threading;
 using System.Threading.Tasks;
 using SafeSharp;
 [return: Lifetime("a"), Borrowed]
@@ -108,6 +128,9 @@ public static class Consumer {
     [return: TypeLifetime("^x", "return")] private static Func<object> Capture([Lifetime("x")] object value) => () => value;
     public static UniversalFactory BadNestedCallback() => Capture;
     public static async Task RepeatValueTask() { var pending = new ValueTask<int>(Task.FromResult(1)); _ = await pending; _ = await pending; }
+    private static void RequireContents([TypeLifetime("item", "arg0")] List<object> values) { }
+    public static void BadCall(List<object> values) { RequireContents(values); }
+    public static void BadArrayReference() { var values = new[] { new MemoryStream() }; ref MemoryStream cell = ref values[0]; cell.Dispose(); _ = values[0].Length; }
     public static object? Retained;
     public static void Retain([Borrowed] object value) { var alias = value; Retained = alias; }
     [return: Lifetime("a")] public static MemoryStream Wrong([Lifetime("a")] MemoryStream first, [Lifetime("b")] MemoryStream second) => second;
@@ -125,9 +148,14 @@ public sealed class GuardedCounter {
     [GuardedBy(nameof(gate))] private int value;
     public void Bad() { value++; }
 }
+public sealed class GuardedAsyncCounter {
+    private readonly SemaphoreSlim gate = new(1, 1);
+    [GuardedBy(nameof(gate))] private int value;
+    public void Bad() { value++; }
+}
 ''', encoding="utf-8")
     bad = run(["build", "Consumer.csproj", "--no-restore", "--nologo", "-v", "minimal"], root, expected=1)
-    expected_rules = {"SS0001", "SS0003", "SS0017", "SS0021", "SS0027", "SS0041", "SS0044", "SS0045", "SS0047", "SS0048", "SS0049"}
+    expected_rules = {"SS0001", "SS0003", "SS0017", "SS0021", "SS0027", "SS0041", "SS0044", "SS0045", "SS0047", "SS0048", "SS0049", "SS0050"}
     if any("error " + rule not in bad for rule in expected_rules) or any(code in bad for code in ("AD0001", "AD0002", "CS8032", "CS8034")):
         raise SystemExit("Bad consumer did not exercise every packaged analyzer family\n" + bad)
     run(["tool", "install", "SafeSharp.Tool", "--version", args.version, "--tool-path", str(root / "tools"),
@@ -166,11 +194,17 @@ public sealed class GuardedCounter {
         if len(consumed) != 1 or consumed[0].get("certainty") != "Definite" or not consumed[0].get("relatedLocations"):
             raise SystemExit(f"Packaged tool {mode} report lost ValueTask capability consumption evidence")
         unguarded = [diagnostic for diagnostic in payload["diagnostics"] if diagnostic["id"] == "SS0049"]
-        if len(unguarded) != 1 or not unguarded[0].get("relatedLocations") or \
-                unguarded[0].get("properties", {}).get("SafeSharp.SynchronizationRequired") != "gate" or \
-                unguarded[0].get("properties", {}).get("SafeSharp.SynchronizationProtocol") != "Monitor" or \
-                "SafeSharp.SynchronizationHeld" not in unguarded[0].get("properties", {}):
-            raise SystemExit(f"Packaged tool {mode} report lost the unheld Monitor guard's evidence")
+        if len(unguarded) != 2 or {item.get("properties", {}).get("SafeSharp.SynchronizationProtocol") for item in unguarded} != {"Monitor", "SemaphoreSlim"} or \
+                any(not item.get("relatedLocations") or item.get("properties", {}).get("SafeSharp.SynchronizationRequired") != "gate" or
+                    "SafeSharp.SynchronizationHeld" not in item.get("properties", {}) for item in unguarded):
+            raise SystemExit(f"Packaged tool {mode} report lost an unheld Monitor or semaphore guard's evidence")
+        calls = [diagnostic for diagnostic in payload["diagnostics"] if diagnostic["id"] == "SS0050"]
+        if len(calls) != 1 or not calls[0].get("relatedLocations") or any(not calls[0].get("properties", {}).get(key) for key in
+                ("SafeSharp.CallTarget", "SafeSharp.CallReason", "SafeSharp.CallEvidence")):
+            raise SystemExit(f"Packaged tool {mode} report lost the direct-call lifetime obligation's evidence")
+        array_refs = [diagnostic for diagnostic in payload["diagnostics"] if diagnostic.get("method") == "Consumer.BadArrayReference()"]
+        if not any(item["id"] == "SS0001" for item in array_refs) or any(item["id"] == "SS0003" for item in array_refs):
+            raise SystemExit(f"Packaged tool {mode} report lost canonical array/ref disposal identity")
         pending_results = [diagnostic for diagnostic in payload["diagnostics"] if diagnostic["id"] == "SS0003" and
                            diagnostic.get("method") == "Consumer.PendingResult()"]
         if len(pending_results) != 1 or pending_results[0].get("certainty") != "Possible" or \
@@ -247,4 +281,4 @@ public sealed class GuardedCounter {
          "-p:SafeSharpPackageVersion=" + args.version], host)
     host_output = run([str(host / "bin/Debug/net10.0/PackageHost.dll"), str(analyzer_path), str(code_fixes_path)], host)
     print(host_output.strip())
-    print("NuGet consumer: fresh package cache; valid nested lifetime/delegate/async/ValueTask/Monitor contracts accepted; SS0001/03/17/21/27/41/44/45/47/48/49 enforced; universe visibility, consumption and guard evidence retained; cached async identities, installed CLI source/project modes and packaged MSBuild-budget/EditorConfig precedence verified.")
+    print("NuGet consumer: fresh package cache; valid direct-call/nested lifetime/delegate/async/ValueTask/Monitor/semaphore contracts and canonical array references accepted; SS0001/03/17/21/27/41/44/45/47/48/49/50 enforced; call obligations, universe visibility, consumption and guard evidence retained; cached async identities, installed CLI source/project modes and packaged MSBuild-budget/EditorConfig precedence verified.")

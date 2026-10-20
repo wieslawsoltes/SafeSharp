@@ -37,6 +37,14 @@ The separate `eng/package-host` fixture loads the packaged analyzer assembly thr
 
 Package verification checks that all six IDs share one release version, all six matching symbol packages contain portable PDB metadata, bundled SafeSharp assemblies match the corresponding library packages byte for byte, analyzer packages contribute no runtime dependencies, and the tool supplies its build host without bundling SDK-owned MSBuild assemblies into its runtime directory.
 
+The fresh-consumer gate can also run without a network connection when the third-party NuGet dependencies are available in a local feed:
+
+```sh
+python eng/smoke-consumer.py artifacts/packages --version 0.4.0-preview.1 --dependency-feed /path/to/dependency-feed
+```
+
+This still creates a fresh package cache. Package source mapping restricts `SafeSharp.*` to the release feed being tested, so a previously cached or separately published SafeSharp build cannot satisfy the gate. Omitting `--dependency-feed` uses nuget.org for third-party dependencies, as in CI.
+
 ## EditorConfig
 
 ```ini
