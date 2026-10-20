@@ -5,7 +5,7 @@ using System.Threading;
 
 namespace SafeSharp.Reporting;
 
-/// <summary>Emits real control-flow edges and reported dependency witnesses as Graphviz graphs.</summary>
+/// <summary>Emits control flow, dependency paths, and exact lifetime assumptions and requirements as Graphviz graphs.</summary>
 public sealed class DotReportWriter : IAnalysisReportWriter
 {
     public void Write(AnalysisReport report, TextWriter writer, CancellationToken cancellationToken = default)
@@ -66,6 +66,46 @@ public sealed class DotReportWriter : IAnalysisReportWriter
                 writer.Write(" -> "); writer.Write(prefix); writer.Write("_p"); writer.Write(ReportText.Number(step)); writer.Write(";\n");
             }
             writer.Write("  }\n");
+        }
+        for (var diagnosticIndex = 0; diagnosticIndex < report.Diagnostics.Length; diagnosticIndex++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var diagnostic = report.Diagnostics[diagnosticIndex];
+            if (RegionWitness.FromDiagnostic(diagnostic) is not { } witness) continue;
+            var prefix = "r" + ReportText.Number(diagnosticIndex);
+            writer.Write("  subgraph cluster_"); writer.Write(prefix); writer.Write(" {\n    label=\"");
+            writer.Write(ReportText.Dot(diagnostic.Id + (witness.CanRender
+                ? witness.HasRequirements
+                    ? " · lifetime region obligations\nSolid: declared assumptions. Dashed: callback requirements. Arrows: longer outlives shorter."
+                    : " · declared lifetime regions\nArrows: longer outlives shorter. Labels: source / required."
+                : " · lifetime diagnostic metadata"))); writer.Write("\";\n");
+            var identifiers = witness.Regions.Select((name, index) => (name, id: prefix + "_n" + ReportText.Number(index)))
+                .ToDictionary(pair => pair.name, pair => pair.id, StringComparer.Ordinal);
+            foreach (var region in witness.Regions)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                writer.Write("    "); writer.Write(identifiers[region]); writer.Write(" [label=\"");
+                writer.Write(ReportText.Dot(witness.Label(region))); writer.Write("\", style=filled, fontcolor=\"#e5eefb\", fillcolor=\"");
+                writer.Write(witness.Fill(region)); writer.Write("\", color=\""); writer.Write(witness.Color(region));
+                writer.Write("\", penwidth=2];\n");
+            }
+            foreach (var edge in witness.AllEdges)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                writer.Write("    "); writer.Write(identifiers[edge.Longer]); writer.Write(" -> "); writer.Write(identifiers[edge.Shorter]);
+                writer.Write(edge.IsRequirement
+                    ? " [label=\"requires outlives\", style=dashed, color=\"#c9a5ff\"];\n"
+                    : " [label=\"outlives\"];\n");
+            }
+            writer.Write("    "); writer.Write(prefix); writer.Write("_metadata [shape=note, label=\"");
+            writer.Write(ReportText.Dot(witness.MetadataLabel(diagnostic))); writer.Write("\"];\n  }\n");
+        }
+        for (var diagnosticIndex = 0; diagnosticIndex < report.Diagnostics.Length; diagnosticIndex++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var diagnostic = report.Diagnostics[diagnosticIndex];
+            if (SynchronizationWitness.FromDiagnostic(diagnostic) is { } synchronization)
+                SynchronizationGraphRenderer.WriteDot(writer, synchronization, diagnostic, diagnosticIndex, cancellationToken);
         }
         writer.Write("}\n");
     }

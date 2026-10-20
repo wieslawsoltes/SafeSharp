@@ -13,6 +13,9 @@ internal sealed class AbstractState : IEquatable<AbstractState>
     internal Dictionary<string, bool> NullablePlaces { get; } = new(StringComparer.Ordinal);
     internal Dictionary<string, ResourceFact> Resources { get; } = new(StringComparer.Ordinal);
     internal Dictionary<string, LoanFact> Loans { get; } = new(StringComparer.Ordinal);
+    internal ReferenceStorageState ReferenceStorage { get; } = new();
+    internal ValueTaskProtocolState ValueTasks { get; }
+    internal AbstractState() => ValueTasks = new ValueTaskProtocolState(ReferenceStorage, ExpandReferenceTargets);
     internal bool IsUnreachable { get; set; }
 
     internal AbstractState Clone()
@@ -22,12 +25,20 @@ internal sealed class AbstractState : IEquatable<AbstractState>
         foreach (var pair in NullablePlaces) result.NullablePlaces.Add(pair.Key, pair.Value);
         foreach (var pair in Resources) result.Resources.Add(pair.Key, pair.Value);
         foreach (var pair in Loans) result.Loans.Add(pair.Key, pair.Value);
+        result.ReferenceStorage.CopyFrom(ReferenceStorage);
+        result.ValueTasks.CopyFrom(ValueTasks);
         return result;
     }
 
     internal IReadOnlyCollection<ReferenceFact> Resolve(string? place)
     {
         if (place is null) return Array.Empty<ReferenceFact>();
+        return ReferenceStorage.TryGetTargets(place, out var targets) ? ReferenceStorageState.Read(ExpandReferenceTargets(targets), ResolveDirect) : ResolveDirect(place);
+    }
+
+    private IReadOnlyCollection<ReferenceFact> ResolveDirect(string place)
+    {
+        if (Places.Count == 0) return Array.Empty<ReferenceFact>();
         if (Places.TryGetValue(place, out var value)) return value.Values;
         var separator = Math.Max(place.LastIndexOf('.'), place.LastIndexOf('['));
         while (separator > 0)
@@ -42,9 +53,56 @@ internal sealed class AbstractState : IEquatable<AbstractState>
         return Array.Empty<ReferenceFact>();
     }
 
-    internal bool CanBeNull(string? place) => place is null || !NullablePlaces.TryGetValue(place, out var mayBeNull) || mayBeNull;
+    internal bool CanBeNull(string? place) => place is null || (ReferenceStorage.TryGetTargets(place, out var targets)
+        ? ExpandReferenceTargets(targets).Any(CanBeNullDirect) : CanBeNullDirect(place));
+
+    private bool CanBeNullDirect(string place) => !NullablePlaces.TryGetValue(place, out var mayBeNull) || mayBeNull;
 
     internal void Assign(string target, IEnumerable<ReferenceFact> references, bool mayBeNull = false)
+    {
+        if (ReferenceStorage.TryGetTargets(target, out var targets))
+        {
+            targets = ExpandReferenceTargets(targets);
+            var values = references.ToArray();
+            foreach (var location in targets)
+            {
+                if (location == ReferenceStorageState.UnknownTarget) continue;
+                if (targets.Count == 1) AssignDirect(location, values, mayBeNull);
+                else AssignDirect(location, ResolveDirect(location).Concat(values).Select(reference => reference.WithAbsence(false)),
+                    mayBeNull || CanBeNullDirect(location));
+            }
+        }
+        else AssignDirect(target, references, mayBeNull);
+    }
+
+    // An address captures the aggregate identity. A wildcard selector is expanded against the
+    // current cells, so a ref taken before a later element is materialized still aliases it.
+    // A summarized allocation site represents several concrete arrays: no write through one
+    // of its addresses can replace every generation's element.
+    internal ImmutableHashSet<string> ExpandReferenceTargets(ImmutableHashSet<string> targets)
+    {
+        ImmutableHashSet<string>.Builder? expanded = null;
+        foreach (var target in targets)
+        {
+            if (!AggregateStorageLocation.TryParse(target, out var id, out var key, out var suffix) ||
+                !Resources.TryGetValue(id, out var aggregate) || aggregate.Kind != ResourceKind.Aggregate) continue;
+            var wildcard = key.IndexOf('*') >= 0;
+            if (!wildcard && !aggregate.IsAggregateSummary) continue;
+            expanded ??= targets.ToBuilder();
+            expanded.Add(ReferenceStorageState.UnknownTarget);
+            if (wildcard)
+                foreach (var element in aggregate.ElementKeys)
+                {
+                    if (AggregateStorageLocation.Overlaps(key, element))
+                        expanded.Add(OwnershipTransfer.AggregateElementCache(id, element) + suffix);
+                    if (expanded.Count > ReferenceStorageState.MaximumTargets) return ReferenceStorage.BoundExpansion(expanded);
+                }
+            if (expanded.Count > ReferenceStorageState.MaximumTargets) return ReferenceStorage.BoundExpansion(expanded);
+        }
+        return expanded is null ? targets : ReferenceStorage.BoundExpansion(expanded);
+    }
+
+    private void AssignDirect(string target, IEnumerable<ReferenceFact> references, bool mayBeNull)
     {
         var value = new Dictionary<string, ReferenceFact>(StringComparer.Ordinal);
         foreach (var reference in references)
@@ -79,6 +137,8 @@ internal sealed class AbstractState : IEquatable<AbstractState>
     private void JoinWith(AbstractState other)
     {
         if (other.IsUnreachable) return;
+        ReferenceStorage.JoinWith(other.ReferenceStorage);
+        ValueTasks.JoinWith(other.ValueTasks);
         foreach (var place in Places.Keys.Union(other.Places.Keys, StringComparer.Ordinal).ToArray())
         {
             Places.TryGetValue(place, out var left);
@@ -126,6 +186,8 @@ internal sealed class AbstractState : IEquatable<AbstractState>
         foreach (var pair in other.NullablePlaces) NullablePlaces[pair.Key] = pair.Value;
         foreach (var pair in other.Resources) Resources[pair.Key] = pair.Value;
         foreach (var pair in other.Loans) Loans[pair.Key] = pair.Value;
+        ReferenceStorage.CopyFrom(other.ReferenceStorage);
+        ValueTasks.CopyFrom(other.ValueTasks);
     }
 
     internal void ExpireLoans(ISet<string> livePlaces)
@@ -133,7 +195,7 @@ internal sealed class AbstractState : IEquatable<AbstractState>
         if (Loans.Count == 0) return;
         var retained = new HashSet<string>(StringComparer.Ordinal);
         foreach (var place in livePlaces)
-        foreach (var reference in Resolve(place))
+        foreach (var reference in OwnershipTransfer.IncludingFactoryResults(this, Resolve(place)))
             if (reference.LoanId is not null) retained.Add(reference.LoanId);
         var queue = new Queue<string>(retained);
         while (queue.Count != 0)
@@ -152,15 +214,29 @@ internal sealed class AbstractState : IEquatable<AbstractState>
                 reference.ResourceId, reference.Availability, reference.LoanId, reference.Projection,
                 reference.MovedPaths.OrderBy(path => path, StringComparer.Ordinal).ToImmutableArray(), reference.MayBeAbsent, reference.CoversResource)).ToImmutableArray(), CanBeNull(pair.Key))).ToImmutableArray(),
         Resources.Values.OrderBy(resource => resource.Id, StringComparer.Ordinal).Select(resource => new ResourceSnapshot(
-            resource.Id, resource.Ownership, resource.Status, resource.Origin, resource.OwnerIds.OrderBy(id => id, StringComparer.Ordinal).ToImmutableArray())).ToImmutableArray(),
+            resource.Id, resource.Ownership, resource.Status, resource.Origin, resource.OwnerIds.OrderBy(id => id, StringComparer.Ordinal).ToImmutableArray(),
+            resource.Kind, resource.DisposedResourceIds.OrderBy(id => id, StringComparer.Ordinal).ToImmutableArray(), resource.ResultState,
+            (resource.ResultState & AsyncResultState.Materialized) != 0
+                ? Resolve(OwnershipTransfer.AsyncResultCache(resource.Id)).Select(reference => reference.ResourceId).Distinct(StringComparer.Ordinal)
+                    .OrderBy(id => id, StringComparer.Ordinal).ToImmutableArray() : ImmutableArray<string>.Empty, resource.AsyncResultDepth, resource.Composition,
+            resource.Composition == AsyncCompositionKind.None ? ImmutableArray<string>.Empty : Resolve(OwnershipTransfer.AsyncDependencyCache(resource.Id))
+                .Select(reference => reference.ResourceId).Distinct(StringComparer.Ordinal).OrderBy(id => id, StringComparer.Ordinal).ToImmutableArray(),
+            resource.ElementKeys.OrderBy(key => key, StringComparer.Ordinal).Select(key => new AggregateElementSnapshot(key,
+                Resolve(OwnershipTransfer.AggregateElementCache(resource.Id, key)).Select(reference => reference.ResourceId)
+                    .Distinct(StringComparer.Ordinal).OrderBy(id => id, StringComparer.Ordinal).ToImmutableArray(),
+                ValueTasks.Ids(OwnershipTransfer.AggregateElementCache(resource.Id, key)).Distinct(StringComparer.Ordinal)
+                    .OrderBy(id => id, StringComparer.Ordinal).ToImmutableArray())).ToImmutableArray(), resource.IsAggregateSummary)).ToImmutableArray(),
         Loans.Values.OrderBy(loan => loan.Id, StringComparer.Ordinal).Select(loan => new LoanSnapshot(loan.Id, loan.ResourceId,
             loan.Holder, loan.Kind, loan.Origin, loan.ParentIds.OrderBy(id => id, StringComparer.Ordinal).FirstOrDefault(), loan.Projection,
-            loan.AllowsSuspension, loan.MayBeAbsent)).ToImmutableArray(), !IsUnreachable);
+            loan.AllowsSuspension, loan.MayBeAbsent, loan.Phase, loan.ActivationEvidence.Values.Select(evidence => evidence.Site)
+                .OrderBy(site => site.Path, StringComparer.Ordinal).ThenBy(site => site.Start).ThenBy(site => site.Length).ToImmutableArray())).ToImmutableArray(), !IsUnreachable, ValueTasks.Snapshot(), ReferenceStorage.Snapshot());
 
     public bool Equals(AbstractState? other) => other is not null && IsUnreachable == other.IsUnreachable && (IsUnreachable ||
         MapEquals(NullablePlaces, other.NullablePlaces, (left, right) => left == right)
         && MapEquals(Resources, other.Resources, (left, right) => left.Equals(right))
         && MapEquals(Loans, other.Loans, (left, right) => left.Equals(right))
+        && ReferenceStorage.Equals(other.ReferenceStorage)
+        && ValueTasks.Equals(other.ValueTasks)
         && MapEquals(Places, other.Places, (left, right) => MapEquals(left, right, (l, r) => l.Equals(r))));
     public override bool Equals(object? obj) => obj is AbstractState state && Equals(state);
     public override int GetHashCode() => Places.Count ^ Resources.Count ^ Loans.Count;
@@ -258,7 +334,10 @@ internal sealed class ReferenceFact : IEquatable<ReferenceFact>
 internal sealed class ResourceFact : IEquatable<ResourceFact>
 {
     internal ResourceFact(string id, ResourceOwnership ownership, ResourceStatus status, SourceSite origin,
-        InstructionFlags flags, ImmutableHashSet<string> ownerIds, ImmutableDictionary<string, AnalysisEvidence>? evidence = null)
+        InstructionFlags flags, ImmutableHashSet<string> ownerIds, ImmutableDictionary<string, AnalysisEvidence>? evidence = null,
+        ResourceKind kind = ResourceKind.Resource, ImmutableHashSet<string>? disposedResourceIds = null,
+        AsyncResultState resultState = AsyncResultState.None, int asyncResultDepth = 1,
+        AsyncCompositionKind composition = AsyncCompositionKind.None, ImmutableHashSet<string>? elementKeys = null, bool aggregateSummary = false)
     {
         Id = id;
         Ownership = ownership;
@@ -267,6 +346,13 @@ internal sealed class ResourceFact : IEquatable<ResourceFact>
         Flags = flags;
         OwnerIds = ownerIds;
         Evidence = evidence ?? ImmutableDictionary.Create<string, AnalysisEvidence>(StringComparer.Ordinal);
+        Kind = kind;
+        ResultState = resultState;
+        AsyncResultDepth = asyncResultDepth;
+        Composition = composition;
+        ElementKeys = elementKeys ?? ImmutableHashSet.Create<string>(StringComparer.Ordinal);
+        IsAggregateSummary = aggregateSummary;
+        DisposedResourceIds = disposedResourceIds ?? ImmutableHashSet.Create<string>(StringComparer.Ordinal);
     }
 
     internal string Id { get; }
@@ -276,16 +362,29 @@ internal sealed class ResourceFact : IEquatable<ResourceFact>
     internal InstructionFlags Flags { get; }
     internal ImmutableHashSet<string> OwnerIds { get; }
     internal ImmutableDictionary<string, AnalysisEvidence> Evidence { get; }
-    internal ResourceFact WithStatus(ResourceStatus status) => new(Id, Ownership, status, Origin, Flags, OwnerIds, Evidence);
+    internal ResourceKind Kind { get; }
+    internal AsyncResultState ResultState { get; }
+    internal int AsyncResultDepth { get; }
+    internal AsyncCompositionKind Composition { get; }
+    internal ImmutableHashSet<string> ElementKeys { get; }
+    internal bool IsAggregateSummary { get; }
+    internal ResourceFact WithElement(string key) => new(Id, Ownership, Status, Origin, Flags, OwnerIds, Evidence, Kind, DisposedResourceIds, ResultState, AsyncResultDepth, Composition, ElementKeys.Add(key), IsAggregateSummary);
+    internal ImmutableHashSet<string> DisposedResourceIds { get; }
+    internal ResourceStatus OutstandingStatus => Kind is ResourceKind.AsyncDisposalCompletion or ResourceKind.AsyncFactoryCarrier ? ResourceStatus.Pending : ResourceStatus.Alive;
+    internal bool HasOutstandingObligation => (Status & OutstandingStatus) != 0;
+    internal ResourceFact WithStatus(ResourceStatus status) => new(Id, Ownership, status, Origin, Flags, OwnerIds, Evidence, Kind, DisposedResourceIds, ResultState, AsyncResultDepth, Composition, ElementKeys, IsAggregateSummary);
+    internal ResourceFact WithResultState(AsyncResultState resultState) => new(Id, Ownership, Status, Origin, Flags, OwnerIds, Evidence, Kind, DisposedResourceIds, resultState, AsyncResultDepth, Composition, ElementKeys, IsAggregateSummary);
     internal ResourceFact Transition(ResourceStatus status, string kind, string message, SourceSite site)
     {
         var evidence = new AnalysisEvidence(kind, message, site);
-        return new ResourceFact(Id, Ownership, status, Origin, Flags, OwnerIds, Evidence.SetItem(EvidenceFacts.Key(evidence), evidence));
+        return new ResourceFact(Id, Ownership, status, Origin, Flags, OwnerIds, Evidence.SetItem(EvidenceFacts.Key(evidence), evidence), Kind, DisposedResourceIds, ResultState, AsyncResultDepth, Composition, ElementKeys, IsAggregateSummary);
     }
     internal ResourceFact Join(ResourceFact other) => new(Id, Ownership, Status | other.Status, Origin, Flags | other.Flags,
-        OwnerIds.Union(other.OwnerIds), Evidence.SetItems(other.Evidence));
+        OwnerIds.Union(other.OwnerIds), Evidence.SetItems(other.Evidence), Kind, DisposedResourceIds.Union(other.DisposedResourceIds), ResultState | other.ResultState, Math.Max(AsyncResultDepth, other.AsyncResultDepth), Composition, ElementKeys.Union(other.ElementKeys), IsAggregateSummary || other.IsAggregateSummary);
     public bool Equals(ResourceFact? other) => other is not null && Id == other.Id && Ownership == other.Ownership && Status == other.Status
-        && Flags == other.Flags && OwnerIds.SetEquals(other.OwnerIds) && EvidenceFacts.Equal(Evidence, other.Evidence);
+        && Flags == other.Flags && Kind == other.Kind && ResultState == other.ResultState && AsyncResultDepth == other.AsyncResultDepth && OwnerIds.SetEquals(other.OwnerIds) && DisposedResourceIds.SetEquals(other.DisposedResourceIds)
+        && Composition == other.Composition && ElementKeys.SetEquals(other.ElementKeys) && IsAggregateSummary == other.IsAggregateSummary
+        && EvidenceFacts.Equal(Evidence, other.Evidence);
     public override bool Equals(object? obj) => obj is ResourceFact other && Equals(other);
     public override int GetHashCode() => StringComparer.Ordinal.GetHashCode(Id) ^ (int)Status;
 }
@@ -293,7 +392,8 @@ internal sealed class ResourceFact : IEquatable<ResourceFact>
 internal sealed class LoanFact : IEquatable<LoanFact>
 {
     internal LoanFact(string id, string resourceId, string holder, BorrowKind kind, SourceSite origin,
-        string projection, bool allowsSuspension, ImmutableHashSet<string> parentIds, bool mayBeAbsent = false)
+        string projection, bool allowsSuspension, ImmutableHashSet<string> parentIds, bool mayBeAbsent = false,
+        BorrowPhase phase = BorrowPhase.Active, ImmutableDictionary<string, AnalysisEvidence>? activationEvidence = null)
     {
         Id = id;
         ResourceId = resourceId;
@@ -304,6 +404,8 @@ internal sealed class LoanFact : IEquatable<LoanFact>
         AllowsSuspension = allowsSuspension;
         ParentIds = parentIds;
         MayBeAbsent = mayBeAbsent;
+        Phase = phase;
+        ActivationEvidence = activationEvidence ?? ImmutableDictionary.Create<string, AnalysisEvidence>(StringComparer.Ordinal);
     }
     internal string Id { get; }
     internal string ResourceId { get; }
@@ -314,11 +416,20 @@ internal sealed class LoanFact : IEquatable<LoanFact>
     internal bool AllowsSuspension { get; }
     internal ImmutableHashSet<string> ParentIds { get; }
     internal bool MayBeAbsent { get; }
-    internal LoanFact WithAbsence() => new(Id, ResourceId, Holder, Kind, Origin, Projection, AllowsSuspension, ParentIds, true);
+    internal BorrowPhase Phase { get; }
+    internal ImmutableDictionary<string, AnalysisEvidence> ActivationEvidence { get; }
+    internal LoanFact WithAbsence() => new(Id, ResourceId, Holder, Kind, Origin, Projection, AllowsSuspension, ParentIds, true, Phase, ActivationEvidence);
+    internal LoanFact Activate(SourceSite site, bool weak)
+    {
+        var evidence = new AnalysisEvidence("activation", "The exclusive reservation is activated here.", site);
+        return new LoanFact(Id, ResourceId, Holder, Kind, Origin, Projection, AllowsSuspension, ParentIds, MayBeAbsent,
+            weak ? Phase | BorrowPhase.Active : BorrowPhase.Active, ActivationEvidence.SetItem(EvidenceFacts.Key(evidence), evidence));
+    }
     internal LoanFact Join(LoanFact other) => new(Id, ResourceId, Holder, Kind, Origin, Projection, AllowsSuspension && other.AllowsSuspension,
-        ParentIds.Union(other.ParentIds), MayBeAbsent || other.MayBeAbsent);
+        ParentIds.Union(other.ParentIds), MayBeAbsent || other.MayBeAbsent, Phase | other.Phase, ActivationEvidence.SetItems(other.ActivationEvidence));
     public bool Equals(LoanFact? other) => other is not null && Id == other.Id && MayBeAbsent == other.MayBeAbsent
-        && AllowsSuspension == other.AllowsSuspension && ParentIds.SetEquals(other.ParentIds);
+        && AllowsSuspension == other.AllowsSuspension && Phase == other.Phase && ParentIds.SetEquals(other.ParentIds)
+        && EvidenceFacts.Equal(ActivationEvidence, other.ActivationEvidence);
     public override bool Equals(object? obj) => obj is LoanFact other && Equals(other);
     public override int GetHashCode() => StringComparer.Ordinal.GetHashCode(Id);
 }

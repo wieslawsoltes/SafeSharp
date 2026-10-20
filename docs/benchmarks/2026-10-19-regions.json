@@ -1,0 +1,116 @@
+{
+  "generatedAtUtc": "2026-10-19T20:28:26.9167216+00:00",
+  "runtime": ".NET 10.0.13",
+  "operatingSystem": "Ubuntu 24.04.3 LTS",
+  "architecture": "X64",
+  "logicalProcessors": 8,
+  "optimizedCoreSha256": "199339852570463baba206bd3a9c4c0c017173bf1265c8e999463d4b3ff3ce53",
+  "baselineCoreSha256": "c5b499837939e2b67f50f719c53fe8e85582c1354755c6e19f725ad3495eb48e",
+  "Suite": "regions",
+  "Warmup": 5,
+  "Iterations": 15,
+  "Filter": null,
+  "tieredCompilation": "0",
+  "notes": "Medians of alternating baseline/optimized synchronous samples; construction excluded, solve and requested outputs included. Allocated bytes are per current thread. Microbenchmarks are not whole-project build speedups.",
+  "results": [
+    {
+      "Name": "regions/chain-64/queries",
+      "Details": "64 named regions, 63 edges; solve plus two relation queries and one shortest proof",
+      "BaselineMilliseconds": 2.8492,
+      "OptimizedMilliseconds": 0.0593,
+      "Speedup": 48.04721753794267,
+      "BaselineAllocatedBytes": 2103072,
+      "OptimizedAllocatedBytes": 66288
+    },
+    {
+      "Name": "regions/cycle-64/queries",
+      "Details": "64 named regions, 64 edges; solve plus two relation queries and one shortest proof",
+      "BaselineMilliseconds": 7.861,
+      "OptimizedMilliseconds": 0.0914,
+      "Speedup": 86.00656455142231,
+      "BaselineAllocatedBytes": 5164496,
+      "OptimizedAllocatedBytes": 47760
+    },
+    {
+      "Name": "regions/disconnected-64/queries",
+      "Details": "64 named regions, 56 edges; solve plus two relation queries and one shortest proof",
+      "BaselineMilliseconds": 0.2563,
+      "OptimizedMilliseconds": 0.0372,
+      "Speedup": 6.889784946236559,
+      "BaselineAllocatedBytes": 196272,
+      "OptimizedAllocatedBytes": 64616
+    },
+    {
+      "Name": "regions/chain-128/queries",
+      "Details": "128 named regions, 127 edges; solve plus two relation queries and one shortest proof",
+      "BaselineMilliseconds": 26.9268,
+      "OptimizedMilliseconds": 0.2117,
+      "Speedup": 127.19319792158716,
+      "BaselineAllocatedBytes": 13837848,
+      "OptimizedAllocatedBytes": 163528
+    },
+    {
+      "Name": "regions/cycle-128/queries",
+      "Details": "128 named regions, 128 edges; solve plus two relation queries and one shortest proof",
+      "BaselineMilliseconds": 104.4457,
+      "OptimizedMilliseconds": 0.2991,
+      "Speedup": 349.1999331327316,
+      "BaselineAllocatedBytes": 36341576,
+      "OptimizedAllocatedBytes": 126056
+    },
+    {
+      "Name": "regions/disconnected-128/queries",
+      "Details": "128 named regions, 112 edges; solve plus two relation queries and one shortest proof",
+      "BaselineMilliseconds": 0.8195,
+      "OptimizedMilliseconds": 0.0905,
+      "Speedup": 9.05524861878453,
+      "BaselineAllocatedBytes": 456568,
+      "OptimizedAllocatedBytes": 160488
+    },
+    {
+      "Name": "regions/chain-256/queries",
+      "Details": "256 named regions, 255 edges; solve plus two relation queries and one shortest proof",
+      "BaselineMilliseconds": 205.9004,
+      "OptimizedMilliseconds": 0.6696,
+      "Speedup": 307.4976105137395,
+      "BaselineAllocatedBytes": 98960736,
+      "OptimizedAllocatedBytes": 458400
+    },
+    {
+      "Name": "regions/cycle-256/queries",
+      "Details": "256 named regions, 256 edges; solve plus two relation queries and one shortest proof",
+      "BaselineMilliseconds": 515.4901,
+      "OptimizedMilliseconds": 0.8498,
+      "Speedup": 606.6016709814073,
+      "BaselineAllocatedBytes": 269808192,
+      "OptimizedAllocatedBytes": 383040
+    },
+    {
+      "Name": "regions/disconnected-256/queries",
+      "Details": "256 named regions, 224 edges; solve plus two relation queries and one shortest proof",
+      "BaselineMilliseconds": 1.2348,
+      "OptimizedMilliseconds": 0.1823,
+      "Speedup": 6.773450356555129,
+      "BaselineAllocatedBytes": 1174680,
+      "OptimizedAllocatedBytes": 452648
+    },
+    {
+      "Name": "regions/chain-128/all-proofs",
+      "Details": "128 named regions, 127 edges; solve plus every shortest proof path",
+      "BaselineMilliseconds": 29.0537,
+      "OptimizedMilliseconds": 14.2297,
+      "Speedup": 2.0417647596224797,
+      "BaselineAllocatedBytes": 13837872,
+      "OptimizedAllocatedBytes": 9883104
+    },
+    {
+      "Name": "regions/cycle-128/all-proofs",
+      "Details": "128 named regions, 128 edges; solve plus every shortest proof path",
+      "BaselineMilliseconds": 105.9264,
+      "OptimizedMilliseconds": 48.8853,
+      "Speedup": 2.16683542905536,
+      "BaselineAllocatedBytes": 36341600,
+      "OptimizedAllocatedBytes": 23575328
+    }
+  ]
+}

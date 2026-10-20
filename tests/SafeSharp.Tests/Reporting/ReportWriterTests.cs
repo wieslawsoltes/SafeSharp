@@ -25,6 +25,11 @@ public sealed class ReportWriterTests
         var loan = Assert.Single(entry.GetProperty("exitState").GetProperty("loans").EnumerateArray());
         Assert.Equal("reader", loan.GetProperty("holder").GetString());
         Assert.Equal("Shared", loan.GetProperty("kind").GetString());
+        Assert.False(loan.GetProperty("mayBeAbsent").GetBoolean());
+        Assert.True(entry.GetProperty("exitState").GetProperty("isReachable").GetBoolean());
+        var owner = Assert.Single(entry.GetProperty("exitState").GetProperty("places").EnumerateArray(), place => place.GetProperty("place").GetString() == "owner");
+        Assert.False(owner.GetProperty("mayBeNull").GetBoolean());
+        Assert.True(owner.GetProperty("references")[0].GetProperty("coversResource").GetBoolean());
         Assert.Contains(entry.GetProperty("liveOut").EnumerateArray(), place => place.GetString() == "reader");
         var released = method.GetProperty("blocks")[1].GetProperty("steps")[0];
         Assert.NotEmpty(released.GetProperty("before").GetProperty("loans").EnumerateArray());
@@ -188,6 +193,80 @@ public sealed class ReportWriterTests
         Assert.Contains("href=\"#m0_b1\"", html);
         Assert.Contains("reader", html);
         Assert.DoesNotContain("no captured state", html);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ReportsPreserveNullRefinementAndPrunedBranchReachability(bool nullable)
+    {
+        var site = new SourceSite("/src/Nullable.cs", 0, 1);
+        var graph = new AnalysisGraph("Nullable.Guard()",
+        [
+            new FlowBlock(0, [new FlowInstruction(InstructionKind.Allocate, site, target: "owner", resourceId: "R",
+                flags: nullable ? InstructionFlags.MayBeNull : InstructionFlags.None)], [1, 2]),
+            new FlowBlock(1, [new FlowInstruction(InstructionKind.AssumeNull, site, source: "owner")], []),
+            new FlowBlock(2, [new FlowInstruction(InstructionKind.AssumeNotNull, site, source: "owner"),
+                new FlowInstruction(InstructionKind.Dispose, site, source: "owner")], []),
+        ], 0, site);
+        var result = new OwnershipAnalysisEngine().Analyze(graph, new AnalysisOptions(captureSnapshots: true));
+        Assert.Empty(result.Issues);
+        var report = new AnalysisReport([result]);
+        using var json = JsonDocument.Parse(AnalysisReportRenderer.Render(report, ReportFormat.Json));
+        var blocks = json.RootElement.GetProperty("methods")[0].GetProperty("blocks");
+        Assert.Equal(nullable, blocks[0].GetProperty("exitState").GetProperty("places")[0].GetProperty("mayBeNull").GetBoolean());
+        Assert.Equal(nullable, blocks[1].GetProperty("exitState").GetProperty("isReachable").GetBoolean());
+        var html = AnalysisReportRenderer.Render(report, ReportFormat.Html);
+        if (nullable)
+        {
+            Assert.Contains("may be null", html);
+            Assert.DoesNotContain("PRUNED", html);
+        }
+        else
+        {
+            Assert.Contains("PRUNED", html);
+            Assert.Contains("This state is infeasible", html);
+        }
+    }
+
+    [Theory]
+    [InlineData(ReportFormat.Html)]
+    [InlineData(ReportFormat.Dot)]
+    [InlineData(ReportFormat.Mermaid)]
+    public void GraphFormatsRenderRecordedServiceWitnessesWithSafeLabels(ReportFormat format)
+    {
+        const string hostile = "Root\"]\nclick injected \"javascript:alert(1)\"<script>";
+        var diagnostic = new ReportDiagnostic("SS0026", "Scoped service captured by singleton.", new SourceSite("/src/Services.cs", 12, 8),
+            properties: new Dictionary<string, string?>
+            {
+                ["SafeSharp.DependencyPath"] = hostile + " -> Bridge -> Scoped",
+                ["SafeSharp.DependencyServices"] = "IRoot -> IBridge -> IScoped",
+                ["SafeSharp.DependencyLifetimes"] = "Singleton -> Transient -> Scoped",
+            });
+        var output = AnalysisReportRenderer.Render(new AnalysisReport([], [diagnostic]), format);
+        Assert.Contains("Singleton", output);
+        Assert.Contains("Transient", output);
+        Assert.Contains("IBridge", output);
+        Assert.DoesNotContain(hostile, output);
+        if (format != ReportFormat.Html) Assert.DoesNotContain("\nclick injected", output);
+        switch (format)
+        {
+            case ReportFormat.Html:
+                Assert.Contains("<ol class=\"dependency-witness\"", output);
+                Assert.Equal(3, Count(output, "<div class=\"dependency-node\">"));
+                Assert.Contains("&lt;script&gt;", output);
+                break;
+            case ReportFormat.Dot:
+                Assert.Contains("d0_p0 -> d0_p1;", output);
+                Assert.Contains("d0_p1 -> d0_p2;", output);
+                Assert.DoesNotContain("label=\"Root\"]", output);
+                break;
+            case ReportFormat.Mermaid:
+                Assert.Contains("d0_p0 --> d0_p1", output);
+                Assert.Contains("d0_p1 --> d0_p2", output);
+                Assert.Contains("Root#34;#93;", output);
+                break;
+        }
     }
 
     internal static AnalysisResult Analyze(string name = "Owner.Use()", string path = "/src/Owner.cs") =>

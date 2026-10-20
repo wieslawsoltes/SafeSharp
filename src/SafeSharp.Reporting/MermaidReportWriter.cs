@@ -5,7 +5,7 @@ using System.Threading;
 
 namespace SafeSharp.Reporting;
 
-/// <summary>Mermaid CFG and dependency-witness output using generated identifiers and escaped source labels.</summary>
+/// <summary>Mermaid flow, dependency and exact region obligation graphs with generated identifiers and escaped labels.</summary>
 public sealed class MermaidReportWriter : IAnalysisReportWriter
 {
     public void Write(AnalysisReport report, TextWriter writer, CancellationToken cancellationToken = default)
@@ -44,6 +44,38 @@ public sealed class MermaidReportWriter : IAnalysisReportWriter
         {
             cancellationToken.ThrowIfCancellationRequested();
             var diagnostic = report.Diagnostics[diagnosticIndex];
+            if (RegionWitness.FromDiagnostic(diagnostic) is not { } witness) continue;
+            var prefix = "r" + ReportText.Number(diagnosticIndex);
+            writer.Write("  subgraph "); writer.Write(prefix); writer.Write("[\"");
+            writer.Write(ReportText.Mermaid(diagnostic.Id + (witness.CanRender
+                ? witness.HasRequirements
+                    ? " · lifetime region obligations; solid assumptions, dashed requirements; arrows mean outlives"
+                    : " · declared lifetime regions; arrows mean outlives"
+                : " · lifetime diagnostic metadata"))); writer.Write("\"]\n");
+            var identifiers = witness.Regions.Select((name, index) => (name, id: prefix + "_n" + ReportText.Number(index)))
+                .ToDictionary(pair => pair.name, pair => pair.id, StringComparer.Ordinal);
+            foreach (var region in witness.Regions)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                writer.Write("    "); writer.Write(identifiers[region]); writer.Write("[\"");
+                writer.Write(ReportText.Mermaid(witness.Label(region).Replace("\n", " · "))); writer.Write("\"]\n    style ");
+                writer.Write(identifiers[region]); writer.Write(" fill:"); writer.Write(witness.Fill(region));
+                writer.Write(",stroke:"); writer.Write(witness.Color(region)); writer.Write(",color:#e5eefb,stroke-width:2px\n");
+            }
+            foreach (var edge in witness.AllEdges)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                writer.Write("    "); writer.Write(identifiers[edge.Longer]);
+                writer.Write(edge.IsRequirement ? " -.->|requires outlives| " : " -->|outlives| ");
+                writer.Write(identifiers[edge.Shorter]); writer.Write('\n');
+            }
+            writer.Write("    "); writer.Write(prefix); writer.Write("_metadata[\"");
+            writer.Write(ReportText.Mermaid(witness.MetadataLabel(diagnostic))); writer.Write("\"]\n  end\n");
+        }
+        for (var diagnosticIndex = 0; diagnosticIndex < report.Diagnostics.Length; diagnosticIndex++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var diagnostic = report.Diagnostics[diagnosticIndex];
             var witness = DependencyWitness.FromDiagnostic(diagnostic);
             if (witness is null) continue;
             var prefix = "d" + ReportText.Number(diagnosticIndex);
@@ -59,5 +91,13 @@ public sealed class MermaidReportWriter : IAnalysisReportWriter
             }
             writer.Write("  end\n");
         }
+        for (var diagnosticIndex = 0; diagnosticIndex < report.Diagnostics.Length; diagnosticIndex++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var diagnostic = report.Diagnostics[diagnosticIndex];
+            if (SynchronizationWitness.FromDiagnostic(diagnostic) is { } synchronization)
+                SynchronizationGraphRenderer.WriteMermaid(writer, synchronization, diagnostic, diagnosticIndex, cancellationToken);
+        }
+
     }
 }
