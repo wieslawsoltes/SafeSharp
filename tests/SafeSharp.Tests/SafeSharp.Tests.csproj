@@ -7,6 +7,7 @@
   <ItemGroup>
     <ProjectReference Include="../../src/SafeSharp.Analyzers/SafeSharp.Analyzers.csproj" />
     <ProjectReference Include="../../src/SafeSharp.Contracts/SafeSharp.Contracts.csproj" />
+    <ProjectReference Include="../../src/SafeSharp.Core/SafeSharp.Core.csproj" />
     <ProjectReference Include="../../src/SafeSharp.Reporting/SafeSharp.Reporting.csproj" />
     <ProjectReference Include="../../src/SafeSharp.CodeFixes/SafeSharp.CodeFixes.csproj" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
@@ -17,5 +18,11 @@
     <PackageReference Include="xunit.runner.visualstudio" Version="3.1.1" PrivateAssets="all" />
     <PackageReference Include="coverlet.collector" Version="6.0.4" PrivateAssets="all" />
     <Using Include="Xunit" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- Restored by the netstandard2.0 project references. Use actual target reference symbols
+         in compatibility fixtures instead of the net10.0 test host's runtime assemblies. -->
+    <None Include="$(NuGetPackageRoot)/netstandard.library/2.0.3/build/netstandard2.0/ref/netstandard.dll"
+          Link="ReferenceAssemblies/netstandard2.0/netstandard.dll" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

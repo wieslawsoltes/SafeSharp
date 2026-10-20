@@ -27,10 +27,19 @@ public static class OwnershipCompilationAnalysis
                 maxIterations: configured!.MaxIterations, maxTrackedResources: configured.MaxTrackedResources,
                 reportPossibleIssues: configured.ReportPossibleIssues, checkSuspension: configured.CheckSuspension);
             var root = tree.GetRoot(cancellationToken);
-            foreach (var node in root.DescendantNodes().Where(n => n is BaseMethodDeclarationSyntax or AccessorDeclarationSyntax or LocalFunctionStatementSyntax))
+            foreach (var node in root.DescendantNodes().Where(n => n is BaseMethodDeclarationSyntax or AccessorDeclarationSyntax or LocalFunctionStatementSyntax ||
+                n is PropertyDeclarationSyntax { ExpressionBody: not null } or IndexerDeclarationSyntax { ExpressionBody: not null }))
             {
-                if (model.GetDeclaredSymbol(node, cancellationToken) is not IMethodSymbol method || analyzed.Contains(method)) continue;
-                var operation = model.GetOperation(node, cancellationToken);
+                var symbol = model.GetDeclaredSymbol(node, cancellationToken);
+                var method = symbol as IMethodSymbol ?? (symbol as IPropertySymbol)?.GetMethod;
+                if (method is null || analyzed.Contains(method)) continue;
+                var operationNode = node switch
+                {
+                    PropertyDeclarationSyntax property => (SyntaxNode)property.ExpressionBody!.Expression,
+                    IndexerDeclarationSyntax indexer => indexer.ExpressionBody!.Expression,
+                    _ => node
+                };
+                var operation = model.GetOperation(operationNode, cancellationToken);
                 if (operation is null) continue;
                 var graph = ControlFlowLowerer.TryCreate(operation, cancellationToken);
                 if (graph is null) continue;

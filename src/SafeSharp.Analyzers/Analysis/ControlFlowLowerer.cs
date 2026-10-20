@@ -137,7 +137,19 @@ internal static class ControlFlowLowerer
                     if ((instruction.Flags & InstructionFlags.MayThrow) == 0 || !HasExceptionalTarget(context, block.EnclosingRegion)) continue;
                     successors.Add(Intern(context.Ordinal, context.Continuation, context.Returning, context.Exceptional,
                         context.ImplicitException, context.Filter, index + 1, context.ReturnSite).Id);
-                    AddExceptionSuccessors(context, block, true, null, false, successors);
+                    if ((instruction.Flags & InstructionFlags.InvalidatesAggregateReferenceOnThrow) != 0 && instruction.Source is { } written)
+                    {
+                        var exceptionalSuccessors = new List<int>();
+                        AddExceptionSuccessors(context, block, true, null, false, exceptionalSuccessors);
+                        var exceptional = NextId();
+                        _blocks.Add(new FlowBlock(exceptional, new[] {
+                            new FlowInstruction(InstructionKind.InvalidateAggregateReference, instruction.Site, source: written,
+                                description: "a throwing call may already have replaced its writable array elements"),
+                            new FlowInstruction(InstructionKind.ReleaseReference, instruction.Site, target: written)
+                        }, exceptionalSuccessors));
+                        successors.Add(exceptional);
+                    }
+                    else AddExceptionSuccessors(context, block, true, null, false, successors);
                     split = true;
                     break;
                 }
@@ -148,7 +160,9 @@ internal static class ControlFlowLowerer
                     {
                         if (context.Returning && !context.Exceptional)
                             instructions.Add(new FlowInstruction(_lowerer.ReturnsBorrowed ? InstructionKind.Read : InstructionKind.Return, context.ReturnSite ?? _site,
-                                source: OperationLowerer.ReturnPlace, description: "validate return after finally cleanup"));
+                                source: OperationLowerer.ReturnPlace,
+                                flags: _lowerer.ReturnsBorrowed ? InstructionFlags.ValidateReturnedResult : InstructionFlags.None,
+                                description: "validate return after finally cleanup"));
                     }
                     else
                     {
@@ -231,7 +245,9 @@ internal static class ControlFlowLowerer
         private bool HasExceptionalTarget(Context context, ControlFlowRegion region)
         {
             if (context.Filter is not null) return true;
-            for (var current = region; current.EnclosingRegion is { } parent; current = parent)
+            // Nested Roslyn CFG roots retain their lexical enclosing region in the parent CFG.
+            // Exceptions leave the callback at its own root; parent ordinals are not local blocks.
+            for (var current = region; !ReferenceEquals(current, _graph.Root) && current.EnclosingRegion is { } parent; current = parent)
                 if (current.Kind == ControlFlowRegionKind.Try && parent.Kind is ControlFlowRegionKind.TryAndCatch or ControlFlowRegionKind.TryAndFinally)
                     return true;
             return false;
@@ -249,7 +265,7 @@ internal static class ControlFlowLowerer
             var cleanup = ImmutableArray.CreateBuilder<int>();
             var routes = ImmutableArray.CreateBuilder<ExceptionRoute>();
             var handled = false;
-            for (var current = block.EnclosingRegion; current.EnclosingRegion is { } parent && !handled; current = parent)
+            for (var current = block.EnclosingRegion; !ReferenceEquals(current, _graph.Root) && current.EnclosingRegion is { } parent && !handled; current = parent)
             {
                 if (current.Kind != ControlFlowRegionKind.Try) continue;
                 if (parent.Kind == ControlFlowRegionKind.TryAndFinally)
@@ -308,20 +324,20 @@ internal static class ControlFlowLowerer
             return Intern(route.Cleanup[0], continuation, false, true, plan.ImplicitException).Id;
         }
 
-        private static ControlFlowRegion? EnclosingFinally(ControlFlowRegion region)
+        private ControlFlowRegion? EnclosingFinally(ControlFlowRegion region)
         {
-            for (var current = region; current is not null; current = current.EnclosingRegion)
+            for (var current = region; current is not null && !ReferenceEquals(current, _graph.Root); current = current.EnclosingRegion)
                 if (current.Kind == ControlFlowRegionKind.Finally) return current;
             return null;
         }
 
         private static bool Contains(ControlFlowRegion region, int ordinal) => region.FirstBlockOrdinal <= ordinal && ordinal <= region.LastBlockOrdinal;
 
-        private static (ITypeSymbol? Type, bool Exact) ThrownType(BasicBlock block, ControlFlowBranch branch)
+        private (ITypeSymbol? Type, bool Exact) ThrownType(BasicBlock block, ControlFlowBranch branch)
         {
             if (branch.Semantics == ControlFlowBranchSemantics.Rethrow)
             {
-                for (var region = block.EnclosingRegion; region is not null; region = region.EnclosingRegion)
+                for (var region = block.EnclosingRegion; region is not null && !ReferenceEquals(region, _graph.Root); region = region.EnclosingRegion)
                     if (region.Kind == ControlFlowRegionKind.Catch) return (region.ExceptionType, false);
                 return (null, false);
             }

@@ -9,3 +9,5 @@ TestResults/
 *.nupkg
 *.snupkg
 coverage/
+__pycache__/
+*.pyc
