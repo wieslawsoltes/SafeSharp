@@ -16,6 +16,8 @@ public sealed class SemaphoreSynchronizationTests
     [InlineData("void M() { if (gate.Wait(0)) { try { value++; } finally { gate.Release(); } } }")]
     [InlineData("void M() { var taken = gate.Wait(1); if (!taken) return; try { value++; } finally { gate.Release(); } }")]
     [InlineData("void M(CancellationToken token) { gate.Wait(token); try { value++; } finally { gate.Release(1); } }")]
+    [InlineData("void M() { gate.Wait(); try { if (gate.Wait(0)) gate.Release(2); value++; } finally { gate.Release(); } }")]
+    [InlineData("async Task M() { await gate.WaitAsync(); try { if (await gate.WaitAsync(0)) gate.Release(2); value++; } finally { gate.Release(); } }")]
     [InlineData("async Task M() { await gate.WaitAsync(); try { value++; await Task.Yield(); value++; } finally { gate.Release(); } }")]
     [InlineData("async Task M(CancellationToken token) { await gate.WaitAsync(token).ConfigureAwait(false); try { value++; } finally { gate.Release(); } }")]
     [InlineData("async Task M() { if (await gate.WaitAsync(0)) { try { value++; } finally { gate.Release(); } } }")]
@@ -43,6 +45,8 @@ public sealed class SemaphoreSynchronizationTests
     [InlineData("void M() { if (gate.Wait(0)) gate.Release(); value++; }")]
     [InlineData("void M() { gate.Release(); }")]
     [InlineData("void M() { gate.Wait(); gate.Release(2); }")]
+    [InlineData("void M() { gate.Wait(); try { gate.Wait(); try { value++; } finally { gate.Release(); } } finally { gate.Release(); } }")]
+    [InlineData("async Task M() { await gate.WaitAsync(); try { await gate.WaitAsync(); try { value++; } finally { gate.Release(); } } finally { gate.Release(); } }")]
     [InlineData("void M(int count) { gate.Wait(); gate.Release(count); value++; }")]
     [InlineData("void M() { var taken = gate.Wait(0); if (taken) gate.Release(); if (taken) value++; }")]
     [InlineData("void M() { other.Wait(); try { value++; } finally { other.Release(); } }")]
@@ -125,6 +129,45 @@ public sealed class SemaphoreSynchronizationTests
         var source = Imports + "class C { " + Fields + "C() { gate = new SemaphoreSlim(0, 1); } " +
             "void M() { gate.Wait(); try { value++; } finally { gate.Release(); } } }";
         Assert.Empty(await Analyze(source));
+    }
+
+    [Theory]
+    [InlineData("C() { gate.Wait(); gate = new SemaphoreSlim(1, 1); gate.Release(); }")]
+    [InlineData("public bool Reset { init { gate.Wait(); gate = new SemaphoreSlim(1, 1); gate.Release(); } }")]
+    public async Task ReplacingReadonlyStorageCannotBalanceDifferentSemaphoreObjects(string body)
+    {
+        Assert.Contains(await Analyze(Imports + "class C { " + Fields + body + " }"), diagnostic => diagnostic.Id == "SS0049");
+    }
+
+    [Theory]
+    [InlineData("C() { var original = gate; original.Wait(); try { gate = new SemaphoreSlim(1, 1); } finally { original.Release(); } }")]
+    [InlineData("public bool Reset { init { var original = gate; original.Wait(); try { gate = new SemaphoreSlim(1, 1); } finally { original.Release(); } } }")]
+    public async Task SavedReadonlyFieldSnapshotsKeepTheirOriginalPermitIdentity(string body)
+    {
+        Assert.Empty(await Analyze(Imports + "class C { " + Fields + body + " }"));
+    }
+
+    [Fact]
+    public async Task WholeStructReplacementCannotBalanceDifferentSemaphoreObjects()
+    {
+        var source = Imports + "struct C { readonly SemaphoreSlim gate = new(1, 1); public C() {} " +
+            "void M(C replacement) { gate.Wait(); this = replacement; gate.Release(); } }";
+        Assert.Contains(await Analyze(source), diagnostic => diagnostic.Id == "SS0049");
+    }
+
+    [Fact]
+    public async Task SavedStructFieldSnapshotKeepsItsOriginalPermitIdentity()
+    {
+        var source = Imports + "struct C { readonly SemaphoreSlim gate = new(1, 1); public C() {} " +
+            "void M(C replacement) { var original = gate; original.Wait(); try { this = replacement; } finally { original.Release(); } } }";
+        Assert.Empty(await Analyze(source));
+    }
+
+    [Fact]
+    public async Task ReadonlyFieldReplacementCannotReuseAnExclusivePrecondition()
+    {
+        var source = Imports + "class C { " + Fields + "public bool Reset { [RequiresLock(nameof(gate))] init { gate = new SemaphoreSlim(1, 1); this.value++; } } }";
+        Assert.Contains(await Analyze(source), diagnostic => diagnostic.Id == "SS0049");
     }
 
     [Fact]

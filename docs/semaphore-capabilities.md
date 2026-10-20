@@ -34,6 +34,8 @@ A successful wait on a counting semaphore does not establish mutual exclusion. T
 
 The evidence follows local aliases of directly constructed instances. It also recognizes readonly source fields whose initializer constructs a binary semaphore, provided every visible constructor or init-accessor assignment preserves that bound and no member exposes a ref alias, passes the field by writable reference, or replaces a containing struct through whole-`this` assignment. Constructor-only initialization, unavailable metadata initializers, arbitrary factories, mutable field invariants, and unknown maximum counts are conservative boundaries. An ordinary `CurrentCount` read cannot prove a maximum or the caller's permit ownership.
 
+Readonly fields can change object identity within constructors and `init` accessors; mutable struct methods can replace their entire containing value. Within these bodies, each semaphore field read is treated as a separate snapshot and field-based guard preconditions remain unproved. Capture the reference in a local and use that local for both acquisition and release. Its permit stays attached to the captured object even if the field or containing struct is subsequently replaced. This bounded policy can report direct field-based acquire/release pairs in these bodies even when a particular body never replaces the field.
+
 A `[RequiresLock(nameof(parameter))]` contract on a `SemaphoreSlim` parameter requires an exclusive binary permit at each checked call. The callee assumes that precondition and must preserve the supplied permit. This is a trusted boundary when the callee's source is unavailable, just like existing lock contracts. Holding a Monitor lock on the semaphore object never satisfies a semaphore permit requirement.
 
 ## Modeled operations
@@ -68,6 +70,8 @@ finally
 The await belongs before the unconditional cleanup region. If the acquisition is inside that region and fails or is canceled, an unconditional `Release` in `finally` attempts to release a permit that was not established. A Boolean initialized to false and checked in the cleanup path can express conditional ownership.
 
 Counting semaphores still receive local acquisition/release balance checking. Their permits remain insufficient for exclusive `GuardedBy` access. Release counts do not constitute source-inferred cross-method transfer or producer/consumer signaling contracts.
+
+A proven binary semaphore is not reentrant. An unbounded second acquisition while its permit is definitely held is diagnosed. Under the checked local permit discipline, a timeout wait made while that same permit remains held can only return false normally; it does not create a second permit. This reasoning assumes no unmodeled external release.
 
 ## A reusable Task represents one acquisition
 

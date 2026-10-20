@@ -236,7 +236,7 @@ internal sealed partial class SynchronizationAnalysis
                 // Only readonly reference projections denote a stable value across repeated reads.
                 // A mutable field read is an evaluated snapshot, unique to this read site; a local
                 // can retain that snapshot, but a later field read cannot reuse its lock proof.
-                var id = field.Field.IsReadOnly && field.Field.Type.IsReferenceType && !field.Field.IsVolatile
+                var id = StableReadonlyProjection(field.Field) && field.Field.Type.IsReferenceType
                     ? field.Field.IsStatic ? Project(0, field.Field) : receiver.Identity == 0 ? 0 : Project(receiver.Identity, field.Field)
                     : field.Field.Type.IsReferenceType ? Allocation(operation) : 0;
                 if (write) evaluatedTargets[operation] = (receiver.Identity, Array.Empty<GuardValue>());
@@ -682,10 +682,18 @@ internal sealed partial class SynchronizationAnalysis
         IParameterReferenceOperation parameter => state.Get(Slot(parameter.Parameter)).Identity,
         IFlowCaptureReferenceOperation capture => state.Get(Slot(capture.Id)).Identity,
         IConversionOperation conversion => TargetIdentity(conversion.Operand, state),
-        IFieldReferenceOperation field when field.Field.IsReadOnly && field.Field.IsStatic => Project(0, field.Field),
-        IFieldReferenceOperation field when field.Field.IsReadOnly && TargetIdentity(field.Instance, state) is var id && id != 0 => Project(id, field.Field),
+        IFieldReferenceOperation field when StableReadonlyProjection(field.Field) && field.Field.IsStatic => Project(0, field.Field),
+        IFieldReferenceOperation field when StableReadonlyProjection(field.Field) && TargetIdentity(field.Instance, state) is var id && id != 0 => Project(id, field.Field),
         _ => 0
     };
+
+    private bool StableReadonlyProjection(IFieldSymbol field) => field.IsReadOnly && !field.IsVolatile &&
+        (!SynchronizationContracts.Same(field.Type, contracts.SemaphoreSlim) || !CanReplaceReadonlyStorage);
+
+    // Constructor/init writes and whole-struct reassignment can change a readonly field's
+    // object identity. A local by-value capture remains stable; the field projection does not.
+    private bool CanReplaceReadonlyStorage => method.MethodKind is MethodKind.Constructor or MethodKind.StaticConstructor ||
+        method.IsInitOnly || !method.IsStatic && method.ContainingType.TypeKind == TypeKind.Struct && !method.IsReadOnly;
 
     private void Suspend(IOperation operation, SynchronizationState state)
     {
@@ -787,6 +795,7 @@ internal sealed partial class SynchronizationAnalysis
         foreach (var field in contract.Fields)
         {
             if (!field.IsStatic && id == 0) return 0;
+            if (SynchronizationContracts.Same(field.Type, contracts.SemaphoreSlim) && !StableReadonlyProjection(field)) return 0;
             id = Project(field.IsStatic ? 0 : id, field);
         }
         return id;

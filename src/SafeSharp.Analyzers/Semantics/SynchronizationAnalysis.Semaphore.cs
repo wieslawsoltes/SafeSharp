@@ -44,6 +44,15 @@ internal sealed partial class SynchronizationAnalysis
                 var conditional = call.TargetMethod.ReturnType.SpecialType == SpecialType.System_Boolean;
                 CheckPendingSemaphoreCompetition(key, call, state);
                 var before = state.Get(key);
+                if (before.Minimum > 0 && state.SemaphoreMutexes.Contains(key.Identity))
+                {
+                    // Under the checked local permit discipline, the held binary permit
+                    // leaves no capacity for a second acquisition. A timed probe can only
+                    // complete normally with false; an unbounded wait cannot reenter.
+                    if (conditional) { result = new GuardValue(0, boolean: false); return true; }
+                    Report(call, "Wait", Name(key.Identity), "a non-reentrant binary semaphore permit is already held before this acquisition", state,
+                        GuardProtocol.SemaphoreSlim.ToString(), requiredIdentity: key.Identity);
+                }
                 Acquire(key, call, state, conditional);
                 if (conditional) result = new GuardValue(0, condition: new GuardCondition(key, before, before.Acquire(call.Syntax.GetLocation())));
                 return true;
@@ -127,8 +136,16 @@ internal sealed partial class SynchronizationAnalysis
             var exceptional = state.Clone(); exceptional.PendingWaits[token] = wait.Fault(); MayThrow(exceptional);
             var before = state.Get(wait.Key);
             if (before.Minimum > 0 && state.SemaphoreMutexes.Contains(wait.Key.Identity))
+            {
+                if (wait.Conditional && wait.Status == SemaphoreWaitStatus.Pending)
+                {
+                    var timedOut = new GuardValue(0, boolean: false);
+                    state.PendingWaits[token] = wait.Complete(timedOut);
+                    return timedOut;
+                }
                 Report(operation, "WaitAsync", Name(wait.Key.Identity), "a non-reentrant binary semaphore permit is already held before this acquisition completes", state,
                     GuardProtocol.SemaphoreSlim.ToString(), requiredIdentity: wait.Key.Identity);
+            }
             Acquire(wait.Key, operation, state, wait.Conditional || wait.Status != SemaphoreWaitStatus.Pending);
             var result = wait.Conditional && wait.Status == SemaphoreWaitStatus.Pending
                 ? new GuardValue(0, condition: new GuardCondition(wait.Key, before, before.Acquire(operation.Syntax.GetLocation())))
