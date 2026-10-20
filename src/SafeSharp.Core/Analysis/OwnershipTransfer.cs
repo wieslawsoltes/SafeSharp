@@ -16,7 +16,7 @@ internal sealed partial class OwnershipTransfer
     {
         if (state.IsUnreachable) return;
         var alternative = (instruction.Flags & InstructionFlags.Conditional) != 0 ? state.Clone() : null;
-        var storageOnly = instruction.Kind is InstructionKind.BindReference or InstructionKind.MergeReference or InstructionKind.ReleaseReference;
+        var storageOnly = instruction.Kind is InstructionKind.BindReference or InstructionKind.MergeReference or InstructionKind.ReleaseReference or InstructionKind.InvalidateAggregateReference;
         var references = storageOnly ? Array.Empty<ReferenceFact>() : state.Resolve(instruction.Source).ToArray();
         var sourceMayBeNull = !storageOnly && state.CanBeNull(instruction.Source);
         issues?.BeginInstruction(instruction, state, references);
@@ -37,6 +37,12 @@ internal sealed partial class OwnershipTransfer
                 break;
             case InstructionKind.ReadAggregateElement:
                 ReadAggregateElement(state, instruction, references, liveAfter, issues);
+                break;
+            case InstructionKind.BindAggregateElementReference:
+                BindAggregateElementReference(state, instruction, references, issues);
+                break;
+            case InstructionKind.InvalidateAggregateReference:
+                InvalidateAggregateReference(state, instruction.Source!);
                 break;
             case InstructionKind.InvalidateAggregateContents:
                 InvalidateAggregateContents(state, references);
@@ -652,11 +658,11 @@ internal sealed partial class OwnershipTransfer
     {
         if (issues is null) return;
         var old = state.Resolve(target);
-        var locations = state.ReferenceStorage.TryGetTargets(target, out var targets) ? targets : ImmutableHashSet.Create(StringComparer.Ordinal, target);
+        var locations = state.ReferenceStorage.TryGetTargets(target, out var targets) ? state.ExpandReferenceTargets(targets) : ImmutableHashSet.Create(StringComparer.Ordinal, target);
         bool Replaced(string place)
         {
             if (state.ReferenceStorage.TryGetTargets(place, out var referenced))
-                return referenced.Any(location => locations.Any(replaced => location == replaced || PlaceRelations.IsStrictDescendant(location, replaced)));
+                return state.ExpandReferenceTargets(referenced).Any(location => locations.Any(replaced => location == replaced || PlaceRelations.IsStrictDescendant(location, replaced)));
             return locations.Any(location => place == location || PlaceRelations.IsStrictDescendant(place, location));
         }
         ReferenceFact[]? survivingReferences = null;

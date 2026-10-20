@@ -50,7 +50,11 @@ public enum InstructionKind
     /// <summary>Observes only a composed proxy, without discarding an ordinary generic factory output.</summary>
     ObserveAsyncComposition,
     /// <summary>Weakens represented aggregate contents which an unmodeled call may replace.</summary>
-    InvalidateAggregateContents
+    InvalidateAggregateContents,
+    /// <summary>Binds Target to the canonical indexed storage of the aggregate value in Source.</summary>
+    BindAggregateElementReference,
+    /// <summary>Weakens canonical aggregate cells selected by the reference in Source after an opaque write.</summary>
+    InvalidateAggregateReference
 }
 
 public enum ResourceOwnership { Owned, Borrowed, External, Scoped }
@@ -92,7 +96,9 @@ public enum InstructionFlags
     /// <summary>TrackValueTask retains an already represented capability, for a cached nested asynchronous result.</summary>
     PreserveExistingCapability = 4096,
     /// <summary>The composed carrier exposes a result, rather than only completion.</summary>
-    HasAsyncResult = 8192
+    HasAsyncResult = 8192,
+    /// <summary>A frontend exception boundary whose Source is writable reference storage to weaken on the exceptional edge.</summary>
+    InvalidatesAggregateReferenceOnThrow = 16384
 }
 
 /// <summary>
@@ -140,7 +146,8 @@ public sealed class FlowInstruction
             kind == InstructionKind.ReceiveAsyncResult || kind == InstructionKind.BindAsyncResult ||
             kind == InstructionKind.TrackValueTask || kind == InstructionKind.PreserveAwaitable ||
             kind == InstructionKind.CreateAggregate || kind == InstructionKind.ReadAggregateElement || kind == InstructionKind.BeginAsyncComposition ||
-            kind == InstructionKind.BindReference || kind == InstructionKind.MergeReference || kind == InstructionKind.ReleaseReference) && string.IsNullOrEmpty(target))
+            kind == InstructionKind.BindReference || kind == InstructionKind.MergeReference || kind == InstructionKind.ReleaseReference ||
+            kind == InstructionKind.BindAggregateElementReference) && string.IsNullOrEmpty(target))
             throw new ArgumentException("This instruction requires a target place.", nameof(target));
         if ((kind == InstructionKind.Alias || kind == InstructionKind.Move || kind == InstructionKind.BorrowShared ||
             kind == InstructionKind.BorrowExclusive || kind == InstructionKind.Read || kind == InstructionKind.Write ||
@@ -152,7 +159,7 @@ public sealed class FlowInstruction
             kind == InstructionKind.ConsumeValueTask || kind == InstructionKind.PreserveAwaitable ||
             kind == InstructionKind.SetAggregateElement || kind == InstructionKind.ReadAggregateElement ||
             kind == InstructionKind.BeginAsyncComposition || kind == InstructionKind.CompleteAsyncComposition || kind == InstructionKind.ObserveAsyncComposition ||
-            kind == InstructionKind.InvalidateAggregateContents ||
+            kind == InstructionKind.InvalidateAggregateContents || kind == InstructionKind.BindAggregateElementReference || kind == InstructionKind.InvalidateAggregateReference ||
             kind == InstructionKind.BindReference || kind == InstructionKind.MergeReference) && string.IsNullOrEmpty(source))
             throw new ArgumentException("This instruction requires a source place.", nameof(source));
     }

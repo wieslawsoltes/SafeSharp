@@ -15,7 +15,7 @@ internal sealed class AbstractState : IEquatable<AbstractState>
     internal Dictionary<string, LoanFact> Loans { get; } = new(StringComparer.Ordinal);
     internal ReferenceStorageState ReferenceStorage { get; } = new();
     internal ValueTaskProtocolState ValueTasks { get; }
-    internal AbstractState() => ValueTasks = new ValueTaskProtocolState(ReferenceStorage);
+    internal AbstractState() => ValueTasks = new ValueTaskProtocolState(ReferenceStorage, ExpandReferenceTargets);
     internal bool IsUnreachable { get; set; }
 
     internal AbstractState Clone()
@@ -33,7 +33,7 @@ internal sealed class AbstractState : IEquatable<AbstractState>
     internal IReadOnlyCollection<ReferenceFact> Resolve(string? place)
     {
         if (place is null) return Array.Empty<ReferenceFact>();
-        return ReferenceStorage.TryGetTargets(place, out var targets) ? ReferenceStorageState.Read(targets, ResolveDirect) : ResolveDirect(place);
+        return ReferenceStorage.TryGetTargets(place, out var targets) ? ReferenceStorageState.Read(ExpandReferenceTargets(targets), ResolveDirect) : ResolveDirect(place);
     }
 
     private IReadOnlyCollection<ReferenceFact> ResolveDirect(string place)
@@ -54,7 +54,7 @@ internal sealed class AbstractState : IEquatable<AbstractState>
     }
 
     internal bool CanBeNull(string? place) => place is null || (ReferenceStorage.TryGetTargets(place, out var targets)
-        ? targets.Any(CanBeNullDirect) : CanBeNullDirect(place));
+        ? ExpandReferenceTargets(targets).Any(CanBeNullDirect) : CanBeNullDirect(place));
 
     private bool CanBeNullDirect(string place) => !NullablePlaces.TryGetValue(place, out var mayBeNull) || mayBeNull;
 
@@ -62,6 +62,7 @@ internal sealed class AbstractState : IEquatable<AbstractState>
     {
         if (ReferenceStorage.TryGetTargets(target, out var targets))
         {
+            targets = ExpandReferenceTargets(targets);
             var values = references.ToArray();
             foreach (var location in targets)
             {
@@ -72,6 +73,33 @@ internal sealed class AbstractState : IEquatable<AbstractState>
             }
         }
         else AssignDirect(target, references, mayBeNull);
+    }
+
+    // An address captures the aggregate identity. A wildcard selector is expanded against the
+    // current cells, so a ref taken before a later element is materialized still aliases it.
+    // A summarized allocation site represents several concrete arrays: no write through one
+    // of its addresses can replace every generation's element.
+    internal ImmutableHashSet<string> ExpandReferenceTargets(ImmutableHashSet<string> targets)
+    {
+        ImmutableHashSet<string>.Builder? expanded = null;
+        foreach (var target in targets)
+        {
+            if (!AggregateStorageLocation.TryParse(target, out var id, out var key, out var suffix) ||
+                !Resources.TryGetValue(id, out var aggregate) || aggregate.Kind != ResourceKind.Aggregate) continue;
+            var wildcard = key.IndexOf('*') >= 0;
+            if (!wildcard && !aggregate.IsAggregateSummary) continue;
+            expanded ??= targets.ToBuilder();
+            expanded.Add(ReferenceStorageState.UnknownTarget);
+            if (wildcard)
+                foreach (var element in aggregate.ElementKeys)
+                {
+                    if (AggregateStorageLocation.Overlaps(key, element))
+                        expanded.Add(OwnershipTransfer.AggregateElementCache(id, element) + suffix);
+                    if (expanded.Count > ReferenceStorageState.MaximumTargets) return ReferenceStorage.BoundExpansion(expanded);
+                }
+            if (expanded.Count > ReferenceStorageState.MaximumTargets) return ReferenceStorage.BoundExpansion(expanded);
+        }
+        return expanded is null ? targets : ReferenceStorage.BoundExpansion(expanded);
     }
 
     private void AssignDirect(string target, IEnumerable<ReferenceFact> references, bool mayBeNull)
