@@ -1,4 +1,7 @@
 using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
+using SafeSharp.Core;
 
 namespace SafeSharp.Analyzers.Analysis;
 
@@ -14,7 +17,9 @@ namespace SafeSharp.Analyzers.Analysis;
 /// </remarks>
 internal sealed class AsyncResultOriginModel
 {
+    private readonly Compilation compilation;
     private readonly INamedTypeSymbol? task;
+    private readonly INamedTypeSymbol? taskExtensions;
     private readonly INamedTypeSymbol? taskOfT;
     private readonly INamedTypeSymbol? valueTask;
     private readonly INamedTypeSymbol? valueTaskOfT;
@@ -27,7 +32,9 @@ internal sealed class AsyncResultOriginModel
 
     internal AsyncResultOriginModel(Compilation compilation)
     {
+        this.compilation = compilation;
         task = FrameworkType(compilation, "System.Threading.Tasks.Task");
+        taskExtensions = FrameworkType(compilation, "System.Threading.Tasks.TaskExtensions");
         taskOfT = FrameworkType(compilation, "System.Threading.Tasks.Task`1");
         valueTask = FrameworkType(compilation, "System.Threading.Tasks.ValueTask");
         valueTaskOfT = FrameworkType(compilation, "System.Threading.Tasks.ValueTask`1");
@@ -41,6 +48,13 @@ internal sealed class AsyncResultOriginModel
 
     internal bool IsCarrier(ITypeSymbol? type) => Is(type, taskOfT) || Is(type, valueTaskOfT);
 
+    internal (IMethodSymbol? GetAwaiter, IMethodSymbol? GetResult) AwaitPattern(SyntaxNode syntax)
+    {
+        if (syntax is not AwaitExpressionSyntax awaited) return default;
+        var information = compilation.GetSemanticModel(syntax.SyntaxTree).GetAwaitExpressionInfo(awaited);
+        return (information.GetAwaiterMethod, information.GetResultMethod);
+    }
+
     internal bool IsAwaitable(ITypeSymbol? type) => IsCarrier(type) || Is(type, configuredTask) || Is(type, configuredValueTask);
 
     internal bool IsCarrierAllocation(ITypeSymbol? type)
@@ -48,6 +62,21 @@ internal sealed class AsyncResultOriginModel
         for (var named = type as INamedTypeSymbol; named is not null; named = named.BaseType)
             if (IsCarrier(named)) return true;
         return false;
+    }
+
+    internal AsyncCompositionKind ClassifyComposition(IMethodSymbol method)
+    {
+        method = method.ReducedFrom ?? method;
+        if (method.IsStatic && Is(method.ContainingType, task))
+        {
+            if (method.Name == "WhenAll") return AsyncCompositionKind.WhenAll;
+            if (method.Name == "WhenAny") return AsyncCompositionKind.WhenAny;
+        }
+        if (!method.IsStatic && method.Name == "WaitAsync" && (Is(method.ContainingType, task) || Is(method.ContainingType, taskOfT)))
+            return AsyncCompositionKind.WaitAsync;
+        if (method.IsStatic && method.Name == "Unwrap" && method.Parameters.Length == 1 && Is(method.ContainingType, taskExtensions))
+            return AsyncCompositionKind.Unwrap;
+        return AsyncCompositionKind.None;
     }
 
     internal AsyncResultOriginOperation Classify(IMethodSymbol method)

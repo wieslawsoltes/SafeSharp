@@ -48,7 +48,8 @@ public sealed class PlaceLivenessTests
         {
             var instructions = new[]
             {
-                new FlowInstruction(kind, Site, target: "target", source: source, owner: "owner"),
+                new FlowInstruction(kind, Site, target: "target", source: source, owner: "owner",
+                    asyncComposition: kind == InstructionKind.BeginAsyncComposition ? AsyncCompositionKind.WhenAll : AsyncCompositionKind.None),
                 new FlowInstruction(InstructionKind.Read, Site, source: "target.child"),
                 new FlowInstruction(InstructionKind.Read, Site, source: "target[0]"),
                 new FlowInstruction(InstructionKind.Read, Site, source: "targetOther"),
@@ -263,9 +264,16 @@ public sealed class PlaceLivenessTests
         var blocks = new Dictionary<int, FlowBlock>();
         foreach (var id in ids)
         {
-            var instructions = Enumerable.Range(0, random.Next(0, 25)).Select(_ => new FlowInstruction(kinds[random.Next(kinds.Length)], Site,
-                target: places[random.Next(places.Length)], source: places[random.Next(places.Length)],
-                owner: random.Next(3) == 0 ? places[random.Next(places.Length)] : null)).ToArray();
+            var instructions = Enumerable.Range(0, random.Next(0, 25)).Select(_ =>
+            {
+                var kind = kinds[random.Next(kinds.Length)];
+                var target = places[random.Next(places.Length)];
+                var source = places[random.Next(places.Length)];
+                var owner = random.Next(3) == 0 ? places[random.Next(places.Length)] : null;
+                return new FlowInstruction(kind, Site, target: target, source: source,
+                    owner: kind == InstructionKind.SetAggregateElement ? owner ?? source : owner,
+                    asyncComposition: kind == InstructionKind.BeginAsyncComposition ? AsyncCompositionKind.WhenAll : AsyncCompositionKind.None);
+            }).ToArray();
             var successors = Enumerable.Range(0, random.Next(0, 5)).Select(_ => ids[random.Next(ids.Length)]);
             blocks.Add(id, new(id, instructions, successors));
         }
@@ -285,7 +293,14 @@ public sealed class PlaceLivenessTests
     private static void AssertMatchesOracle(IReadOnlyDictionary<int, FlowBlock> blocks, int budget)
     {
         var predecessors = Predecessors(blocks);
-        var expected = HashSetLivenessOracle.Compute(blocks, predecessors, budget, default);
+        // Preserve the frozen pre-ref-storage solver as an independent oracle. The newer
+        // MergeReference opcode has the same structural liveness as its existing MergeAlias
+        // instruction: it reads the previous target as well as the new source.
+        var oracleBlocks = blocks.ToDictionary(pair => pair.Key, pair => new FlowBlock(pair.Value.Id,
+            pair.Value.Instructions.Select(instruction => instruction.Kind == InstructionKind.MergeReference
+                ? new FlowInstruction(InstructionKind.MergeAlias, instruction.Site, instruction.Target, instruction.Source,
+                    owner: instruction.Owner) : instruction), pair.Value.Successors));
+        var expected = HashSetLivenessOracle.Compute(oracleBlocks, predecessors, budget, default);
         var actual = PlaceLiveness.Compute(blocks, predecessors, budget, default);
         Assert.Equal(expected.BudgetExceeded, actual.BudgetExceeded);
         foreach (var id in blocks.Keys)

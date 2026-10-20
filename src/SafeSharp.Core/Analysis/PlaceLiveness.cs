@@ -137,7 +137,7 @@ internal sealed class PlaceLiveness
             var target = instruction.Kind == InstructionKind.Nop ? -1 : universe.Index(instruction.Target);
             Kill = target < 0 ? null : universe.KillFor(target);
             Source = instruction.Kind == InstructionKind.Nop ? -1 : universe.Index(instruction.Source);
-            MergeTarget = instruction.Kind == InstructionKind.MergeAlias ? target : -1;
+            MergeTarget = instruction.Kind is InstructionKind.MergeAlias or InstructionKind.MergeReference ? target : -1;
             Owner = universe.Index(instruction.Owner);
         }
 

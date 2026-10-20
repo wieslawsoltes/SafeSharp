@@ -64,6 +64,17 @@ public sealed class ExceptionalLifetimeReturnTests
         Assert.Equal(violation, diagnostics.Any(diagnostic => diagnostic.Id == "SS0041"));
     }
 
+    [Theory]
+    [InlineData("try { return ref input; } finally { input = other; }", true)]
+    [InlineData("ref Resource alias = ref input; try { return ref alias; } finally { alias = other; }", true)]
+    [InlineData("ref Resource alias = ref input; try { return ref alias; } finally { alias = ref other; }", false)]
+    public async Task RefReturnsCaptureStorageAndValidateItsValueAfterCleanup(string body, bool violation)
+    {
+        var source = Prelude + "[ReturnsBorrowed(\"input\")] static ref Resource M(ref Resource input, ref Resource other) { " + body + " } }";
+        var diagnostics = await AnalyzerTestHost.GetDiagnosticsAsync(source, new LifetimeContractAnalyzer());
+        Assert.Equal(violation, diagnostics.Any(diagnostic => diagnostic.Id == "SS0041"));
+    }
+
     private static Task<System.Collections.Immutable.ImmutableArray<Microsoft.CodeAnalysis.Diagnostic>> Analyze(string body) =>
         AnalyzerTestHost.GetDiagnosticsAsync(Prelude + "[return: Lifetime(\"a\")] Resource M([Lifetime(\"a\")] Resource input, Resource other, bool choose) { " + body + " } }",
             new LifetimeContractAnalyzer());

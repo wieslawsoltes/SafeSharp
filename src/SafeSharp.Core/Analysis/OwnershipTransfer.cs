@@ -6,7 +6,7 @@ using System.Linq;
 namespace SafeSharp.Core;
 
 /// <summary>Transfer semantics and source-grounded rule evaluation, independent of the fixed-point scheduling policy.</summary>
-internal sealed class OwnershipTransfer
+internal sealed partial class OwnershipTransfer
 {
     private readonly AnalysisOptions options;
     internal OwnershipTransfer(AnalysisOptions options) => this.options = options;
@@ -16,15 +16,39 @@ internal sealed class OwnershipTransfer
     {
         if (state.IsUnreachable) return;
         var alternative = (instruction.Flags & InstructionFlags.Conditional) != 0 ? state.Clone() : null;
-        var references = state.Resolve(instruction.Source).ToArray();
-        var sourceMayBeNull = state.CanBeNull(instruction.Source);
+        var storageOnly = instruction.Kind is InstructionKind.BindReference or InstructionKind.MergeReference or InstructionKind.ReleaseReference;
+        var references = storageOnly ? Array.Empty<ReferenceFact>() : state.Resolve(instruction.Source).ToArray();
+        var sourceMayBeNull = !storageOnly && state.CanBeNull(instruction.Source);
         issues?.BeginInstruction(instruction, state, references);
         switch (instruction.Kind)
         {
+            case InstructionKind.BindReference:
+            case InstructionKind.MergeReference:
+                state.ReferenceStorage.Bind(instruction.Target!, instruction.Source!, instruction.Kind == InstructionKind.MergeReference);
+                break;
+            case InstructionKind.ReleaseReference:
+                state.ReferenceStorage.Release(instruction.Target!);
+                break;
+            case InstructionKind.CreateAggregate:
+                CreateAggregate(state, instruction, blockId, instructionIndex, liveAfter, issues);
+                break;
+            case InstructionKind.SetAggregateElement:
+                SetAggregateElement(state, instruction, references, liveAfter, issues);
+                break;
+            case InstructionKind.ReadAggregateElement:
+                ReadAggregateElement(state, instruction, references, liveAfter, issues);
+                break;
+            case InstructionKind.BeginAsyncComposition:
+                BeginAsyncComposition(state, instruction, references, blockId, instructionIndex, liveAfter, issues);
+                break;
+            case InstructionKind.CompleteAsyncComposition:
+                CompleteAsyncComposition(state, instruction, references, blockId, instructionIndex, liveAfter, issues);
+                break;
             case InstructionKind.Allocate:
                 Allocate(state, instruction, blockId, instructionIndex, liveAfter, issues);
                 break;
             case InstructionKind.Alias:
+            case InstructionKind.PreserveAwaitable:
                 CheckMoved(state, instruction, references, issues);
                 CheckOverwrite(state, instruction, instruction.Target!, references, issues, liveAfter);
                 state.Assign(instruction.Target!, references, sourceMayBeNull);
@@ -95,8 +119,19 @@ internal sealed class OwnershipTransfer
             case InstructionKind.BeginAsyncFactory:
                 BeginAsyncFactory(state, instruction, blockId, instructionIndex, liveAfter, issues);
                 break;
+            case InstructionKind.ObserveAsyncComposition:
+                CheckMoved(state, instruction, references, issues);
+                foreach (var reference in references)
+                {
+                    ObserveComposedDisposal(state, instruction, reference);
+                    if (state.Resources.TryGetValue(reference.ResourceId, out var composition) && composition.Composition != AsyncCompositionKind.None)
+                        state.Resources[composition.Id] = composition.Transition(TransferStatus(composition.Status, ResourceStatus.Completed, !reference.CoversResource),
+                            "composition-observation", "The composed operation is observed without assuming successful payload production.", instruction.Site);
+                }
+                break;
             case InstructionKind.ObserveAsyncFactory:
                 CheckMoved(state, instruction, references, issues);
+                foreach (var reference in references) ObserveComposedDisposal(state, instruction, reference);
                 foreach (var reference in references)
                     if (reference.Projection.Length == 0 && state.Resources.TryGetValue(reference.ResourceId, out var factory) &&
                         factory.Kind == ResourceKind.AsyncFactoryCarrier)
@@ -138,6 +173,8 @@ internal sealed class OwnershipTransfer
                 if (instruction.Target is not null) state.Forget(instruction.Target);
                 break;
             case InstructionKind.Nop:
+            case InstructionKind.TrackValueTask:
+            case InstructionKind.ConsumeValueTask:
                 break;
             case InstructionKind.AssumeNull:
                 if (!state.CanBeNull(instruction.Source)) state.IsUnreachable = true;
@@ -173,6 +210,7 @@ internal sealed class OwnershipTransfer
             default:
                 throw new ArgumentOutOfRangeException(nameof(instruction), instruction.Kind, "Unknown ownership instruction.");
         }
+        state.ValueTasks.Apply(instruction, state, blockId, instructionIndex, liveAfter, issues);
         if (alternative is not null) state.JoinAlternative(alternative);
         issues?.EndInstruction();
     }
@@ -212,7 +250,7 @@ internal sealed class OwnershipTransfer
         var evidence = ImmutableDictionary.Create<string, AnalysisEvidence>(StringComparer.Ordinal).Add(EvidenceFacts.Key(fact), fact);
         var carrier = new ResourceFact(id, ResourceOwnership.Owned, ResourceStatus.Pending, instruction.Site, instruction.Flags,
             ImmutableHashSet.Create<string>(StringComparer.Ordinal), evidence, ResourceKind.AsyncFactoryCarrier,
-            resultState: AsyncResultState.Deferred);
+            resultState: AsyncResultState.Deferred, asyncResultDepth: instruction.AsyncResultDepth);
         TrackAllocation(state, instruction, carrier, false, liveAfter, issues);
     }
 
@@ -226,6 +264,12 @@ internal sealed class OwnershipTransfer
         var nullable = state.CanBeNull(instruction.Source);
         var id = instruction.ResourceId ?? "completed-factory:" + blockId + ":" + index;
         var pending = (instruction.Flags & InstructionFlags.DeferredAsyncResult) != 0;
+        var cache = AsyncResultCache(id);
+        var retained = state.Resources.ContainsKey(id) && RetainsAllocation(state, id, instruction.Target, liveAfter);
+        var previous = retained ? state.Resolve(cache).ToArray() : Array.Empty<ReferenceFact>();
+        var previousProtocols = retained ? state.ValueTasks.Resolve(cache).ToArray() : Array.Empty<ReferenceFact>();
+        var protocols = state.ValueTasks.Resolve(instruction.Source).ToArray();
+        var wasNullable = retained && state.CanBeNull(cache);
         var fact = new AnalysisEvidence("factory-binding", pending
             ? "An asynchronous return contract retains this existing result identity without assuming that completion has occurred."
             : "A framework result producer wraps this already available value without creating a second owned resource.", instruction.Site);
@@ -234,53 +278,89 @@ internal sealed class OwnershipTransfer
             ImmutableHashSet.Create<string>(StringComparer.Ordinal), evidence, ResourceKind.AsyncFactoryCarrier,
             resultState: AsyncResultState.Materialized);
         TrackAllocation(state, instruction, carrier, false, liveAfter, issues);
-        state.Assign(AsyncResultCache(id), references, nullable);
+        state.Assign(cache, retained ? previous.Concat(references).Select(value => value.WithAbsence(false)) : references, nullable || wasNullable);
+        state.ValueTasks.Assign(cache, retained ? previousProtocols.Concat(protocols).Select(value => value.WithAbsence(false)) : protocols);
     }
 
-    internal static IEnumerable<ReferenceFact> IncludingFactoryResults(AbstractState state, IEnumerable<ReferenceFact> references)
+    internal static IEnumerable<ReferenceFact> IncludingFactoryResults(AbstractState state, IEnumerable<ReferenceFact> references,
+        bool transferOnly = false, ISet<string>? excludedCaches = null)
     {
-        foreach (var reference in references)
+        // Allocation-site carriers and aggregates can form cycles at loop joins. Traverse the
+        // finite graph iteratively and propagate only monotonically weaker alias facts.
+        var roots = references as ReferenceFact[] ?? references.ToArray();
+        if (roots.Length == 0) return roots;
+        if (roots.Length == 1 && (!state.Resources.TryGetValue(roots[0].ResourceId, out var only) ||
+            only.Kind is not (ResourceKind.AsyncFactoryCarrier or ResourceKind.Aggregate) && only.ResultState == AsyncResultState.None)) return roots;
+        var pending = new Queue<ReferenceFact>(roots);
+        var seen = new Dictionary<string, ReferenceFact>(StringComparer.Ordinal);
+        while (pending.Count != 0)
         {
-            yield return reference;
-            if (reference.Projection.Length != 0 || !state.Resources.TryGetValue(reference.ResourceId, out var carrier) ||
-                carrier.Kind != ResourceKind.AsyncFactoryCarrier || (carrier.ResultState & AsyncResultState.Materialized) == 0) continue;
-            foreach (var result in state.Resolve(AsyncResultCache(carrier.Id)))
-                yield return reference.CoversResource ? result : result.WithAbsence(false);
+            var reference = pending.Dequeue();
+            if (seen.TryGetValue(reference.Key, out var previous))
+            {
+                reference = previous.Join(reference);
+                if (previous.Equals(reference)) continue;
+            }
+            seen[reference.Key] = reference;
+            if (reference.Projection.Length != 0 || !state.Resources.TryGetValue(reference.ResourceId, out var resource)) continue;
+            foreach (var cache in ContainedCaches(resource, transferOnly))
+            {
+                if (excludedCaches?.Contains(cache) == true) continue;
+                foreach (var value in state.Resolve(cache))
+                    pending.Enqueue(reference.CoversResource ? value : value.WithAbsence(false));
+            }
+            if (transferOnly && resource.Composition is AsyncCompositionKind.WhenAll or AsyncCompositionKind.Unwrap &&
+                (resource.Flags & InstructionFlags.HasAsyncResult) == 0)
+                foreach (var value in IncludingFactoryResults(state, state.Resolve(AsyncDependencyCache(resource.Id)))
+                    .Where(value => state.Resources.TryGetValue(value.ResourceId, out var dependency) && dependency.Kind == ResourceKind.AsyncDisposalCompletion))
+                    pending.Enqueue(reference.CoversResource ? value : value.WithAbsence(false));
         }
+        return seen.Values;
+    }
+
+    internal static IEnumerable<string> ContainedCaches(ResourceFact resource, bool transferOnly = false)
+    {
+        if (resource.Kind == ResourceKind.Aggregate)
+            foreach (var key in resource.ElementKeys) yield return AggregateElementCache(resource.Id, key);
+        if ((resource.ResultState & AsyncResultState.Materialized) != 0)
+            yield return AsyncResultCache(resource.Id);
+        if (resource.Composition != AsyncCompositionKind.None && (!transferOnly ||
+            resource.Composition is AsyncCompositionKind.WhenAll or AsyncCompositionKind.Unwrap &&
+            (resource.Flags & InstructionFlags.HasAsyncResult) != 0))
+            yield return AsyncDependencyCache(resource.Id);
     }
 
     private static void TransferFactoryResults(AbstractState state, FlowInstruction instruction, ReferenceFact[] references, IssueCollector? issues)
     {
-        foreach (var reference in references)
+        var roots = references.Select(reference => reference.Key).ToImmutableHashSet(StringComparer.Ordinal);
+        var represented = IncludingFactoryResults(state, references).Where(reference => !roots.Contains(reference.Key)).ToArray();
+        CheckUse(state, instruction, represented, issues);
+        CheckBorrowedEscape(state, instruction, represented, issues);
+        CheckLoans(state, instruction, represented, "SS0005", "A carrier or aggregate cannot transfer a represented result while a loan to that result remains live.",
+            _ => true, false, issues);
+        var transferred = IncludingFactoryResults(state, references, transferOnly: true).Where(reference => !roots.Contains(reference.Key)).ToArray();
+        var localMove = instruction.Kind == InstructionKind.Move && instruction.Target is not null;
+        var caches = localMove ? IncludingFactoryResults(state, references, transferOnly: true)
+            .Where(reference => reference.Projection.Length == 0 && state.Resources.ContainsKey(reference.ResourceId))
+            .SelectMany(reference => ContainedCaches(state.Resources[reference.ResourceId], transferOnly: true)).Distinct(StringComparer.Ordinal)
+            .Select(cache => new { Cache = cache, Values = state.Resolve(cache).ToArray(), Nullable = state.CanBeNull(cache) }).ToArray() : null;
+        foreach (var value in transferred)
         {
-            if (reference.Projection.Length != 0 || !state.Resources.TryGetValue(reference.ResourceId, out var carrier) ||
-                carrier.Kind != ResourceKind.AsyncFactoryCarrier || (carrier.ResultState & AsyncResultState.Materialized) == 0) continue;
-            var cache = AsyncResultCache(carrier.Id);
-            var cached = state.Resolve(cache).ToArray();
-            var values = reference.CoversResource ? cached : cached.Select(value => value.WithAbsence(false)).ToArray();
-            CheckUse(state, instruction, values, issues);
-            CheckBorrowedEscape(state, instruction, values, issues);
-            CheckLoans(state, instruction, values, "SS0005", "A factory carrier cannot transfer its received result while a loan to that result remains live.",
-                _ => true, false, issues);
-            var localMove = instruction.Kind == InstructionKind.Move && instruction.Target is not null;
-            foreach (var value in values)
-            {
-                if (instruction.Kind == InstructionKind.Move) InvalidateAliases(state, value, instruction.Site, !value.CoversResource);
-                if (localMove || value.Projection.Length != 0 || value.LoanId is not null ||
-                    !state.Resources.TryGetValue(value.ResourceId, out var resource) || resource.Ownership != ResourceOwnership.Owned) continue;
-                state.Resources[value.ResourceId] = resource.Transition(TransferStatus(resource.Status,
-                    instruction.Kind == InstructionKind.Escape ? ResourceStatus.Escaped : ResourceStatus.Transferred, !value.CoversResource),
-                    "factory-result-transfer", "Responsibility for the received result leaves with its factory carrier.", instruction.Site);
-            }
-            // A local carrier Move invalidates existing payload aliases, but its destination keeps
-            // the original cached result. An already stale cached result is never made available.
-            if (localMove) state.Assign(cache, cached, state.CanBeNull(cache));
+            if (instruction.Kind == InstructionKind.Move) InvalidateAliases(state, value, instruction.Site, !value.CoversResource);
+            if (localMove || value.Projection.Length != 0 || value.LoanId is not null ||
+                !state.Resources.TryGetValue(value.ResourceId, out var resource) || resource.Ownership != ResourceOwnership.Owned) continue;
+            state.Resources[value.ResourceId] = resource.Transition(TransferStatus(resource.Status,
+                instruction.Kind == InstructionKind.Escape || instruction.Kind == InstructionKind.SetAggregateElement ? ResourceStatus.Escaped : ResourceStatus.Transferred,
+                !value.CoversResource), "contained-transfer", "Responsibility for this represented result leaves with its carrier or aggregate.", instruction.Site);
         }
+        if (caches is not null)
+            foreach (var item in caches) state.Assign(item.Cache, item.Values, item.Nullable);
     }
 
     private static void ReceiveAsyncResult(AbstractState state, FlowInstruction instruction, ReferenceFact[] references,
-        int blockId, int index, ISet<string> liveAfter, IssueCollector? issues)
+        int blockId, int index, ISet<string> liveAfter, IssueCollector? issues, bool completeComposition = true)
     {
+        if (completeComposition) CompleteAsyncComposition(state, instruction, references, blockId, index, liveAfter, issues);
         CheckMoved(state, instruction, references, issues);
         var received = new List<ReferenceFact>();
         var external = references.Length == 0;
@@ -301,19 +381,21 @@ internal sealed class OwnershipTransfer
             var values = new List<ReferenceFact>();
             var cacheMayBeNull = false;
             if (materialized) values.AddRange(previous);
-            if ((carrier.ResultState & AsyncResultState.Deferred) != 0)
+            if (carrier.Composition == AsyncCompositionKind.None && (carrier.ResultState & AsyncResultState.Deferred) != 0)
             {
                 var id = "async-result:" + carrier.Id;
                 var nullable = (carrier.Flags & InstructionFlags.MayBeNull) != 0;
                 var absent = nullable || reference.MayBeAbsent || (carrier.Status & ResourceStatus.Absent) != 0;
                 var produced = new AnalysisEvidence("factory-result", "The owned result becomes available only after this successful completion.", instruction.Site);
-                var resource = new ResourceFact(id, ResourceOwnership.Owned, ResourceStatus.Alive | (absent ? ResourceStatus.Absent : ResourceStatus.None),
+                var nested = carrier.AsyncResultDepth > 1;
+                var resource = new ResourceFact(id, ResourceOwnership.Owned, (nested ? ResourceStatus.Pending : ResourceStatus.Alive) | (absent ? ResourceStatus.Absent : ResourceStatus.None),
                     instruction.Site, carrier.Flags, ImmutableHashSet.Create<string>(StringComparer.Ordinal),
-                    carrier.Evidence.SetItem(EvidenceFacts.Key(produced), produced));
+                    carrier.Evidence.SetItem(EvidenceFacts.Key(produced), produced), nested ? ResourceKind.AsyncFactoryCarrier : ResourceKind.Resource,
+                    resultState: nested ? AsyncResultState.Deferred : AsyncResultState.None, asyncResultDepth: Math.Max(1, carrier.AsyncResultDepth - 1));
                 if (state.Resources.TryGetValue(id, out var old))
                 {
-                    var retained = materialized || liveAfter.Where(place => place != instruction.Target && place != cache)
-                        .SelectMany(state.Resolve).Any(value => value.ResourceId == id && !value.DefinitelyMoved);
+                    var retained = materialized || IncludingFactoryResults(state, liveAfter.Where(place => place != instruction.Target && place != cache)
+                        .SelectMany(state.Resolve)).Any(value => value.ResourceId == id && !value.DefinitelyMoved);
                     if (retained) resource = resource.Join(old);
                     else if (old.HasOutstandingObligation && (old.Flags & InstructionFlags.SuppressLeak) == 0)
                         issues?.Add("SS0011", "Receiving a new result from this repeated factory site abandons an undisposed earlier result.", instruction.Site,
@@ -377,8 +459,8 @@ internal sealed class OwnershipTransfer
         if (state.Resources.TryGetValue(id, out var previous))
         {
             if (previous.Kind != resource.Kind) throw new ArgumentException("A resource identity cannot change its resource kind.", nameof(instruction));
-            var retained = liveAfter.Where(place => place != instruction.Target && !PlaceRelations.IsStrictDescendant(place, instruction.Target!))
-                .SelectMany(state.Resolve).Any(reference => reference.ResourceId == id && (reference.Availability & ReferenceAvailability.Available) != 0);
+            var retained = RetainsAllocation(state, id, instruction.Target, liveAfter);
+            state.ValueTasks.RenewCarrier(id, retained);
             if (previous.Kind == ResourceKind.AsyncDisposalCompletion && previous.HasOutstandingObligation)
                 issues?.Add("SS0017", retained
                     ? "A completion from an earlier execution of this disposal site may still be pending."
@@ -567,6 +649,27 @@ internal sealed class OwnershipTransfer
     {
         if (issues is null) return;
         var old = state.Resolve(target);
+        var locations = state.ReferenceStorage.TryGetTargets(target, out var targets) ? targets : ImmutableHashSet.Create(StringComparer.Ordinal, target);
+        bool Replaced(string place)
+        {
+            if (state.ReferenceStorage.TryGetTargets(place, out var referenced))
+                return referenced.Any(location => locations.Any(replaced => location == replaced || PlaceRelations.IsStrictDescendant(location, replaced)));
+            return locations.Any(location => place == location || PlaceRelations.IsStrictDescendant(place, location));
+        }
+        ReferenceFact[]? survivingReferences = null;
+        HashSet<string>? liveResourceIds = null;
+        ReferenceFact[] SurvivingReferences() => survivingReferences ??= liveAfter is null ? Array.Empty<ReferenceFact>() :
+            IncludingFactoryResults(state, liveAfter.Where(place => !Replaced(place)).SelectMany(state.Resolve),
+                excludedCaches: locations.ToImmutableHashSet(StringComparer.Ordinal)).ToArray();
+        bool UsableCache(string place)
+        {
+            var owner = CacheOwner(place);
+            if (owner is null) return true;
+            if (liveAfter is null) return false;
+            liveResourceIds ??= new HashSet<string>(SurvivingReferences().Where(value => !value.DefinitelyMoved)
+                .Select(value => value.ResourceId), StringComparer.Ordinal);
+            return liveResourceIds.Contains(owner);
+        }
         foreach (var reference in old)
         {
             if (reference.LoanId is not null || reference.DefinitelyMoved
@@ -580,9 +683,9 @@ internal sealed class OwnershipTransfer
             // edge can abandon that stack without executing its normal ReleaseLoan instructions.
             // A dead snapshot is not a surviving handle; live snapshots and ordinary aliases are.
             var otherReferences = (completion || factory) && liveAfter is not null
-                ? liveAfter.Where(place => place != target && !PlaceRelations.IsStrictDescendant(place, target)).SelectMany(state.Resolve)
-                : state.Places.Where(pair => pair.Key != target && !PlaceRelations.IsStrictDescendant(pair.Key, target) &&
-                    IsUsableResultCache(state, pair.Key, liveAfter) &&
+                ? SurvivingReferences()
+                : state.Places.Where(pair => !Replaced(pair.Key) &&
+                    UsableCache(pair.Key) &&
                     (!pair.Key.StartsWith("$t:call-", StringComparison.Ordinal) || liveAfter is null ||
                      liveAfter.Any(live => live == pair.Key || PlaceRelations.IsStrictDescendant(live, pair.Key))))
                     .SelectMany(pair => pair.Value.Values);
@@ -598,12 +701,19 @@ internal sealed class OwnershipTransfer
         }
     }
 
-    private static bool IsUsableResultCache(AbstractState state, string place, ISet<string>? liveAfter)
+    private static string? CacheOwner(string place)
     {
-        if (!place.StartsWith(AsyncResultCachePrefix, StringComparison.Ordinal)) return true;
-        if (liveAfter is null) return false;
-        var carrier = place.Substring(AsyncResultCachePrefix.Length);
-        return liveAfter.SelectMany(state.Resolve).Any(reference => reference.ResourceId == carrier && !reference.DefinitelyMoved);
+        string? owner = null;
+        if (place.StartsWith(AsyncResultCachePrefix, StringComparison.Ordinal)) owner = place.Substring(AsyncResultCachePrefix.Length);
+        else if (place.StartsWith(AsyncDependencyCachePrefix, StringComparison.Ordinal)) owner = place.Substring(AsyncDependencyCachePrefix.Length);
+        else if (place.StartsWith(AggregateElementCachePrefix, StringComparison.Ordinal))
+        {
+            var start = AggregateElementCachePrefix.Length;
+            var separator = place.IndexOf(':', start);
+            if (separator > start && int.TryParse(place.Substring(start, separator - start), out var length) && place.Length >= separator + 1 + length)
+                owner = place.Substring(separator + 1, length);
+        }
+        return owner;
     }
 
     private static void CheckLoans(AbstractState state, FlowInstruction instruction, ReferenceFact[] references,
@@ -649,16 +759,8 @@ internal sealed class OwnershipTransfer
     private static void CheckSuspension(AbstractState state, FlowInstruction instruction, ISet<string> liveAfter, IssueCollector? issues)
     {
         if (issues is null) return;
-        var directReferences = liveAfter.SelectMany(state.Resolve).ToArray();
-        List<ReferenceFact>? cachedReferences = null;
-        foreach (var reference in directReferences)
-        {
-            if (reference.DefinitelyMoved || !state.Resources.TryGetValue(reference.ResourceId, out var resource) ||
-                resource.Kind != ResourceKind.AsyncFactoryCarrier || (resource.ResultState & AsyncResultState.Materialized) == 0) continue;
-            foreach (var cached in state.Resolve(AsyncResultCache(reference.ResourceId)))
-                (cachedReferences ??= new List<ReferenceFact>(directReferences)).Add(cached);
-        }
-        IReadOnlyCollection<ReferenceFact> liveReferences = cachedReferences is not null ? cachedReferences : directReferences;
+        var liveReferences = IncludingFactoryResults(state, liveAfter.SelectMany(state.Resolve)
+            .Where(reference => !reference.DefinitelyMoved)).ToArray();
         foreach (var loan in state.Loans.Values)
         {
             if (loan.AllowsSuspension || !liveReferences.Any(reference => reference.LoanId is not null && LoanAncestors(state, reference.LoanId).Contains(loan.Id))) continue;

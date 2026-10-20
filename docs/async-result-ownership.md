@@ -105,7 +105,7 @@ The result cache is an analysis fact, not a newly invented C# local that owns cl
 
 `Wait()` remains a completion observation for SafeSharp's separate asynchronous **disposal** protocol. It does not claim an owned factory output. Waiting without retrieving `T`, reading `IsCompleted`, discarding the task, or disposing the `Task` therefore does not establish cleanup of an owned result. Timeout and cancellation waits do not prove successful reception either.
 
-The analyzer models payload ownership when `ValueTask<T>` is used, but does not establish its single-consumption API discipline. Repeated arbitrary `ValueTask` use, mixed `AsTask`/`await` consumption, and use before completion remain separate rules of the framework API. [`Preserve()`](https://learn.microsoft.com/en-us/dotnet/api/system.threading.tasks.valuetask-1.preserve) provides a carrier suitable for repeated future use, subject to its requirement that the original value is no longer used. Preserving the same abstract payload on repeated use prevents an ownership reset; it does not validate every sequence of `ValueTask` consumption.
+The analyzer separately tracks the single-consumption capability of `ValueTask` and `ValueTask<T>`. `SS0048` checks repeated awaits, mixed `AsTask`/`await` consumption, `Result`/`GetResult`, and consumption after transfer through stable aliases and control-flow joins. [`Preserve()`](https://learn.microsoft.com/en-us/dotnet/api/system.threading.tasks.valuetask-1.preserve) consumes the original capability and provides a reusable carrier while preserving the same payload identity. Proving runtime completion before synchronous observation remains a separate boundary. See [ValueTask consumption capabilities](value-task-consumption.md).
 
 ## Diagnostics and evidence
 
@@ -119,11 +119,11 @@ The engine counts the carrier and its possible output against the tracked-resour
 
 ## Boundaries
 
-The model covers the recognized factory's immediate `T`, not arbitrary `Task.WhenAll`, `WhenAny`, `ContinueWith`, custom schedulers, task unwrapping, nested task combinators, or user-defined awaiter semantics. Such APIs need explicit models of their output identity and ownership protocol. It does not infer cleanup simply because a method accepts a task or observes it internally without a consuming contract.
+The model follows represented nested carrier layers and source-proven nested return shapes. It also honors ownership and receiver-bounded borrow summaries of Roslyn's selected custom `GetResult` method. See [nested asynchronous ownership](nested-async-ownership.md). Direct framework `Task.WhenAll`, `WhenAny`, `Unwrap`, and `WaitAsync` calls now have identity-preserving completion models; see [Task composition](async-task-composition.md) for array snapshots, success/fault effects, and transfer rules. Arbitrary input enumerables, `ContinueWith`, custom schedulers, cross-method composition graphs, and custom builder internals remain explicit boundaries. The analyzer does not infer cleanup simply because a method accepts a task or observes it internally without a consuming contract.
 
 For an uncontracted task result, the frontend creates an external result identity after reception. It does not infer that the payload aliases the task object or that the payload is freshly owned. Borrowed payload contracts retain their source loans in a distinct carrier, while borrowed task-carrier aliases do not become payload aliases. Arbitrary task inputs, heap recovery through unknown aliases, reflection, and external method behavior remain subject to the documented source-summary and heap boundaries.
 
-The analysis is a may/must product over allocation sites, not a count of concrete task instances. Multiple live generations from one loop site can therefore retain conservative alternatives. It does not predict runtime completion, cancellation, physical cleanup success, or whether a `ValueTask` implementation permits a particular sequence of consumption operations.
+The analysis is a may/must product over allocation sites, not a count of concrete task instances. Multiple live generations from one loop site can therefore retain conservative alternatives. It does not predict runtime completion, cancellation, or physical cleanup success. ValueTask consumption checks enforce the documented general API contract rather than depending on a particular `IValueTaskSource` implementation.
 
 ## Rust and framework references
 

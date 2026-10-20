@@ -17,7 +17,10 @@ explicit external-storage and unknown-storage flags. Returning a conditional ref
 possible location. Pure ref-identity helpers preserve the caller's stored value. Writable calls
 apply their normal-return postconditions simultaneously, because formal parameter order does not
 specify write order when two actual arguments alias the same location. A write through one C#
-reference parameter may also modify another reference parameter that aliases it.
+reference parameter may also modify another reference parameter that aliases it. Normal ref-output
+origins compose through source calls: reference arguments select their addresses during argument
+evaluation, then snapshot their incoming values at call entry. A callee can return an earlier
+by-value snapshot even when it subsequently replaces the referenced cell.
 
 ```csharp
 static ref Resource Identity(ref Resource value) => ref value;
@@ -54,8 +57,8 @@ writing its arguments, the exceptional state treats writable ref/out locations a
 throws refine compatible catches. An implicit exception has an unknown type unless more precise
 information is available, so the analysis retains every possible compatible handler.
 
-The return operand is a value snapshot. Reassigning its local during cleanup does not replace the
-value that C# already captured for return:
+An ordinary return operand is a value snapshot. Reassigning its local during cleanup does not
+replace the value that C# already captured for return:
 
 ```csharp
 static Resource Factory(Resource external)
@@ -65,6 +68,12 @@ static Resource Factory(Resource external)
     finally { value = external; }
 }
 ```
+
+A `ref` or `ref readonly` return instead captures a storage location. Cleanup can replace the
+value stored in that location; inference and lifetime checking read that cell at normal exit.
+Rebinding the ref local used by the return does not redirect the already captured location.
+The ownership engine uses the same distinction through its
+[reference-storage domain](reference-storage-analysis.md).
 
 Disposing the captured object is different. Allocations carry finite site identities, so disposal
 through another alias invalidates the returned origin. `Ownership.Move` changes ownership
@@ -142,5 +151,5 @@ Pinned Rust 1.91.0 sources:
 
 The executable regression suites are `ReferenceOriginSummaryTests`,
 `ExceptionalOriginSummaryTests`, `LifetimeContractAnalyzerTests`, and
-`ExceptionalLifetimeReturnTests`. They compile valid fixtures with Roslyn before running the real
+`ExceptionalLifetimeReturnTests`, and `ReferenceStorageOwnershipTests`. They compile valid fixtures with Roslyn before running the real
 analyzers, and include both proofs that must be accepted and stale proofs that must be rejected.

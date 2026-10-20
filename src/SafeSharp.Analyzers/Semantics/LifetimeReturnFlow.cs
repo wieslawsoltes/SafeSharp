@@ -89,7 +89,11 @@ internal sealed class LifetimeReturnFlow
                     var origins = Evaluate(branch, state, 0);
                     if (block.FallThroughSuccessor?.Semantics == ControlFlowBranchSemantics.Return ||
                         block.ConditionalSuccessor?.Semantics == ControlFlowBranchSemantics.Return)
+                    {
                         state.Values[ReturnedValue] = origins;
+                        if (contract.Method.ReturnsByRef || contract.Method.ReturnsByRefReadonly)
+                            state.RefTargets[ReturnedValue] = ArgumentTargets(state, branch);
+                    }
                 }
                 foreach (var outgoing in SourceControlFlowRouter.Branches(block))
                     foreach (var successor in router.Successors(currentContext, outgoing)) propagate(successor, state);
@@ -103,7 +107,8 @@ internal sealed class LifetimeReturnFlow
                 var context = router[pair.Key];
                 if (!router.IsNormalExit(context) || context.ReturnOperation is not { } returned) continue;
                 var state = pair.Value;
-                var origins = state.Values.TryGetValue(ReturnedValue, out var captured) ? captured : Unknown(returned, "missing return snapshot");
+                var origins = contract.Method.ReturnsByRef || contract.Method.ReturnsByRefReadonly ? Read(state, ReturnedValue, returned) :
+                    state.Values.TryGetValue(ReturnedValue, out var captured) ? captured : Unknown(returned, "missing return snapshot");
                 origins = origins.SelectMany(origin => state.InvalidOrigins.Contains(origin.Key)
                     ? Unknown(returned, "a result invalidated by disposal or consumption before normal completion") : One(origin)).ToImmutableHashSet();
                 if (!contract.Method.IsAsync && IsFrameworkAwaitable(contract.Method.ReturnType))

@@ -219,9 +219,11 @@ internal static class MethodOriginAnalysis
             if (opaque || exit is null) return Opaque();
             var outputs = ImmutableDictionary.CreateBuilder<int, ImmutableHashSet<string>>();
             foreach (var parameter in method.Parameters)
-                if (parameter.RefKind == RefKind.Out && exit.Values.TryGetValue(Slot(parameter), out var origins))
+                if (parameter.RefKind is RefKind.Ref or RefKind.Out && exit.Values.TryGetValue(Slot(parameter), out var origins))
                     outputs[parameter.Ordinal] = ExportValues(origins, exit);
             var returned = exit.Values.TryGetValue(Returned, out var returnedValue) ? returnedValue : UnknownOrigins;
+            if ((method.ReturnsByRef || method.ReturnsByRefReadonly) && exit.References.TryGetValue(Returned, out var returnedTargets))
+                returned = ReadTargets(returnedTargets, exit);
             var shapes = ImmutableHashSet.CreateBuilder<MethodReturnOrigin>();
             ExportOrigins(returned, exit, method.IsAsync && asyncResults.IsCarrier(method.ReturnType) ? 1 : 0,
                 new HashSet<int>(), shapes);
@@ -744,25 +746,44 @@ internal static class MethodOriginAnalysis
         {
             var values = new Dictionary<int, ImmutableHashSet<string>>();
             references = new Dictionary<int, ImmutableHashSet<int>>();
+            foreach (var argument in arguments)
+            {
+                var ordinal = argument.Parameter?.Ordinal ?? -1;
+                if (argument.Parameter is { RefKind: not RefKind.None } && IsAddressable(argument.Value))
+                    references[ordinal] = Targets(argument.Value, state, depth + 1);
+                else values[ordinal] = Evaluate(argument.Value, state, depth + 1);
+            }
+            InvalidateCapturedStorage(state);
+            // Addresses are selected left-to-right. Their incoming values are read when the call
+            // starts, after all argument expressions have run, and before any output is installed.
+            foreach (var pair in references) values[pair.Key] = ReadTargets(pair.Value, state);
             var writes = new Dictionary<int, ImmutableHashSet<string>>();
             var definite = new HashSet<int>();
             foreach (var argument in arguments)
             {
-                var ordinal = argument.Parameter?.Ordinal ?? -1;
-                if (argument.Parameter is { RefKind: not RefKind.None } parameter && IsAddressable(argument.Value))
+                if (argument.Parameter is not { RefKind: RefKind.Ref or RefKind.Out } parameter ||
+                    effect.PreservedRefParameters.Contains(parameter.Ordinal) || !references.TryGetValue(parameter.Ordinal, out var targets)) continue;
+                var replacement = UnknownOrigins;
+                if (effect.OwnedOutputParameters.TryGetValue(parameter.Ordinal, out var nullable))
                 {
-                    var targets = Targets(argument.Value, state, depth + 1);
-                    references[ordinal] = targets;
-                    if (parameter.RefKind is RefKind.Out or RefKind.Ref && !effect.PreservedRefParameters.Contains(ordinal))
-                    {
-                        var replacement = effect.OwnedOutputParameters.TryGetValue(ordinal, out var nullable) ? FreshAt(argument) : UnknownOrigins;
-                        if (nullable) replacement = replacement.Add(Null);
-                        AddWrites(targets, replacement, writes, definite);
-                    }
+                    replacement = FreshAt(argument);
+                    if (nullable) replacement = replacement.Add(Null);
                 }
-                else values[ordinal] = Evaluate(argument.Value, state, depth + 1);
+                else if (effect.ReferenceOutputs.TryGetValue(parameter.Ordinal, out var output))
+                {
+                    replacement = EmptyOrigins;
+                    foreach (var origin in output)
+                    {
+                        if (origin == Null) replacement = replacement.Add(Null);
+                        else if (origin.StartsWith("$parameter:", StringComparison.Ordinal) &&
+                            int.TryParse(origin.Substring(11), out var source) && values.TryGetValue(source, out var value))
+                            replacement = replacement.Union(value);
+                        else replacement = replacement.Add(Unknown);
+                    }
+                    if (replacement.IsEmpty) replacement = UnknownOrigins;
+                }
+                AddWrites(targets, replacement, writes, definite);
             }
-            InvalidateCapturedStorage(state);
             // Apply normal-return postconditions together. The order of formal parameters says
             // nothing about a callee's write order when several ref/out actuals share storage.
             foreach (var pair in writes)
@@ -772,7 +793,6 @@ internal static class MethodOriginAnalysis
                 state.Values[pair.Key] = definite.Contains(pair.Key) ? pair.Value :
                     pair.Value.Union(state.Values.TryGetValue(pair.Key, out var previous) ? previous : UnknownOrigins);
             }
-            foreach (var pair in references) values[pair.Key] = ReadTargets(pair.Value, state);
             return values;
         }
 
