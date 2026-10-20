@@ -253,7 +253,8 @@ internal static partial class LifetimeDelegateAnalysis
         private readonly Compilation compilation;
 
         internal Binding(LifetimeContractModel promised, LifetimeContractModel actual, int boundParameters, Location location,
-            RegionSolverOptions options, CancellationToken cancellationToken, Compilation compilation, bool receiverSuppliedByCaller = false)
+            RegionSolverOptions options, CancellationToken cancellationToken, Compilation compilation, bool receiverSuppliedByCaller = false,
+            string? suppliedReceiverRegion = null, bool directCall = false)
         {
             this.promised = promised;
             this.cancellationToken = cancellationToken;
@@ -302,8 +303,20 @@ internal static partial class LifetimeDelegateAnalysis
                     AddEdge(requirements, required, supplied, site, "Writable ref/out storage is invariant.");
             }
             if (LifetimeContractModel.HasReceiver(actual.Method))
-                AddEdge(requirements, receiverSuppliedByCaller && universals.TryGetValue("this", out var suppliedReceiver) ? suppliedReceiver : Universal("$receiver", "captured receiver"), inference["this"], site,
+                AddEdge(requirements, receiverSuppliedByCaller && universals.TryGetValue(suppliedReceiverRegion ?? "this", out var suppliedReceiver) ? suppliedReceiver : Universal("$receiver", "captured receiver"), inference["this"], site,
                     receiverSuppliedByCaller ? "The inherited receiver is supplied by the caller." : "The captured receiver has a lifetime independent of later delegate inputs.");
+            if (directCall)
+            {
+                // A direct invocation has a nonempty evaluation extent. Without this lower bound,
+                // every type requirement could be satisfied by an empty inferred region and unknown
+                // type provenance would accidentally count as a proof.
+                var call = Universal("$call", "the current invocation extent");
+                foreach (var region in promised.ParameterRegions.OfType<string>().Concat(promised.TypePositions.Where(position => position.RegionScope.Length == 0).Select(position => position.Region)).Concat(suppliedReceiverRegion is null ? Array.Empty<string>() : new[] { suppliedReceiverRegion }).Distinct(StringComparer.Ordinal))
+                    if (universals.TryGetValue(region, out var supplied))
+                        AddEdge(assumptions, supplied, call, site, "Supplied input regions cover the current invocation.");
+                foreach (var required in inference.Values.ToArray())
+                    AddEdge(requirements, required, call, site, "A callee input lifetime covers the current invocation.");
+            }
         }
 
         internal bool AddReturn(LifetimeContractModel actual, MethodSummary summary, bool promisesAsyncPayload)
