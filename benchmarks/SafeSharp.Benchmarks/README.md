@@ -6,7 +6,7 @@ This console project measures the Core liveness, region, reference-storage, and 
 dotnet run --project benchmarks/SafeSharp.Benchmarks -c Release -- liveness --iterations 15 --warmup 5 --json artifacts/benchmarks/liveness.json
 ```
 
-The liveness comparison uses the frozen SafeSharp `fd66dc0` HashSet solver shared with the differential unit tests. Named-region comparisons accept an independently built baseline Core assembly:
+The liveness comparison uses the original SafeSharp `fd66dc0` HashSet fixed-point algorithm shared with the differential unit tests. Its independent transfer logic has been extended for newer reference-storage instructions, including captured-address uses; it does not reuse the optimized effect compiler. Historical benchmark records retain the instruction semantics of their measured checkpoints. Named-region comparisons accept an independently built baseline Core assembly:
 
 ```bash
 DOTNET_TieredCompilation=0 dotnet run --project benchmarks/SafeSharp.Benchmarks -c Release -- regions --baseline-core /path/to/baseline/SafeSharp.Core.dll --iterations 15 --warmup 5 --json artifacts/benchmarks/regions.json

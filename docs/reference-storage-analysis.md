@@ -9,11 +9,14 @@ separate domains throughout ownership analysis.
 
 `ReferenceStorageState` maps a reference place to immutable, flattened storage targets. A new
 reference copies the targets selected at binding time, so rebinding its source cannot redirect an
-older alias. `BindReference`, `MergeReference`, and `ReleaseReference` are explicit frontend
-instructions; release removes an address snapshot without replacing its target's value.
+older alias. `BindReference`, `MergeReference`, `ReleaseReference`, and
+`BindAggregateElementReference` are explicit frontend instructions. The aggregate binding captures
+an evaluated array identity and normalized index; release removes an address snapshot without
+replacing its target's value.
 
-Resource and ValueTask reads resolve the same storage domain. A write to one known target is a
-strong replacement. A write through several possible targets is weak: each selected location
+Resource and ValueTask reads resolve the same storage domain. A write to one exact target that
+represents a single instance is a strong replacement. Alternative targets, wildcard indices, and
+summarized aggregate generations require weak writes: each selected location
 retains both the old and incoming values, and their presence is conditional. Joins retain every
 possible target. The analyzer never disposes both alternatives merely because a conditional ref
 can designate either one.
@@ -63,16 +66,31 @@ by-value result need a richer allocation-identity relation and are not guessed. 
 ref effects retain both the original value and an opaque replacement outcome.
 
 These postconditions apply only after normal call completion. Source summary and lifetime inference
-invalidate possible exceptional ref writes; normal fresh output allocations are not replayed on a
-throwing edge. Precise interprocedural exceptional write histories are not inferred by the caller's
-ownership graph.
+invalidate possible exceptional ref writes. For represented aggregate-element refs, the caller's
+CFG applies `InvalidateAggregateReference` on the exceptional continuation before filter selection
+and finally unwinding. It weakens the saved ref/out targets while preserving independent by-value
+snapshots and normal-return summaries; normal fresh output allocations are not replayed on a
+throwing edge. Precise interprocedural exceptional write histories are not inferred.
 
 Opaque ref returns retain possible reference-argument locations plus an explicit unknown target.
 Proven external storage stays external. These facts do not establish new ownership of arbitrary
-heap cells, dynamic dispatch, or native mutation. Mutable refs into the canonical element caches
-used for async aggregate arrays are not yet composed with this storage domain; direct array effects
-and local/parameter refs are analyzed separately. Source write postconditions retain the documented
+heap cells, dynamic dispatch, or native mutation. Source write postconditions retain the documented
 bounds in [source summary analysis](source-summary-analysis.md).
+
+For represented arrays, ordinary element access, local refs, conditional refs, source-proven ref
+returns, and ref/out outputs share canonical resource and ValueTask cells. Captured addresses stay
+attached to the evaluated array when the original variable or another ref is rebound. Unknown
+indices expand conservatively over matching cells, including cells materialized later, and repeated
+allocation generations remain weak. Earlier value copies and `Task.WhenAll`/`Task.WhenAny` input
+snapshots keep their captured identities. Value writes through refs keep the address live; rebinding
+or releasing a ref ends its former binding's liveness.
+
+External or structurally projected arrays without represented aggregate identities remain opaque.
+Symbolic integer equalities, arbitrary collection storage, pointer arithmetic, and concurrent
+mutation are outside this sequential model. Canonical identity does not derive child loans from
+parent container loans or prove that a later ref write respects every subsequently created loan of
+the containing array. See [canonical aggregate references](aggregate-reference-storage.md) for the
+supported storage rules, exceptional effects, and deep-container permission boundary.
 
 ## Protocols, diagnostics, and reports
 
@@ -86,7 +104,7 @@ JSON exposes `referenceStorage` and HTML displays a reference-storage table besi
 aliases. This distinction explains whether an assignment changed a value or selected a new cell.
 
 The domain permits at most 256 targets per reference, 4,096 bindings, and 4,096 characters per
-projected location. Bounds guard pathological projection growth and alias unions. Exceeding one
+projected location. Bounds guard pathological projection growth, alias unions, and wildcard target expansion. Exceeding one
 stops ownership analysis with `SS0015`; a truncated target set is never treated as a completed
 safety result. Singleton reads and writes use direct storage lookup, while only conditional targets
 need resource-fact unions.

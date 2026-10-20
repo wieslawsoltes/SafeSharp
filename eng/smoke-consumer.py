@@ -100,7 +100,10 @@ public sealed class GuardedAsyncCounter {
     public async Task Good() { await gate.WaitAsync().ConfigureAwait(false); try { value++; await Task.Yield(); value++; } finally { gate.Release(); } }
 }
 ''', encoding="utf-8")
-    good = run(["build", "Consumer.csproj", "--nologo", "-v", "minimal"], root)
+    # Explicit configuration excludes inherited exact-ID source mappings that
+    # could otherwise select an older same-version package from the dependency feed.
+    restore_config = "-p:RestoreConfigFile=" + str(root / "NuGet.Config")
+    good = run(["build", "Consumer.csproj", "--nologo", "-v", "minimal", restore_config], root)
     if any(code in good for code in ("AD0001", "AD0002", "CS8032", "CS8034")):
         raise SystemExit("Analyzer failed to load in the package consumer\n" + good)
     assets = json.loads((root / "obj" / "project.assets.json").read_text(encoding="utf-8"))
@@ -277,7 +280,7 @@ public sealed class GuardedAsyncCounter {
     analyzer_assets = assets["libraries"][f"SafeSharp.Analyzers/{args.version}"]
     analyzer_path = root / "packages" / analyzer_assets["path"] / "analyzers/dotnet/cs/SafeSharp.Analyzers.dll"
     code_fixes_path = root / "packages" / code_fixes["path"] / "analyzers/dotnet/cs/SafeSharp.CodeFixes.dll"
-    run(["build", "PackageHost.csproj", "--nologo", "-v", "minimal",
+    run(["build", "PackageHost.csproj", "--nologo", "-v", "minimal", restore_config,
          "-p:SafeSharpPackageVersion=" + args.version], host)
     host_output = run([str(host / "bin/Debug/net10.0/PackageHost.dll"), str(analyzer_path), str(code_fixes_path)], host)
     print(host_output.strip())

@@ -38,6 +38,24 @@ The tiny graph has 4 blocks, 32 instructions, and 16 places. Dense joins use 64 
 
 **The sparse-temporary case was slower in this run:** 9.0612 ms compared with 7.5847 ms, a 19.5% elapsed-time increase. It allocated 1,626,368 bytes compared with 3,016,632 bytes, a 46.1% reduction. That allocation improvement does not erase the time regression. The remaining four shapes improved elapsed time and allocations relative to this frozen baseline. The result does not establish a universal liveness speedup, and elapsed medians alone do not identify the cause of the sparse-case overhead. Domain discovery, effect compilation, and boundary materialization are included in both measurements.
 
+## Inline-word follow-up
+
+After the preceding run, [commit `162038d`](https://github.com/wieslawsoltes/SafeSharp/commit/162038deceb3abb489d0aba3c1eb7a2ba777c22b) changed place discovery to ordinal array sorting, maintained single-bit counts directly, and embedded a single occupied word/index inside an immutable `PlaceSet`. Larger dense and sparse representations remain available. Portable arithmetic preserves the `netstandard2.0` target.
+
+The complete follow-up record is [2026-10-20-inline-liveness.json](benchmarks/2026-10-20-inline-liveness.json). It used five warmups and fifteen alternating measured samples, .NET 10.0.13 on Ubuntu 24.04.3 LTS/x64, `DOTNET_TieredCompilation=0`, and a two-logical-processor runtime limit. All five scenarios passed their independent liveness comparisons. The measured Core SHA-256 is `211ce92ac515727c394d710aba32565a79a4846073a9b1e91b569e6878002a85`.
+
+| Scenario | Earlier indexed allocated bytes | Inline-word allocated bytes | Follow-up baseline ms | Follow-up indexed ms |
+| --- | ---: | ---: | ---: | ---: |
+| Tiny | 12,640 | 11,416 | 0.0585 | 0.0315 |
+| Dense joins | 333,536 | 333,280 | 1,080.5253 | 5.9227 |
+| Projection loop | 596,256 | 599,944 | 6,043.0251 | 18.3624 |
+| Sparse temporaries | 1,626,368 | 1,314,896 | 89.4838 | 32.4193 |
+| Unchanged boundaries | 254,840 | 253,720 | 42.0092 | 1.9667 |
+
+Sparse-temporary allocation fell by 311,472 bytes, or 19.2%, relative to the preceding optimized record. Projection-loop allocation increased by 3,688 bytes; the change is not an allocation improvement for every shape.
+
+The follow-up ran under substantial shared-host contention. Its elapsed medians and large within-run ratios are preserved as observations, but do not establish a performance improvement over the earlier candidate or a whole-build speedup. The allocation comparison is the useful narrow result here. These measurements also precede the later canonical-reference extension that keeps captured addresses live across value writes; they are a record of the identified checkpoint, not timings of every subsequent feature. The current independent HashSet oracle preserves its original fixed-point algorithm while extending transfer rules separately for those newer instructions.
+
 ## Named regions: eleven current-only measurements
 
 No `--baseline-core` assembly was supplied, so every baseline and speedup field for these scenarios is `null`. The nine query cases solve the complete relation graph, perform two relation queries, and request one shortest proof. The two all-proofs cases solve the graph and materialize every implied relation's complete shortest path. Chains have `N - 1` edges; cycles have `N` edges; disconnected cases split the chain into groups of eight regions.

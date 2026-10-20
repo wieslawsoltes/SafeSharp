@@ -36,7 +36,7 @@ sealed class Counter
 
 `[GuardedBy]` applies to fields, properties, and returned references. A property contract is also a precondition for its accessors: its getter assumes read access and its setter assumes write access. A reference read from guarded storage retains the obligation in locals, captures, and supported ref aliases. Copying an immutable value, such as an `int`, ends that obligation after the protected read.
 
-`[RequiresLock]` applies to methods, constructors, and delegates. Calls must establish the requirement; the body assumes it. `LockAccess.Read` accepts a reader, upgradeable reader, or writer capability for a reader/writer lock. The default `LockAccess.Write` requires an exclusive/writer capability. Monitor and `System.Threading.Lock` are exclusive protocols in either case.
+`[RequiresLock]` applies to methods, constructors, and delegates. Calls must establish the requirement; the body assumes it. `LockAccess.Read` accepts a reader, upgradeable reader, or writer capability for a reader/writer lock. The default `LockAccess.Write` requires an exclusive/writer capability. Monitor, `System.Threading.Lock`, and proven binary `SemaphoreSlim` permits provide exclusive capabilities in either case.
 
 A guard path can start at `this`, a by-value reference parameter, or a readonly static field. Further components must be readonly, nonvolatile reference fields. Properties, mutable fields, boxing-dependent/value-type roots, dynamic roots, unresolved type parameters, writable or readonly by-reference parameter roots, empty components, and paths longer than 32 fields do not establish a stable contract. A local by-value snapshot can still hold the result of reading a mutable field.
 
@@ -51,10 +51,11 @@ Constructor requirements are checked at `new` expressions, including parameter a
 | `Monitor` | `lock` on an ordinary reference; `Enter`, `TryEnter`; `ref bool lockTaken` overloads; `IsEntered` | `Exit`; `Wait`, `Pulse`, and `PulseAll` require current-thread ownership. Normal `Wait` completion retains the same monitor capability. |
 | `System.Threading.Lock` | Statically typed `lock`; `Enter`, `TryEnter`, `EnterScope`; `IsHeldByCurrentThread` | `Exit`; `Lock.Scope.Dispose`; lexical/using cleanup. Scope values copied before disposal remain distinct disposal obligations on the same underlying lock depth. |
 | `ReaderWriterLockSlim` | `EnterReadLock`, `EnterUpgradeableReadLock`, `EnterWriteLock`; their `TryEnter` variants; `IsReadLockHeld`, `IsUpgradeableReadLockHeld`, `IsWriteLockHeld` | Matching mode exits. Reads accept read/upgradeable/write; mutation requires write. Direct read-to-write upgrades are diagnosed. |
+| `SemaphoreSlim` | Successful `Wait`; successful observation of a represented `WaitAsync` task; Boolean timeout results refine acquisition. Task copies and supported awaiter wrappers retain one acquisition token. | `Release` checks permit counts; `Dispose` checks outstanding acquired or pending permits. Exclusive guarded access requires a proven `maxCount` of `1`. |
 
-Framework intrinsics are matched by resolved symbols from supported framework assemblies. Source-defined lookalikes named `System.Threading.Monitor`, `Lock`, or `ReaderWriterLockSlim` do not grant capabilities.
+Framework intrinsics are matched by resolved type and member symbols from supported framework assemblies. Source-defined lookalikes named `System.Threading.Monitor`, `Lock`, `ReaderWriterLockSlim`, or `SemaphoreSlim` do not grant capabilities; unrelated custom awaitables do not establish semaphore acquisition.
 
-The three protocols remain distinct even when they refer to the same object. For example, `Monitor.Enter(aThreadingLock)` and `lock ((object)aThreadingLock)` do not establish the `System.Threading.Lock` capability expected by a guard whose static type is `System.Threading.Lock`.
+The four protocols remain distinct even when they refer to the same object. For example, `Monitor.Enter(aThreadingLock)` and `lock ((object)aThreadingLock)` do not establish the `System.Threading.Lock` capability expected by a guard whose static type is `System.Threading.Lock`. Holding a Monitor lock on a `SemaphoreSlim` object likewise does not establish a semaphore permit. See [SemaphoreSlim capabilities](semaphore-capabilities.md) for binary-construction evidence, asynchronous acquisition tokens, release counts, and conservative protocol boundaries.
 
 Recursive acquisition counts use finite intervals. A minimum greater than zero establishes a must-capability; the maximum preserves possible unreleased acquisitions. Counts saturate after 16 nested acquisitions, with an unbounded upper approximation. Deep recursion can therefore produce conservative diagnostics. The checker does not infer `ReaderWriterLockSlim.LockRecursionPolicy`: in particular, the mixed upgradeable-read plus read to write transition permitted by `SupportsRecursion` remains conservatively diagnosed. It does not certify every recursion-policy exception.
 
@@ -94,7 +95,7 @@ The engine reuses the exception-normalized [source CFG router](source-summary-an
 
 Roslyn 4.14 can expose the valid C# `lock (System.Threading.Lock)` construct as an invalid CFG placeholder without an explicit scope-disposal edge. SafeSharp normalizes only that shape after verifying the original bound `ILockOperation` and exact framework type. It models the lexical scope's entry and normal/exceptional exit; arbitrary invalid operations never grant a capability.
 
-A capability that may cross `await` or `yield` produces `SS0049`. The continuation cannot reuse its former must-hold proof. All three supported primitives have thread-affine ownership; an asynchronous continuation is not assumed to resume on the acquiring thread.
+A Monitor, `System.Threading.Lock`, or `ReaderWriterLockSlim` capability that may cross `await` or `yield` produces `SS0049`. These protocols have thread-affine ownership, so the continuation cannot reuse its former must-hold proof. A proven `SemaphoreSlim` permit retains its local capability across suspension because that protocol is not thread-affine. Merely obtaining a `WaitAsync` task grants no permit, and awaiting it while a thread-affine lock may be held still diagnoses that lock.
 
 ## Protected references and call boundaries
 

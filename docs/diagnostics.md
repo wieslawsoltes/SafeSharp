@@ -1,12 +1,12 @@
 # Diagnostic reference
 
-SafeSharp implements **42 Roslyn diagnostics across five analyzers** for ownership, borrowing, disposal, explicit lifetime regions, concurrency contracts, and dependency injection. They run during compiler and IDE analysis. The ownership engine computes effects over Roslyn control-flow graphs; separate semantic, boundary, lifetime, and concurrency analyzers check their corresponding declarations, implementation obligations, and call boundaries.
+SafeSharp implements **43 Roslyn diagnostics across five analyzers** for ownership, borrowing, disposal, explicit lifetime regions, concurrency contracts, and dependency injection. They run during compiler and IDE analysis. The ownership engine computes effects over Roslyn control-flow graphs; separate semantic, boundary, lifetime, and concurrency analyzers check their corresponding declarations, implementation obligations, and call boundaries.
 
 Every rule below is implemented. “Implemented” describes the stated check within the documented model, not equivalence to Rust's language-level guarantees. `Ownership.Move`, `Borrow`, and `BorrowMut` are metadata-bearing passthrough methods; C# still permits aliasing and value-type copies at runtime. See [implementation status](implementation-status.md), [architecture](architecture.md), [contracts](contracts-and-semantics.md), and [Rust design references](rust-design.md) for the analysis domain and its limits.
 
 ## Rule matrix
 
-“Info” appears as a suggestion in typical IDE configurations. Every diagnostic can be configured with `dotnet_diagnostic.<ID>.severity`. Within SS0001–SS0049, only SS0018–SS0019 and SS0035–SS0039 are unassigned.
+“Info” appears as a suggestion in typical IDE configurations. Every diagnostic can be configured with `dotnet_diagnostic.<ID>.severity`. Within SS0001–SS0050, only SS0018–SS0019 and SS0035–SS0039 are unassigned.
 
 | ID | Implemented check | Analyzer | Default | Enabled |
 | --- | --- | --- | --- | --- |
@@ -52,6 +52,7 @@ Every rule below is implemented. “Implemented” describes the stated check wi
 | [SS0047](#ss0047) | Callback violates an annotated delegate lifetime contract | Lifetime | Warning | Yes |
 | [SS0048](#ss0048) | ValueTask capability is consumed or transferred more than once | Ownership | Warning | Yes |
 | [SS0049](#ss0049) | Required synchronization guard or lock protocol is not established | Concurrency | Warning | Yes |
+| [SS0050](#ss0050) | Direct invocation does not satisfy an explicit lifetime requirement | Lifetime | Warning | Yes |
 
 The public analyzer classes and descriptor categories are:
 
@@ -831,9 +832,38 @@ sealed class Counter
 }
 ```
 
-Acquire the declared guard around the access or call, and release it on the required cleanup paths. A RequiresLock precondition is assumed when checking its body and required at callers; it does not acquire a lock at runtime. Valid guard paths identify the instance receiver, a method parameter or a supported stable field chain. The same field name on a different object is a different guard. Monitor, System.Threading.Lock and ReaderWriterLockSlim use distinct protocols; reader/writer operations additionally require the appropriate mode.
+Acquire the declared guard around the access or call, and release it on the required cleanup paths. A RequiresLock precondition is assumed when checking its body and required at callers; it does not acquire a lock at runtime. Valid guard paths identify the instance receiver, a method parameter or a supported stable field chain. The same field name on a different object is a different guard. Monitor, System.Threading.Lock, ReaderWriterLockSlim and SemaphoreSlim use distinct protocols; reader/writer operations additionally require the appropriate mode.
+
+A SemaphoreSlim guard requires supported evidence that its maximum count is exactly one. A successful supported wait acquires a permit, a false timeout/fault/cancellation does not, and observing the same wait Task repeatedly cannot acquire extra permits. Release counts, pending waits, disposal and supplied RequiresLock capabilities retain separate obligations. Semaphore permits may remain held across await; the three thread-affine lock protocols retain their suspension restriction. Unknown wrappers and unproved maximum counts do not establish exclusive guarded access. See [semaphore capabilities](semaphore-capabilities.md).
 
 The diagnostic properties `SafeSharp.SynchronizationRequired`, `SafeSharp.SynchronizationProtocol`, `SafeSharp.SynchronizationHeld` and `SafeSharp.SynchronizationReason` preserve the requirement and observed abstract guard state. Structured HeldCount/Held records retain protocol and acquisition intervals; Access/AccessMode and RequiredIdentity preserve the member, mode and evaluated guard label when available. HTML/DOT/Mermaid show required-versus-recorded relationships without inferring identity equality from display names; JSON/SARIF retain the exact properties. Related locations identify the relevant declaration/acquisition. This is a sequential capability analysis over explicit contracts and supported APIs. GuardedBy does not make an otherwise invalid Sync structure valid; that composition check still has its own requirements. Guard analysis does not discover arbitrary synchronization, prove all thread interleavings, establish deadlock freedom or replace CLR memory-order rules. Complex/unknown effects retain the limitations in [synchronization analysis](synchronization-analysis.md); budget exhaustion receives SS0046 rather than a successful proof.
+
+## SS0050
+
+**Direct invocation does not satisfy an explicit lifetime requirement.** A method with input TypeLifetime paths or an outer TypeOutlives requirement is called without sufficient caller evidence for those requirements. The callee's requirements are obligations; calling the method never turns them into caller assumptions.
+
+```csharp
+using System.Collections.Generic;
+using SafeSharp;
+
+static void Use([TypeLifetime("item", "arg0")] List<object> values) { }
+
+static void Valid([TypeLifetime("a", "arg0")] List<object> values)
+{
+    Use(values);
+}
+
+static void MissingEvidence(List<object> values)
+{
+    Use(values); // SS0050: the borrowed-content lifetime is not established.
+}
+```
+
+Supply a compatible annotated input and the required caller outlives/type-bound assumptions. The existing structural solver checks invariant writable positions, supported generic variance, nested callable binders and placeholder visibility. Callee regions must cover a nonempty invocation extent; assigning an empty inferred region cannot conceal a missing type proof. Named/reordered arguments, extension receivers, inherited declarations and constructed generic parameters use symbol-based argument binding.
+
+Evidence comes from stable declared caller parameters, supported receiver facts and transparent local aliases. Bounded, compilation-local effect summaries invalidate nested content evidence after relevant replacement, ref exposure, mutation, unknown calls/accessors, heap/deferred escapes or loop-carried effects. A modeled `[Borrowed, DoesNotEscape]` parameter preserves read-only, nonretaining input evidence; either contract alone does not supply both properties. Arbitrary factory results, conditional inputs and inferred collection contents remain outside the supported proof.
+
+`SafeSharp.CallTarget`, `SafeSharp.CallArguments`, `SafeSharp.CallReason` and `SafeSharp.CallEvidence` retain the binding and missing fact. Related locations identify contract declarations. Region assumptions/requirements, universes, visibility proofs and type bounds are retained when the solver produces them; HTML, DOT, Mermaid, JSON and SARIF show those actual witnesses. A region/evidence budget failure receives SS0043 and withholds a compatibility result. See [direct invocation lifetime contracts](direct-call-lifetimes.md) for accepted/rejected examples, cache and cancellation behavior, and the precise evidence boundaries.
 
 ## Configuration and adoption
 
