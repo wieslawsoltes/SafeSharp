@@ -69,7 +69,7 @@ for path in sorted(root.glob("*.nupkg")):
         if identity == "SafeSharp.Tool":
             if not any(item.attrib.get("name") == "DotnetTool" for item in metadata.findall(".//{*}packageType")):
                 raise SystemExit(identity + ": DotnetTool package type required")
-            for assembly in ("Microsoft.Build.dll", "Microsoft.Build.Framework.dll", "Microsoft.Build.Tasks.Core.dll", "Microsoft.Build.Utilities.Core.dll"):
+            for assembly in ("Microsoft.Build.dll", "Microsoft.Build.Framework.dll", "Microsoft.Build.Tasks.Core.dll", "Microsoft.Build.Utilities.Core.dll", "Microsoft.NET.StringTools.dll"):
                 if "tools/net10.0/any/" + assembly in names:
                     raise SystemExit(identity + ": MSBuild must resolve from the selected SDK, not the tool's runtime directory")
             settings = ET.fromstring(package.read("tools/net10.0/any/DotnetToolSettings.xml"))
