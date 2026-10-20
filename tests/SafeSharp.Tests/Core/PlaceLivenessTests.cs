@@ -201,6 +201,49 @@ public sealed class PlaceLivenessTests
         }
     }
 
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(63)]
+    [InlineData(64)]
+    [InlineData(127)]
+    [InlineData(128)]
+    public void SingleOccupiedWordsRetainOrdinalIdentityThroughSparseDenseAndEmptyTransitions(int word)
+    {
+        var count = (word + 2) * 64;
+        var names = Enumerable.Range(0, count).Select(index => "p" + index.ToString("D5")).ToArray();
+        var universe = new PlaceUniverse([new FlowBlock(0,
+            names.Select(name => new FlowInstruction(InstructionKind.Read, Site, source: name)), [])], default);
+        var buffer = new PlaceSetBuilder(universe.WordCount);
+        // Cross both occupancy-summary boundaries and transitions from dense to one
+        // word, to empty, and back to sparse without changing ordinal membership.
+        buffer.SetRange(0, count, true, default);
+        buffer.SetRange(0, word * 64, false, default);
+        buffer.SetRange((word + 1) * 64, count, false, default);
+        buffer.Remove(word * 64 + 17);
+        var snapshot = PlaceSet.Freeze(universe, buffer, default);
+        var expected = names.Skip(word * 64).Take(64).Where((_, index) => index != 17).ToArray();
+        Assert.Equal(expected, snapshot);
+        Assert.Equal(63, snapshot.Count);
+        foreach (var name in names) Assert.Equal(expected.Contains(name), snapshot.Contains(name));
+        Assert.True(snapshot.Matches(buffer, default));
+
+        var copy = new PlaceSetBuilder(universe.WordCount);
+        snapshot.UnionInto(copy, default);
+        Assert.True(snapshot.Matches(copy, default));
+        buffer.Clear();
+        buffer.Add(((word + 1) % universe.WordCount) * 64);
+        Assert.Equal(expected, snapshot);
+        Assert.False(snapshot.Matches(buffer, default));
+        snapshot.ExceptFrom(copy, default);
+        Assert.Empty(PlaceSet.Freeze(universe, copy, default));
+        copy.Add(word * 64 + 63);
+        Assert.Equal([names[word * 64 + 63]], PlaceSet.Freeze(universe, copy, default));
+        copy.Remove(word * 64 + 63);
+        copy.Add(word * 64);
+        Assert.Equal([names[word * 64]], PlaceSet.Freeze(universe, copy, default));
+    }
+
     [Fact]
     public void CancellationDuringDomainDiscoveryStopsBeforeAnySolverResult()
     {

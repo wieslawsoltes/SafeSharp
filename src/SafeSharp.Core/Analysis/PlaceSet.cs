@@ -18,12 +18,23 @@ internal sealed class PlaceSet : ISet<string>
     private readonly PlaceUniverse universe;
     private readonly ulong[] words;
     private readonly int[]? sparseIndices;
+    private readonly int inlineWordIndex = -1;
+    private readonly ulong inlineWord;
 
     internal PlaceSet(PlaceUniverse universe, ulong[] words, int[]? sparseIndices, int count)
     {
         this.universe = universe;
         this.words = words;
         this.sparseIndices = sparseIndices;
+        Count = count;
+    }
+
+    private PlaceSet(PlaceUniverse universe, int wordIndex, ulong word, int count)
+    {
+        this.universe = universe;
+        words = Array.Empty<ulong>();
+        inlineWordIndex = wordIndex;
+        inlineWord = word;
         Count = count;
     }
 
@@ -44,6 +55,13 @@ internal sealed class PlaceSet : ISet<string>
     internal static PlaceSet Freeze(PlaceUniverse universe, PlaceSetBuilder buffer, CancellationToken cancellationToken)
     {
         if (buffer.Count == 0) return universe.Empty;
+        // Common short-lived temporaries need only one word. Keep it inside the set
+        // instead of allocating both a word array and a sparse-index array.
+        if (buffer.OccupiedWords == 1)
+        {
+            var index = buffer.OccupiedWordXor;
+            return new PlaceSet(universe, index, buffer.Words[index], buffer.Count);
+        }
         // The second array has a header too. Retain a dense array for small or reasonably full sets.
         if (buffer.OccupiedWords * 3 + 4 >= buffer.Words.Length * 2)
             return new PlaceSet(universe, (ulong[])buffer.Words.Clone(), null, buffer.Count);
@@ -68,6 +86,12 @@ internal sealed class PlaceSet : ISet<string>
 
     internal void UnionInto(PlaceSetBuilder buffer, CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (inlineWordIndex >= 0)
+        {
+            buffer.SetWord(inlineWordIndex, buffer.Words[inlineWordIndex] | inlineWord);
+            return;
+        }
         for (var index = 0; index < words.Length; index++)
         {
             if ((index & 255) == 0) cancellationToken.ThrowIfCancellationRequested();
@@ -78,6 +102,12 @@ internal sealed class PlaceSet : ISet<string>
 
     internal void ExceptFrom(PlaceSetBuilder buffer, CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (inlineWordIndex >= 0)
+        {
+            buffer.SetWord(inlineWordIndex, buffer.Words[inlineWordIndex] & ~inlineWord);
+            return;
+        }
         for (var index = 0; index < words.Length; index++)
         {
             if ((index & 255) == 0) cancellationToken.ThrowIfCancellationRequested();
@@ -89,6 +119,8 @@ internal sealed class PlaceSet : ISet<string>
     internal bool Matches(PlaceSetBuilder buffer, CancellationToken cancellationToken)
     {
         if (Count != buffer.Count) return false;
+        cancellationToken.ThrowIfCancellationRequested();
+        if (inlineWordIndex >= 0) return inlineWord == buffer.Words[inlineWordIndex];
         // Equal cardinalities reduce equality to checking this set's occupied words. This is
         // constant work for a short-lived temporary even when the method has thousands of places.
         for (var index = 0; index < words.Length; index++)
@@ -103,12 +135,24 @@ internal sealed class PlaceSet : ISet<string>
     {
         if (item is null || !universe.TryIndex(item, out var id)) return false;
         var index = id >> 6;
+        if (inlineWordIndex >= 0) return index == inlineWordIndex && (inlineWord & (1UL << (id & 63))) != 0;
         if (sparseIndices is not null) index = Array.BinarySearch(sparseIndices, index);
         return index >= 0 && index < words.Length && (words[index] & (1UL << (id & 63))) != 0;
     }
 
     public IEnumerator<string> GetEnumerator()
     {
+        if (inlineWordIndex >= 0)
+        {
+            var remaining = inlineWord;
+            var first = inlineWordIndex << 6;
+            while (remaining != 0)
+            {
+                yield return universe.Names[first + BitWords.TrailingZeroes(remaining)];
+                remaining &= remaining - 1;
+            }
+            yield break;
+        }
         for (var index = 0; index < words.Length; index++)
         {
             var remaining = words[index];
