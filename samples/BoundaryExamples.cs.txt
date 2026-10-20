@@ -1,0 +1,93 @@
+using System;
+using System.IO;
+using System.Threading.Tasks;
+using SafeSharp;
+
+// This fixture intentionally includes violations. The generated report is a
+// reproducible view of actual analyzer evidence, not a hand-drawn safety claim.
+
+[return: TypeLifetime("fresh", "return")]
+delegate Func<object> UniversalFactory([Lifetime("owner")] object owner);
+
+[return: TypeLifetime("^owner", "return")]
+delegate Func<object> TiedFactory([Lifetime("owner")] object owner);
+
+static class LifetimeBoundaries
+{
+    [return: TypeLifetime("^input", "return")]
+    static Func<object> Capture([Lifetime("input")] object input) => () => input;
+
+    // Accepted: the returned callback remains tied to the original input.
+    static TiedFactory TiedCapture() => Capture;
+
+    // SS0047: an outer capture cannot satisfy a fresh nested invocation lifetime.
+    static UniversalFactory InvalidGeneralization() => Capture;
+}
+
+static class AsyncBoundaries
+{
+    static Task<MemoryStream> Open() => Task.FromResult(new MemoryStream());
+
+    static async Task StableCompositionResults()
+    {
+        var pending = Task.WhenAll(Open(), Open());
+        var streams = await pending;
+        streams[0].Dispose();
+        streams[1].Dispose();
+
+        var sameStreams = await pending;
+        _ = sameStreams[0].Length; // SS0001: the cached payload is still disposed.
+    }
+
+    static async Task RepeatedValueTask()
+    {
+        var pending = new ValueTask<int>(Task.FromResult(42));
+        _ = await pending;
+        _ = await pending; // SS0048: the same affine capability was consumed.
+    }
+
+    static async Task ReusableTask()
+    {
+        var pending = new ValueTask<int>(Task.FromResult(42));
+        var reusable = pending.AsTask();
+        _ = await reusable;
+        _ = await reusable; // Accepted: AsTask provides a reusable Task handle.
+    }
+}
+
+static class ReferenceBoundaries
+{
+    static void StorageAndValueSnapshots()
+    {
+        var first = new MemoryStream();
+        var second = new MemoryStream();
+        ref var slot = ref first;
+        var snapshot = slot;
+        slot = second;
+        snapshot.Dispose();
+        _ = snapshot.Length; // SS0001: assigning the slot did not change this value.
+        slot.Dispose();
+    }
+}
+
+sealed class GuardedCounter
+{
+    private readonly object gate = new();
+    private readonly object otherGate = new();
+    [GuardedBy(nameof(gate))] private int value;
+
+    public int Read()
+    {
+        lock (gate) return value; // Accepted: the matching receiver is held.
+    }
+
+    public void WrongGuard()
+    {
+        lock (otherGate) value++; // SS0049: a different monitor cannot protect value.
+    }
+
+    [RequiresLock(nameof(gate))]
+    private void Increment() => value++;
+
+    public void MissingPrecondition() => Increment(); // SS0049 at the call boundary.
+}
