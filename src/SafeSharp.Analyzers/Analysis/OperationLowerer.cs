@@ -243,7 +243,7 @@ internal sealed partial class OperationLowerer
                 var arguments = EvaluateArguments(creation.Arguments, creation.Constructor);
                 ActivateArguments(arguments);
                 InvalidateCallAggregates(creation, creation.Constructor, arguments);
-                MarkMayThrow(creation);
+                MarkCallMayThrow(creation, creation.Arguments, arguments);
                 ApplyOutputArguments(creation.Arguments, arguments.Values, creation.Constructor is { } constructor ? _summaries.Get(constructor, _cancellationToken) : null);
                 TouchArguments(arguments);
                 var awaitable = KnownAwaitableCreation(creation, arguments);
@@ -368,13 +368,7 @@ internal sealed partial class OperationLowerer
                 return (owner ?? "static:" + property.Property.ContainingType.ToDisplayString()) + "." + property.Property.Name;
             }
             case IArrayElementReferenceOperation element:
-            {
-                var owner = Evaluate(element.ArrayReference, false);
-                InvalidateArrayElementAddress(element, owner);
-                foreach (var index in element.Indices) Evaluate(index);
-                if (owner is not null && writeReceiver) Add(InstructionKind.Write, element, source: owner);
-                return owner is null ? null : owner + "[" + string.Join(",", element.Indices.Select(i => i.ConstantValue.HasValue ? i.ConstantValue.Value?.ToString() ?? "null" : "*")) + "]";
-            }
+                return AddressArrayElement(element, writeReceiver);
             default: return Evaluate(operation, false);
         }
     }
@@ -530,7 +524,7 @@ internal sealed partial class OperationLowerer
         if (receiverLoan is not null) Add(InstructionKind.Write, invocation, source: receiverLoan);
         TransferCallbackCaptures(invocation);
         InvalidateCallAggregates(invocation, method, arguments, instance, invocation.Instance?.Type);
-        MarkMayThrow(invocation);
+        MarkCallMayThrow(invocation, invocation.Arguments, arguments);
         ApplyOutputArguments(invocation.Arguments, arguments.Values, summary);
         TouchArguments(arguments);
         if (receiverLoan is not null) Add(InstructionKind.Read, invocation, source: receiverLoan);

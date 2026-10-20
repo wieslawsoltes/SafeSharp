@@ -1,6 +1,6 @@
 # Lifetime contracts inside types
 
-`TypeLifetime` describes borrowed contents at a specific position inside a parameter or result type. The analyzer checks these explicit contracts when a method group, annotated anonymous function, or delegate is converted to a contracted delegate. It uses Roslyn's resolved generic variance and a [higher-ranked region solver](higher-ranked-regions.md) with nested binders, placeholder visibility, and type-outlives tests.
+`TypeLifetime` describes borrowed contents at a specific position inside a parameter or result type. The analyzer checks these explicit contracts at contracted delegate conversions, inherited method boundaries, and supported direct invocations with input `TypeLifetime` or outer `TypeOutlives` requirements. It uses Roslyn's resolved generic variance and a [higher-ranked region solver](higher-ranked-regions.md) with nested binders, placeholder visibility, and type-outlives tests.
 
 The annotations are boundary contracts. They do not add lifetime parameters to CLR types, replace C# type checking, or prove an arbitrary collection implementation stores its elements as declared. Existing `Lifetime` contracts continue to drive whole-value returned-provenance analysis. `TypeLifetime` describes the additional type shape which C# metadata does not otherwise express.
 
@@ -102,7 +102,7 @@ delegate void Read<T>(
     [Lifetime("scope")] ref Resource scope);
 ```
 
-The bound concerns the borrowed contents represented by `T`. It does not claim that every CLR generic argument contains borrowed references. Roslyn's constructed method and containing-type arguments resolve the type identity at the conversion; equal display names do not equate distinct type parameters.
+The bound concerns the borrowed contents represented by `T`. It does not claim that every CLR generic argument contains borrowed references. Roslyn's constructed method and containing-type arguments resolve the type identity at the comparison boundary; equal display names do not equate distinct type parameters.
 
 An input whose type is a generic parameter and which has `[Lifetime("a")]` implies `T: a`. Selecting an explicitly annotated generic-parameter type with `TypeLifetime` also supplies a bound when that input's region is local to the selected binder. Explicitly annotated borrowed contents must outlive their annotated containing owner in the same binder. For example:
 
@@ -128,6 +128,14 @@ delegate Func<T, Resource, Resource> GenericFactory<T>();
 
 The callback's generic input implies `T: input`; the explicit contract additionally supplies `T: result` in that returned callback's binder. The selected region must be declared locally in the selected scope. A same-named outer region does not satisfy a missing local declaration. A callback implementation requiring this bound cannot be converted to a target that supplies only the implied `T: input` bound.
 
+## Direct invocations
+
+`SS0050` checks a method's explicit input `TypeLifetime` paths and outer `TypeOutlives` requirements at the invocation. The checker derives supplied evidence from stable caller parameters, the caller receiver for whole-value requirements, and transparent local initializer aliases of supported inputs. Named and reordered arguments map by Roslyn parameter ordinal; extension receivers and constructed generic arguments use symbol-based substitution. Callee requirements remain proof obligations and never become caller assumptions merely because the call occurs.
+
+Caller lifetime assumptions, relevant nested outlives relations, and explicit or implied type bounds must establish the demanded positions. Writable positions are invariant, nested callable paths retain their own binders, and inferred lifetimes must cover a nonempty invocation extent. Reassignment, content writes, reference exposure, and unmodeled mutation can invalidate supplied evidence. A `[Borrowed, DoesNotEscape]` parameter supplies the modeled read-only, nonretaining call boundary; `DoesNotEscape` alone does not establish immutability. Arbitrary factory results, flow-merged inputs, and unannotated callbacks do not receive inferred nested contracts.
+
+Direct-call diagnostics retain `SafeSharp.CallTarget`, `CallArguments`, `CallReason`, and `CallEvidence` together with the existing region and type-bound witnesses. The same recorded evidence is available to HTML, DOT, Mermaid, JSON, and SARIF reports. See [direct invocation lifetime contracts](direct-call-lifetimes.md) for accepted and rejected examples, mutation invalidation, budgets, and supported evidence.
+
 ## Inheritance, diagnostics, and evidence
 
 Omitted `TypeLifetime` and `TypeOutlives` metadata is read from the nearest applicable inherited method contract. Parameters are matched by ordinal. Lifetime names at outer type positions and inherited scoped bounds participate in positional alpha-renaming. Interface implementations and overrides must preserve the inherited type-lifetime promises; changing a nested result origin or adding an unsupported generic bound reports SS0042. Generic method parameter names are matched by ordinal rather than by spelling. The inherited receiver is a caller-supplied input rather than an independent captured delegate receiver.
@@ -141,6 +149,7 @@ Explicitly annotated anonymous functions use the same conversion check; unannota
 | SS0040 | An invalid path, duplicate path, absent generic type parameter, missing region, invalid outer reference, or other malformed declaration. |
 | SS0042 | An implementation changes an inherited nested lifetime, variance, scoped bound, or type-outlives promise. |
 | SS0047 | A delegate conversion changes a type-lifetime promise, adds a required bound, violates variance, or leaks a nested placeholder. |
+| SS0050 | A direct invocation cannot establish an explicit input type-lifetime path or type-outlives requirement from the caller's available evidence. |
 | SS0043 | The combined binding/solving budget is exhausted; compatibility is not established. |
 
 Existing region properties still contain a complete graph: region names, assumptions, requirements, strongly connected components, and a shortest failure path. Higher-ranked failures additionally expose `RegionUniverses`, `RegionVariableUniverses`, `RegionUniversePromotions`, and `RegionVisibilityProofs`. Type failures add `TypeOutlivesAssumptions`, `TypeOutlivesRequirements`, `TypeBindings`, and `TypeOutlivesType`, all under the `SafeSharp.` prefix. Related diagnostic locations include the original contract declarations.
@@ -157,7 +166,7 @@ Constructed type substitution memoizes repeated subtrees per comparison side. Ea
 
 `safesharp_max_regions`, `safesharp_max_region_constraints`, and `safesharp_max_region_steps` bound the resulting proof. Nested invariant checks allocate independent universes under the same limit. Binding work and all region solves share the configured step budget; static edges, promotions, and type bounds count toward the combined constraint limit. Cancellation is observed while parsing, binding, and solving. Incomplete solves never produce a success claim or partial diagnostic proof.
 
-The supported domain is explicit borrowed type positions, their declared Roslyn variance, and nested callable lifetime binders at contracted delegate conversions and inherited method boundaries. These contracts are trusted descriptions of nested contents; SafeSharp does not infer arbitrary container storage or verify every nested element produced by a method body. Arbitrary direct calls and runtime reflection do not gain a new CLR type system. A bound extension receiver with its own `TypeLifetime` paths currently lacks delegate-supplied evidence and is reported conservatively. Full Rust trait resolution, higher-kinded type unification, automatic closure generalization, and every possible nominal generic-type projection remain outside this finite contract model.
+The supported domain is explicit borrowed type positions, their declared Roslyn variance, and nested callable lifetime binders at contracted delegate conversions, inherited method boundaries, and supported direct invocations. These contracts are trusted descriptions of nested contents; SafeSharp does not infer arbitrary container storage or verify every nested element produced by a method body. Direct invocations check the supported caller evidence described above; they do not create a general CLR lifetime type system or validate all nested return contents. At delegate conversions, a bound extension receiver with its own `TypeLifetime` paths currently lacks delegate-supplied evidence and is reported conservatively. Runtime reflection, full Rust trait resolution, higher-kinded type unification, automatic closure generalization, and every possible nominal generic-type projection remain outside this finite contract model.
 
 ## Design references and regression tests
 

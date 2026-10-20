@@ -57,6 +57,14 @@ array reference read and write the same represented element. A `WhenAll<T>`
 result array is a stable aggregate: reading an element through another array
 alias or awaiting the same proxy again does not produce a fresh owner.
 
+References to represented elements use those same canonical cells. A ref local,
+an evaluated ref/out argument, or a source-proven ref return observes the same
+resource and ValueTask capability as an ordinary indexed access. The address
+captures the evaluated array identity; replacing the array variable or rebinding
+another reference cannot redirect it. Replacing the value stored in the cell is
+visible to every alias of that cell, while earlier value copies retain their
+independent identities.
+
 ```csharp
 var combined = Task.WhenAll(CreateAsync());
 var first = await combined;
@@ -94,14 +102,23 @@ because their source is available: general array-element effect summaries remain
 a boundary. This conservative content invalidation does not infer arbitrary
 callee disposal, retention, or replacement ownership.
 
-Exposing an element's storage through `ref`, `out`, or an explicit `in` argument
-also weakens the represented contents. This includes conditional ref expressions
-lowered through CFG captures. Mutable element references currently use the general
-storage domain rather than a coherent canonical array cell, so a write through
-such a reference must not leave a stale exact cleanup proof in the array cache.
-Values copied before the address exposure and task inputs already captured by a
-composition keep their independent identities. Ordinary by-value conditional
-element reads retain their precision.
+Taking a represented element's address through `ref`, `out`, or explicit `in`
+does not by itself weaken its contents. Exact singleton writes update the
+canonical cell strongly; conditional refs and wildcard indices retain weak
+alternatives. Source-proven normal ref/out outputs update those same cells.
+Opaque writable outputs preserve possible old/replacement outcomes. An
+exceptional writable-ref call weakens the captured canonical cell before filter
+selection and finally unwinding, because the callee may have replaced the value
+before throwing. Readonly inputs do not acquire that writable-cell exception
+effect. Independent value snapshots and already captured composition inputs
+remain unchanged by later cell replacement.
+
+A live element ref keeps the aggregate allocation site live, including when its
+next use overwrites the cell. Reusing the allocation site while that address is
+still held summarizes multiple concrete arrays and requires weak updates.
+Dynamic selectors expand against the current represented cells, including cells
+first materialized after the address was taken. These storage rules and their
+limits are detailed in [canonical aggregate references](aggregate-reference-storage.md).
 
 ValueTask consumption capabilities also follow represented array elements and
 nested carrier caches. Copying a `ValueTask` out of the same element twice retains
@@ -112,12 +129,14 @@ capability across repeated receives, without an inferred fresh-ownership claim.
 ## Reports and bounded execution
 
 The language-neutral IR includes explicit aggregate creation, element reads and
-writes, composition construction, and successful composition completion.
+writes, canonical element-reference binding, exceptional reference invalidation,
+composition construction, and successful composition completion.
 Snapshots and JSON reports expose:
 
 - The trusted composition kind and captured dependency resource IDs.
 - Stable received result identities and their completion/result-production state.
 - Canonical array indices, resource IDs, and ValueTask capability IDs.
+- Reference-storage targets resolved to the same canonical element cells.
 - Whether one aggregate allocation site represents multiple retained instances.
 
 HTML reports show composition dependencies and aggregate element identities next
@@ -147,11 +166,15 @@ a limit reports `SS0015` rather than silently dropping dependencies.
 - A faulted `WhenAll` can contain successful siblings. SafeSharp keeps unresolved
   obligations instead of claiming that all results were produced or all siblings
   failed. It does not infer which individual tasks succeeded from an exception.
-- Unknown-index and external heap contents remain conservative. Precise mutable
-  ref aliases into aggregate element caches and arbitrary container ownership
-  contracts require additional storage models; exposing an element address is
-  conservatively invalidated until that integration exists. An unrepresented structural
-  projection cannot reuse its enclosing aggregate's element or task-result cache.
+- Unknown-index and external heap contents remain conservative. Canonical refs
+  preserve represented storage identity, but arbitrary collection ownership,
+  symbolic index relationships, and unrepresented structural projections need
+  additional models. A projection cannot reuse its enclosing aggregate's element
+  or task-result cache without a represented aggregate identity.
+- Deep-container borrowing permissions remain separate from storage coherence.
+  The element model does not derive a child loan from a loan of the containing
+  array or prove that writes through an earlier captured ref respect every later
+  parent loan. A clean ownership report does not establish that permission proof.
 - Runtime readiness, races with concurrent array mutation, custom awaiter or
   builder internals, and scheduler behavior are not proven by this sequential
   ownership domain.

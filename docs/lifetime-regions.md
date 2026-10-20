@@ -146,7 +146,7 @@ The contract resolver maps inherited region relationships into the implementatio
 
 Compatibility checks reject an implementation that introduces additional input outlives requirements, changes an owned result into a borrowed result or vice versa, redirects a named returned loan to another parameter/receiver, changes its declared mutability, or adds return-source candidates that cannot satisfy the inherited lifetime promise. Input requirements include relationships to and from the receiver. Transitive implications are considered, so merely restating an already implied relation does not introduce a new requirement. An explicit `ReturnsBorrowed` source narrows the candidate origins used by this comparison as well as those propagated to callers.
 
-This is an explicit-contract compatibility check. It does not prove every aspect of behavioral subtyping, such as arbitrary exception effects, synchronization, generic variance, or higher-ranked lifetime quantification. Contracts at external and virtual call boundaries remain trusted descriptions of behavior.
+This is an explicit-contract compatibility check. TypeLifetime/TypeOutlives extend it with annotated type paths, declared variance, nested binder visibility and scoped type obligations, as described in [type lifetime contracts](type-lifetimes.md). It does not prove every aspect of behavioral subtyping, such as arbitrary exception effects, synchronization or complete type/trait inference. Contracts at external and virtual call boundaries remain trusted descriptions of behavior.
 
 ## Reusable region solver
 
@@ -303,8 +303,9 @@ Reduce unnecessary signature/body complexity or increase a measured, appropriate
 | Omitted inherited contracts and positional region/parameter renaming | Implemented. |
 | Basic inherited input and returned-lifetime compatibility | Implemented. |
 | One universal outlives binder for annotated delegate conversions | Implemented; input shortening, result covariance, ref/out invariance and independent captured receivers. See [delegate contracts](lifetime-delegates.md). |
-| Full type-level region inference, nested higher-ranked universes/placeholders | Not implemented. |
-| Complete generic variance, nested type-lifetime tests, automatic closure lifetime generalization | Not implemented. |
+| Nested higher-ranked universes/placeholders | Implemented by the separate [higher-ranked solver](higher-ranked-regions.md), including visibility intersection and static promotion/leak evidence. |
+| Annotated nested type paths, declared variance and explicit/supported implied bounds | Implemented for delegate and inherited-signature comparisons; see [type lifetime contracts](type-lifetimes.md). |
+| Full type/trait region inference, arbitrary nested body contents and automatic closure lifetime generalization | Not implemented. |
 | Arbitrary heap/container/native aliases and every external library effect | Require models/contracts; unknown origins are not accepted as proofs. |
 | Arbitrary custom awaiters/builders and unmodeled task combinators | Payload origins remain unknown. |
 | Full region-state reconstruction across exceptional handler entries | Conservative: unchanged parameters remain known; parameters that may have been replaced and missing local facts become unknown. |
@@ -322,7 +323,7 @@ The implementation is original C#. It adopts the explicit outlives-constraint an
 - [Rust compiler guide: constraint propagation](https://rustc-dev-guide.rust-lang.org/borrow-check/region-inference/constraint-propagation.html) explains graph edges and equivalent regions found through SCCs.
 - [Rust compiler `RegionInferenceContext`](https://doc.rust-lang.org/beta/nightly-rustc/rustc_borrowck/region_infer/struct.RegionInferenceContext.html) exposes `constraint_sccs`, `solve`, `eval_outlives`, and `constraint_path_between_regions`, with links to the corresponding Rust implementation.
 
-SafeSharp's named-region graph is intentionally smaller: it does not represent rustc's full set of MIR points, universe placeholders, type tests, or higher-ranked region constraints. Its BFS witness generation is a diagnostic/provenance service over the explicit graph, while its separate C# control-flow analysis checks actual returned origins against the solved promises.
+SafeSharp's named-region graph remains a smaller explicit relation domain than rustc's MIR-point region inference. The separate higher-ranked domain adds universes, placeholders and opaque type-outlives tests for annotated nested signatures; it does not reproduce the full Rust type/trait system. Lazy shortest witnesses explain original graph relationships, while the separate C# control-flow analysis checks returned origins against the solved promises.
 
 ## Universal delegate conversions
 

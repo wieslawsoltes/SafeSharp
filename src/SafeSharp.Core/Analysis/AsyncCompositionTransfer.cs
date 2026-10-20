@@ -12,9 +12,48 @@ internal sealed partial class OwnershipTransfer
     internal static string AsyncDependencyCache(string id) => AsyncDependencyCachePrefix + id;
     internal static string AggregateElementCache(string id, string key) => AggregateElementCachePrefix + id.Length + ":" + id + key;
 
-    private static bool RetainsAllocation(AbstractState state, string id, string? target, ISet<string> liveAfter) =>
-        IncludingFactoryResults(state, liveAfter.Where(place => place != target && (target is null || !PlaceRelations.IsStrictDescendant(place, target)))
-            .SelectMany(state.Resolve)).Any(reference => reference.ResourceId == id && !reference.DefinitelyMoved);
+    private static bool RetainsAllocation(AbstractState state, string id, string? target, ISet<string> liveAfter)
+    {
+        var surviving = liveAfter.Where(place => place != target && (target is null || !PlaceRelations.IsStrictDescendant(place, target))).ToArray();
+        return IncludingFactoryResults(state, surviving.SelectMany(state.Resolve)).Any(reference => reference.ResourceId == id && !reference.DefinitelyMoved) ||
+            surviving.Any(place => state.ReferenceStorage.TryGetTargets(place, out var locations) && locations.Any(location =>
+                AggregateStorageLocation.TryParse(location, out var owner, out _, out _) && owner == id));
+    }
+
+    private static ResourceFact EnsureAggregateElement(AbstractState state, ResourceFact aggregate, string key)
+    {
+        if (aggregate.ElementKeys.Contains(key)) return aggregate;
+        var cache = AggregateElementCache(aggregate.Id, key);
+        // Unknown writes already performed may have selected this not-yet-materialized cell.
+        // Once materialized, subsequent unknown writes update it together with the wildcard.
+        var wildcards = aggregate.ElementKeys.Where(element => element.IndexOf('*') >= 0 && AggregateStorageLocation.Overlaps(element, key))
+            .Select(element => AggregateElementCache(aggregate.Id, element)).ToArray();
+        state.Assign(cache, wildcards.SelectMany(state.Resolve).Select(value => value.WithAbsence(false)), mayBeNull: true);
+        state.ValueTasks.Assign(cache, wildcards.SelectMany(state.ValueTasks.Resolve).Select(value => value.WithAbsence(false)));
+        aggregate = aggregate.WithElement(key);
+        state.Resources[aggregate.Id] = aggregate;
+        return aggregate;
+    }
+
+    private static void BindAggregateElementReference(AbstractState state, FlowInstruction instruction, ReferenceFact[] owners, IssueCollector? issues)
+    {
+        CheckUse(state, instruction, owners, issues);
+        var locations = ImmutableHashSet.CreateBuilder<string>(StringComparer.Ordinal);
+        var key = instruction.Projection ?? "[*]";
+        if (owners.Length == 0) locations.Add(ReferenceStorageState.UnknownTarget);
+        foreach (var owner in owners)
+        {
+            if (owner.Projection.Length != 0 || !state.Resources.TryGetValue(owner.ResourceId, out var aggregate) || aggregate.Kind != ResourceKind.Aggregate)
+            {
+                locations.Add(ReferenceStorageState.UnknownTarget);
+                continue;
+            }
+            EnsureAggregateElement(state, aggregate, key);
+            locations.Add(AggregateElementCache(aggregate.Id, key));
+            if (!owner.CoversResource) locations.Add(ReferenceStorageState.UnknownTarget);
+        }
+        state.ReferenceStorage.BindLocations(instruction.Target!, state.ReferenceStorage.BoundExpansion(locations));
+    }
 
     private static void CreateAggregate(AbstractState state, FlowInstruction instruction, int blockId, int index, ISet<string> liveAfter, IssueCollector? issues)
     {
@@ -44,13 +83,17 @@ internal sealed partial class OwnershipTransfer
             if (owner.Projection.Length != 0 || !state.Resources.TryGetValue(owner.ResourceId, out var aggregate) || aggregate.Kind != ResourceKind.Aggregate)
             { external = true; continue; }
             var key = instruction.Projection ?? "[*]";
-            var cache = AggregateElementCache(aggregate.Id, key);
-            var weak = aggregate.IsAggregateSummary || !owner.CoversResource || key.IndexOf('*') >= 0;
-            CheckOverwrite(state, instruction, cache, values, issues, liveAfter);
-            state.Assign(cache, weak ? state.Resolve(cache).Select(value => value.WithAbsence(false)).Concat(values.Select(value => value.WithAbsence(false))) : values,
-                state.CanBeNull(instruction.Source) || weak && state.CanBeNull(cache));
-            state.ValueTasks.Assign(cache, weak ? state.ValueTasks.Resolve(cache).Select(value => value.WithAbsence(false)).Concat(protocols.Select(value => value.WithAbsence(false))) : protocols);
-            state.Resources[aggregate.Id] = aggregate.WithElement(key);
+            aggregate = EnsureAggregateElement(state, aggregate, key);
+            var wildcard = key.IndexOf('*') >= 0;
+            foreach (var element in aggregate.ElementKeys.Where(element => element == key || wildcard && AggregateStorageLocation.Overlaps(element, key)))
+            {
+                var cache = AggregateElementCache(aggregate.Id, element);
+                var weak = aggregate.IsAggregateSummary || !owner.CoversResource || wildcard;
+                CheckOverwrite(state, instruction, cache, values, issues, liveAfter);
+                state.Assign(cache, weak ? state.Resolve(cache).Select(value => value.WithAbsence(false)).Concat(values.Select(value => value.WithAbsence(false))) : values,
+                    state.CanBeNull(instruction.Source) || weak && state.CanBeNull(cache));
+                state.ValueTasks.Assign(cache, weak ? state.ValueTasks.Resolve(cache).Select(value => value.WithAbsence(false)).Concat(protocols.Select(value => value.WithAbsence(false))) : protocols);
+            }
         }
         if (external)
         {
@@ -81,10 +124,13 @@ internal sealed partial class OwnershipTransfer
             if (owner.Projection.Length != 0 || !state.Resources.TryGetValue(owner.ResourceId, out var aggregate) || aggregate.Kind != ResourceKind.Aggregate)
             { opaque = true; continue; }
             var key = instruction.Projection ?? "[*]";
-            foreach (var element in aggregate.ElementKeys.Where(element => key.IndexOf('*') >= 0 || element == key || element.IndexOf('*') >= 0))
+            var wildcard = key.IndexOf('*') >= 0;
+            nullable |= wildcard; // Unmaterialized cells may still contain their default value.
+            if (!wildcard) aggregate = EnsureAggregateElement(state, aggregate, key);
+            foreach (var element in aggregate.ElementKeys.Where(element => element == key || wildcard && AggregateStorageLocation.Overlaps(element, key)))
             {
                 var cache = AggregateElementCache(aggregate.Id, element);
-                var weak = aggregate.IsAggregateSummary || !owner.CoversResource || key.IndexOf('*') >= 0 && aggregate.ElementKeys.Count > 1 || element.IndexOf('*') >= 0;
+                var weak = aggregate.IsAggregateSummary || !owner.CoversResource || wildcard || element.IndexOf('*') >= 0;
                 values.AddRange(state.Resolve(cache).Select(value => weak ? value.WithAbsence(false) : value));
                 protocols.AddRange(state.ValueTasks.Resolve(cache).Select(value => weak ? value.WithAbsence(false) : value));
                 nullable |= state.CanBeNull(cache);
@@ -118,6 +164,17 @@ internal sealed partial class OwnershipTransfer
             var cache = AggregateElementCache(id, key);
             state.Assign(cache, state.Resolve(cache).Select(value => value.WithAbsence(false)), mayBeNull: true);
             state.ValueTasks.Assign(cache, state.ValueTasks.Resolve(cache).Select(value => value.WithAbsence(false)));
+        }
+    }
+
+    private static void InvalidateAggregateReference(AbstractState state, string source)
+    {
+        if (!state.ReferenceStorage.TryGetTargets(source, out var targets)) return;
+        foreach (var location in state.ExpandReferenceTargets(targets))
+        {
+            if (!AggregateStorageLocation.TryParse(location, out _, out _, out _)) continue;
+            state.Assign(location, state.Resolve(location).Select(value => value.WithAbsence(false)), mayBeNull: true);
+            state.ValueTasks.Assign(location, state.ValueTasks.Resolve(location).Select(value => value.WithAbsence(false)));
         }
     }
 

@@ -146,12 +146,12 @@ internal sealed partial class OperationLowerer
 
     private string? ReadArrayElement(IArrayElementReferenceOperation element, bool read)
     {
+        // A conditional ref's CFG capture evaluates a location. Retain its storage as well as
+        // its current value; a by-value capture takes the independent snapshot below instead.
+        if (IsArrayElementAddressSyntax(element)) return AddressArrayElement(element, read: read);
         var owner = SnapshotCallValue(Evaluate(element.ArrayReference, false), element, "array");
         foreach (var index in element.Indices) Evaluate(index);
         if (owner is not null) Add(InstructionKind.Read, element, source: owner);
-        // CFG captures may evaluate a conditional ref's element before binding its address.
-        // Only actual address syntax takes this conservative path; by-value captures stay exact.
-        if (IsArrayElementAddressSyntax(element)) InvalidateArrayElementAddress(element, owner);
         MarkMayThrow(element);
         if (!TracksOwnershipValue(element.Type)) return ReleaseReceiverSnapshot(owner, element, null);
         var target = Temporary(element);
@@ -163,11 +163,26 @@ internal sealed partial class OperationLowerer
         return ReleaseReceiverSnapshot(owner, element, target);
     }
 
-    private void InvalidateArrayElementAddress(IArrayElementReferenceOperation element, string? owner)
+    private string? AddressArrayElement(IArrayElementReferenceOperation element, bool writeReceiver = false, bool read = false)
     {
-        if (owner is not null && TracksOwnershipValue(element.Type))
-            Add(InstructionKind.InvalidateAggregateContents, element, source: owner,
-                description: "retain possible original elements when their storage escapes the canonical array cache through a reference");
+        if (!TracksOwnershipValue(element.Type))
+        {
+            // Scalar elements have no canonical resource cell. Keep their existing structural
+            // address; a projection of a released value snapshot would lose the receiver.
+            var scalarOwner = Evaluate(element.ArrayReference, false);
+            foreach (var index in element.Indices) Evaluate(index);
+            if (scalarOwner is not null && writeReceiver) Add(InstructionKind.Write, element, source: scalarOwner);
+            return scalarOwner is null ? null : scalarOwner + ArrayIndex(element);
+        }
+        var owner = SnapshotCallValue(Evaluate(element.ArrayReference, false), element, "array-address");
+        foreach (var index in element.Indices) Evaluate(index);
+        if (owner is not null) Add(writeReceiver ? InstructionKind.Write : InstructionKind.Read, element, source: owner);
+        MarkMayThrow(element);
+        var target = "$element-reference:" + element.Syntax.SpanStart;
+        Add(InstructionKind.BindAggregateElementReference, element, target: target, source: owner ?? UnknownReferenceStorage,
+            projection: ArrayIndex(element), description: "capture canonical array element storage independently of the caller's array variable");
+        if (read) Add(InstructionKind.Read, element, source: target);
+        return ReleaseReceiverSnapshot(owner, element, target);
     }
 
     private static bool IsArrayElementAddressSyntax(IArrayElementReferenceOperation element)

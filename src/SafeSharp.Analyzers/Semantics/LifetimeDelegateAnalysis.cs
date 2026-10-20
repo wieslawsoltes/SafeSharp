@@ -253,7 +253,8 @@ internal static partial class LifetimeDelegateAnalysis
         private readonly Compilation compilation;
 
         internal Binding(LifetimeContractModel promised, LifetimeContractModel actual, int boundParameters, Location location,
-            RegionSolverOptions options, CancellationToken cancellationToken, Compilation compilation, bool receiverSuppliedByCaller = false)
+            RegionSolverOptions options, CancellationToken cancellationToken, Compilation compilation, bool receiverSuppliedByCaller = false,
+            string? suppliedReceiverRegion = null, bool directCall = false)
         {
             this.promised = promised;
             this.cancellationToken = cancellationToken;
@@ -267,7 +268,7 @@ internal static partial class LifetimeDelegateAnalysis
             foreach (var name in promised.RootRegionNames)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                Universal(name, "delegate region '" + name + "'");
+                Universal(name, (directCall ? "caller region '" : "delegate region '") + (directCall && name.StartsWith("$caller:", StringComparison.Ordinal) ? name.Substring(8) : name) + "'");
             }
             foreach (var edge in promised.Constraints)
             {
@@ -278,7 +279,7 @@ internal static partial class LifetimeDelegateAnalysis
             foreach (var name in actual.RootRegionNames)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                Inference(name, "callback region '" + name + "'");
+                Inference(name, (directCall ? "callee region '" : "callback region '") + name + "'");
             }
             foreach (var edge in actual.Constraints)
             {
@@ -291,19 +292,31 @@ internal static partial class LifetimeDelegateAnalysis
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 var parameter = actual.Method.Parameters[index];
-                var required = Inference(actual.ParameterRegions[index] ?? "$parameter:" + index, "callback input '" + parameter.Name + "'");
+                var required = Inference(actual.ParameterRegions[index] ?? "$parameter:" + index, (directCall ? "callee input '" : "callback input '") + parameter.Name + "'");
                 actualInputs[index] = required;
                 var supplied = index < boundParameters
                     ? Universal("$bound:" + index, "captured argument '" + parameter.Name + "'")
                     : Universal(promised.ParameterRegions[index - boundParameters] ?? "$parameter:" + (index - boundParameters),
-                        "delegate input '" + promised.Method.Parameters[index - boundParameters].Name + "'");
+                        (directCall ? "argument '" : "delegate input '") + promised.Method.Parameters[index - boundParameters].Name + "'");
                 AddEdge(requirements, supplied, required, site, "Input may be borrowed for a shorter region.");
                 if (parameter.RefKind is RefKind.Ref or RefKind.Out)
                     AddEdge(requirements, required, supplied, site, "Writable ref/out storage is invariant.");
             }
             if (LifetimeContractModel.HasReceiver(actual.Method))
-                AddEdge(requirements, receiverSuppliedByCaller && universals.TryGetValue("this", out var suppliedReceiver) ? suppliedReceiver : Universal("$receiver", "captured receiver"), inference["this"], site,
+                AddEdge(requirements, receiverSuppliedByCaller && universals.TryGetValue(suppliedReceiverRegion ?? "this", out var suppliedReceiver) ? suppliedReceiver : Universal("$receiver", "captured receiver"), inference["this"], site,
                     receiverSuppliedByCaller ? "The inherited receiver is supplied by the caller." : "The captured receiver has a lifetime independent of later delegate inputs.");
+            if (directCall)
+            {
+                // A direct invocation has a nonempty evaluation extent. Without this lower bound,
+                // every type requirement could be satisfied by an empty inferred region and unknown
+                // type provenance would accidentally count as a proof.
+                var call = Universal("$call", "the current invocation extent");
+                foreach (var region in promised.ParameterRegions.OfType<string>().Concat(promised.TypePositions.Where(position => position.RegionScope.Length == 0).Select(position => position.Region)).Concat(suppliedReceiverRegion is null ? Array.Empty<string>() : new[] { suppliedReceiverRegion }).Distinct(StringComparer.Ordinal))
+                    if (universals.TryGetValue(region, out var supplied))
+                        AddEdge(assumptions, supplied, call, site, "Supplied input regions cover the current invocation.");
+                foreach (var required in inference.Values.ToArray())
+                    AddEdge(requirements, required, call, site, "A callee input lifetime covers the current invocation.");
+            }
         }
 
         internal bool AddReturn(LifetimeContractModel actual, MethodSummary summary, bool promisesAsyncPayload)

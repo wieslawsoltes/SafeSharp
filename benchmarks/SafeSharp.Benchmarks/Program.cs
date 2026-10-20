@@ -16,6 +16,7 @@ internal static class Program
             var cases = new List<BenchmarkCase>();
             if (options.Suite is "all" or "liveness") cases.AddRange(LivenessBenchmarks.Create());
             if (options.Suite is "all" or "regions") cases.AddRange(RegionBenchmarks.Create(options.BaselineCore));
+            if (options.Suite is "all" or "boundaries") cases.AddRange(BoundaryBenchmarks.Create());
             if (options.Filter is not null) cases.RemoveAll(benchmark => !benchmark.Name.Contains(options.Filter, StringComparison.OrdinalIgnoreCase));
             if (cases.Count == 0) throw new ArgumentException("No benchmark scenario matched the selected suite and filter.");
             var results = new List<BenchmarkResult>();
@@ -132,7 +133,7 @@ internal sealed record BenchmarkOptions(string Suite, int Iterations, int Warmup
         for (var index = 0; index < args.Length; index++)
         {
             var option = args[index];
-            if (option is "liveness" or "regions" or "all") { suite = option; continue; }
+            if (option is "liveness" or "regions" or "boundaries" or "all") { suite = option; continue; }
             if (++index == args.Length) throw new ArgumentException("Missing value for " + option);
             switch (option)
             {

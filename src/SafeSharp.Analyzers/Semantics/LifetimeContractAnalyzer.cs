@@ -23,8 +23,11 @@ public sealed class LifetimeContractAnalyzer : DiagnosticAnalyzer
     public static readonly DiagnosticDescriptor DelegateContract = Rule("SS0047", "Callback does not satisfy the delegate lifetime contract",
         "Callback '{0}' is incompatible with delegate '{1}': {2}");
 
+    public static readonly DiagnosticDescriptor CallContract = Rule("SS0050", "Call does not satisfy its lifetime contract",
+        "Call to '{0}' does not establish its lifetime contract: {1}");
+
     public override ImmutableArray<DiagnosticDescriptor> SupportedDiagnostics =>
-        ImmutableArray.Create(InvalidDeclaration, ReturnViolation, InheritedContract, BudgetExceeded, DelegateContract);
+        ImmutableArray.Create(InvalidDeclaration, ReturnViolation, InheritedContract, BudgetExceeded, DelegateContract, CallContract);
 
     public override void Initialize(AnalysisContext context)
     {
@@ -35,6 +38,7 @@ public sealed class LifetimeContractAnalyzer : DiagnosticAnalyzer
             var contracts = new LifetimeContractProvider(start.Compilation);
             if (!contracts.Available) return;
             var summaries = new MethodSummaryProvider(start.Compilation);
+            var callEffects = new LifetimeDelegateAnalysis.CallEffectsProvider();
             var declarations = new ConcurrentDictionary<IMethodSymbol, byte>(SymbolEqualityComparer.Default);
             var bodies = new ConcurrentDictionary<IMethodSymbol, byte>(SymbolEqualityComparer.Default);
             start.RegisterSymbolAction(symbolContext =>
@@ -54,6 +58,7 @@ public sealed class LifetimeContractAnalyzer : DiagnosticAnalyzer
                     symbolContext.ReportDiagnostic, symbolContext.CancellationToken);
             }, SymbolKind.NamedType);
             start.RegisterOperationAction(operationContext => LifetimeDelegateAnalysis.Analyze(operationContext, contracts, summaries), OperationKind.DelegateCreation);
+            start.RegisterOperationAction(operationContext => LifetimeDelegateAnalysis.AnalyzeCall(operationContext, contracts, callEffects), OperationKind.Invocation);
             start.RegisterOperationBlockAction(blockContext =>
             {
                 if (blockContext.OwningSymbol is not IMethodSymbol method) return;

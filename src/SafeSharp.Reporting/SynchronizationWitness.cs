@@ -99,7 +99,7 @@ internal sealed class SynchronizationWitness
             .Select(property => property.Key + ": " + (property.Value ?? "(null)")));
 
     private static bool Number(string? value, out int number) => int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out number);
-    private static bool ProtocolName(string? value, bool requirement) => value is "Monitor" or "ThreadingLock" or "Read" or "UpgradeableRead" or "Write" ||
+    private static bool ProtocolName(string? value, bool requirement) => value is "Monitor" or "ThreadingLock" or "Read" or "UpgradeableRead" or "Write" or "SemaphoreSlim" ||
         requirement && value == "ReaderWriter";
     private static bool Text(string? value)
     {

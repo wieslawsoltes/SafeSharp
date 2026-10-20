@@ -51,6 +51,11 @@ internal sealed class ReferenceStorageState : IEquatable<ReferenceStorageState>
     {
         var locations = TryGetTargets(source, out var referenced) ? referenced : ImmutableHashSet.Create(StringComparer.Ordinal, source);
         if (merge && bindings.TryGetValue(target, out var previous)) locations = previous.Union(locations);
+        BindLocations(target, locations);
+    }
+
+    internal void BindLocations(string target, ImmutableHashSet<string> locations)
+    {
         if (locations.Count > MaximumTargets || locations.Any(location => location.Length > MaximumLocationLength) ||
             !bindings.ContainsKey(target) && bindings.Count >= MaximumBindings)
         {
@@ -58,6 +63,13 @@ internal sealed class ReferenceStorageState : IEquatable<ReferenceStorageState>
             return;
         }
         bindings[target] = locations;
+    }
+
+    internal ImmutableHashSet<string> BoundExpansion(ImmutableHashSet<string>.Builder locations)
+    {
+        if (locations.Count <= MaximumTargets && locations.All(location => location.Length <= MaximumLocationLength)) return locations.ToImmutable();
+        BudgetExceeded = true;
+        return UnknownLocations;
     }
 
     internal void Release(string target) => bindings.Remove(target);

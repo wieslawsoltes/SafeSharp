@@ -58,6 +58,27 @@ public sealed class PlaceLivenessTests
         }
     }
 
+    [Fact]
+    public void ValueWritesReadCapturedAddressesWhileRebindingAndReleaseKillTheBinding()
+    {
+        var block = new FlowBlock(0,
+        [
+            new(InstructionKind.BindReference, Site, target: "reference", source: "first"),
+            new(InstructionKind.Alias, Site, target: "reference", source: "incoming"),
+            new(InstructionKind.BindReference, Site, target: "reference", source: "second"),
+            new(InstructionKind.Alias, Site, target: "reference.field", source: "next"),
+            new(InstructionKind.ReleaseReference, Site, target: "reference"),
+            new(InstructionKind.Read, Site, source: "unrelated"),
+        ], []);
+        var blocks = new Dictionary<int, FlowBlock> { [0] = block };
+        var liveness = Compute(blocks);
+        Assert.Contains("reference", liveness.Before[0][1]);
+        Assert.Contains("reference.field", liveness.Before[0][3]);
+        foreach (var index in new[] { 0, 2, 4 })
+            Assert.DoesNotContain(liveness.Before[0][index], place => place == "reference" || place.StartsWith("reference.", StringComparison.Ordinal));
+        AssertMatchesOracle(blocks, 100);
+    }
+
     [Theory]
     [InlineData(0)]
     [InlineData(1)]
@@ -201,6 +222,49 @@ public sealed class PlaceLivenessTests
         }
     }
 
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(63)]
+    [InlineData(64)]
+    [InlineData(127)]
+    [InlineData(128)]
+    public void SingleOccupiedWordsRetainOrdinalIdentityThroughSparseDenseAndEmptyTransitions(int word)
+    {
+        var count = (word + 2) * 64;
+        var names = Enumerable.Range(0, count).Select(index => "p" + index.ToString("D5")).ToArray();
+        var universe = new PlaceUniverse([new FlowBlock(0,
+            names.Select(name => new FlowInstruction(InstructionKind.Read, Site, source: name)), [])], default);
+        var buffer = new PlaceSetBuilder(universe.WordCount);
+        // Cross both occupancy-summary boundaries and transitions from dense to one
+        // word, to empty, and back to sparse without changing ordinal membership.
+        buffer.SetRange(0, count, true, default);
+        buffer.SetRange(0, word * 64, false, default);
+        buffer.SetRange((word + 1) * 64, count, false, default);
+        buffer.Remove(word * 64 + 17);
+        var snapshot = PlaceSet.Freeze(universe, buffer, default);
+        var expected = names.Skip(word * 64).Take(64).Where((_, index) => index != 17).ToArray();
+        Assert.Equal(expected, snapshot);
+        Assert.Equal(63, snapshot.Count);
+        foreach (var name in names) Assert.Equal(expected.Contains(name), snapshot.Contains(name));
+        Assert.True(snapshot.Matches(buffer, default));
+
+        var copy = new PlaceSetBuilder(universe.WordCount);
+        snapshot.UnionInto(copy, default);
+        Assert.True(snapshot.Matches(copy, default));
+        buffer.Clear();
+        buffer.Add(((word + 1) % universe.WordCount) * 64);
+        Assert.Equal(expected, snapshot);
+        Assert.False(snapshot.Matches(buffer, default));
+        snapshot.ExceptFrom(copy, default);
+        Assert.Empty(PlaceSet.Freeze(universe, copy, default));
+        copy.Add(word * 64 + 63);
+        Assert.Equal([names[word * 64 + 63]], PlaceSet.Freeze(universe, copy, default));
+        copy.Remove(word * 64 + 63);
+        copy.Add(word * 64);
+        Assert.Equal([names[word * 64]], PlaceSet.Freeze(universe, copy, default));
+    }
+
     [Fact]
     public void CancellationDuringDomainDiscoveryStopsBeforeAnySolverResult()
     {
@@ -293,14 +357,10 @@ public sealed class PlaceLivenessTests
     private static void AssertMatchesOracle(IReadOnlyDictionary<int, FlowBlock> blocks, int budget)
     {
         var predecessors = Predecessors(blocks);
-        // Preserve the frozen pre-ref-storage solver as an independent oracle. The newer
-        // MergeReference opcode has the same structural liveness as its existing MergeAlias
-        // instruction: it reads the previous target as well as the new source.
-        var oracleBlocks = blocks.ToDictionary(pair => pair.Key, pair => new FlowBlock(pair.Value.Id,
-            pair.Value.Instructions.Select(instruction => instruction.Kind == InstructionKind.MergeReference
-                ? new FlowInstruction(InstructionKind.MergeAlias, instruction.Site, instruction.Target, instruction.Source,
-                    owner: instruction.Owner) : instruction), pair.Value.Successors));
-        var expected = HashSetLivenessOracle.Compute(oracleBlocks, predecessors, budget, default);
+        // Both solvers receive the same IR. The independent string-set oracle handles
+        // reference binding and address use directly; translating MergeReference to
+        // MergeAlias would erase the fact that its target can hold a captured address.
+        var expected = HashSetLivenessOracle.Compute(blocks, predecessors, budget, default);
         var actual = PlaceLiveness.Compute(blocks, predecessors, budget, default);
         Assert.Equal(expected.BudgetExceeded, actual.BudgetExceeded);
         foreach (var id in blocks.Keys)

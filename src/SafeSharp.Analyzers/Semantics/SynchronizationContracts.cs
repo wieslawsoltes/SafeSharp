@@ -5,7 +5,7 @@ using SafeSharp.Analyzers.Analysis;
 
 namespace SafeSharp.Analyzers.Semantics;
 
-internal enum GuardProtocol { Monitor, ThreadingLock, ReaderWriter }
+internal enum GuardProtocol { Monitor, ThreadingLock, ReaderWriter, SemaphoreSlim }
 
 /// <summary>A resolved, immutable member path; runtime receiver identities are supplied by dataflow.</summary>
 internal sealed class GuardContract
@@ -27,7 +27,7 @@ internal sealed class GuardContract
 }
 
 /// <summary>Compilation-local, symbol-identity resolution; no syntax text is treated as a lock identity.</summary>
-internal sealed class SynchronizationContracts
+internal sealed partial class SynchronizationContracts
 {
     private readonly Lazy<MethodSummaryProvider> summaries;
     private readonly INamedTypeSymbol? guardedBy;
@@ -44,6 +44,7 @@ internal sealed class SynchronizationContracts
         Monitor = FrameworkType(compilation, "System.Threading.Monitor");
         ThreadingLock = FrameworkType(compilation, "System.Threading.Lock");
         ReaderWriter = FrameworkType(compilation, "System.Threading.ReaderWriterLockSlim");
+        SemaphoreSlim = FrameworkType(compilation, "System.Threading.SemaphoreSlim");
     }
     private static INamedTypeSymbol? FrameworkType(Compilation compilation, string metadataName)
     {
@@ -59,12 +60,14 @@ internal sealed class SynchronizationContracts
     internal INamedTypeSymbol? Monitor { get; }
     internal INamedTypeSymbol? ThreadingLock { get; }
     internal INamedTypeSymbol? ReaderWriter { get; }
+    internal INamedTypeSymbol? SemaphoreSlim { get; }
     internal static bool Same(ISymbol? left, ISymbol? right) => SymbolEqualityComparer.Default.Equals(left, right);
     internal bool IsMonitor(IMethodSymbol method) => Same(method.ContainingType, Monitor);
     internal bool IsThreadingLock(IMethodSymbol method) => Same(method.ContainingType, ThreadingLock);
     internal bool IsReaderWriter(IMethodSymbol method) => Same(method.ContainingType, ReaderWriter);
+    internal bool IsSemaphore(IMethodSymbol method) => Same(method.ContainingType, SemaphoreSlim);
     internal GuardProtocol Protocol(ITypeSymbol? type) => Same(type, ThreadingLock) ? GuardProtocol.ThreadingLock :
-        Same(type, ReaderWriter) ? GuardProtocol.ReaderWriter : GuardProtocol.Monitor;
+        Same(type, ReaderWriter) ? GuardProtocol.ReaderWriter : Same(type, SemaphoreSlim) ? GuardProtocol.SemaphoreSlim : GuardProtocol.Monitor;
 
     internal ImmutableArray<GuardContract> Members(ISymbol member) => members.GetOrAdd(member, symbol =>
     {

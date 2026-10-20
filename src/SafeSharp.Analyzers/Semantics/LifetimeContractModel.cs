@@ -15,7 +15,8 @@ internal sealed class LifetimeContractModel
     internal LifetimeContractModel(IMethodSymbol method, ImmutableArray<string?> parameters, string? returned,
         ImmutableArray<RegionConstraint> constraints, ImmutableArray<LifetimeDeclarationIssue> issues,
         ImmutableArray<Location> locations, string? borrowedSource, bool mutableBorrow, bool returnsOwned,
-        ImmutableArray<LifetimeTypePosition> typePositions = default, ImmutableArray<LifetimeTypeBound> typeBounds = default)
+        ImmutableArray<LifetimeTypePosition> typePositions = default, ImmutableArray<LifetimeTypeBound> typeBounds = default,
+        ImmutableArray<string> additionalRootRegions = default)
     {
         Method = method;
         ParameterRegions = parameters;
@@ -34,6 +35,7 @@ internal sealed class LifetimeContractModel
         if (returned is not null) names.Add(returned);
         if (HasReceiver(method)) names.Add("this");
         names.AddRange(TypePositions.Where(position => position.RegionScope.Length == 0).Select(position => position.Region));
+        if (!additionalRootRegions.IsDefault) names.AddRange(additionalRootRegions);
         RootRegionNames = names.Distinct(StringComparer.Ordinal).OrderBy(name => name, StringComparer.Ordinal).ToImmutableArray();
         names.AddRange(TypePositions.Select(position => position.Region));
         RegionNames = names.Distinct(StringComparer.Ordinal).OrderBy(name => name, StringComparer.Ordinal).ToImmutableArray();

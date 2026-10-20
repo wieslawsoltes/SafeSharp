@@ -18,7 +18,10 @@ internal sealed class ValueTaskProtocolState : IEquatable<ValueTaskProtocolState
     private readonly Dictionary<string, Dictionary<string, ReferenceFact>> places = new(StringComparer.Ordinal);
     private readonly Dictionary<string, ValueTaskFact> instances = new(StringComparer.Ordinal);
     private readonly ReferenceStorageState? referenceStorage;
-    internal ValueTaskProtocolState(ReferenceStorageState? referenceStorage = null) => this.referenceStorage = referenceStorage;
+    private readonly Func<ImmutableHashSet<string>, ImmutableHashSet<string>>? expandTargets;
+    internal ValueTaskProtocolState(ReferenceStorageState? referenceStorage = null,
+        Func<ImmutableHashSet<string>, ImmutableHashSet<string>>? expandTargets = null)
+    { this.referenceStorage = referenceStorage; this.expandTargets = expandTargets; }
 
     internal IEnumerable<string> Ids(string? place, AbstractState? state = null) => Resolve(place)
         .Concat(state is null ? Enumerable.Empty<ReferenceFact>() : ContainedProtocols(state, state.Resolve(place)))
@@ -36,7 +39,7 @@ internal sealed class ValueTaskProtocolState : IEquatable<ValueTaskProtocolState
     }
 
     internal IReadOnlyCollection<ReferenceFact> Resolve(string? place) => place is null ? Array.Empty<ReferenceFact>() :
-        referenceStorage?.TryGetTargets(place, out var targets) == true ? ReferenceStorageState.Read(targets, ResolveDirect) : ResolveDirect(place);
+        referenceStorage?.TryGetTargets(place, out var targets) == true ? ReferenceStorageState.Read(expandTargets?.Invoke(targets) ?? targets, ResolveDirect) : ResolveDirect(place);
 
     private IReadOnlyCollection<ReferenceFact> ResolveDirect(string place) => places.TryGetValue(place, out var values)
         ? values.Values : Array.Empty<ReferenceFact>();
@@ -45,6 +48,7 @@ internal sealed class ValueTaskProtocolState : IEquatable<ValueTaskProtocolState
     {
         if (referenceStorage?.TryGetTargets(target, out var targets) == true)
         {
+            targets = expandTargets?.Invoke(targets) ?? targets;
             var values = references.ToArray();
             foreach (var location in targets)
             {
@@ -67,7 +71,10 @@ internal sealed class ValueTaskProtocolState : IEquatable<ValueTaskProtocolState
 
     internal ValueTaskProtocolState Clone()
     {
-        var result = new ValueTaskProtocolState(referenceStorage);
+        // This isolated protocol clone is used only by MergeAlias, whose alternatives share
+        // the same ownership state and aggregate shape. AbstractState.Clone instead creates a
+        // new protocol instance with the cloned state's own resolver before copying facts.
+        var result = new ValueTaskProtocolState(referenceStorage, expandTargets);
         result.CopyFrom(this);
         return result;
     }
@@ -101,7 +108,8 @@ internal sealed class ValueTaskProtocolState : IEquatable<ValueTaskProtocolState
     internal void Apply(FlowInstruction instruction, AbstractState state, int blockId, int index, ISet<string> liveAfter, IssueCollector? issues)
     {
         if (instances.Count == 0 && instruction.Kind != InstructionKind.TrackValueTask ||
-            instruction.Kind is InstructionKind.BindReference or InstructionKind.MergeReference or InstructionKind.ReleaseReference) return;
+            instruction.Kind is InstructionKind.BindReference or InstructionKind.MergeReference or InstructionKind.ReleaseReference or
+                InstructionKind.BindAggregateElementReference or InstructionKind.InvalidateAggregateReference) return;
         var references = Resolve(instruction.Source).ToArray();
         switch (instruction.Kind)
         {

@@ -94,6 +94,25 @@ internal sealed partial class OperationLowerer
                 description: "end the argument's storage snapshot without overwriting its target");
     }
 
+    private void MarkCallMayThrow(IOperation operation, System.Collections.Immutable.ImmutableArray<IArgumentOperation> arguments, CallArguments values)
+    {
+        // Normal source summaries describe completed calls. A callee can replace a writable
+        // element and then throw; its caller's filters/finally must not reuse the old exact
+        // array-cell proof. Keep the normal continuation intact and expose the evaluated
+        // addresses as exception metadata for ControlFlowLowerer.
+        var written = arguments.Where(argument => argument.Parameter?.RefKind is RefKind.Ref or RefKind.Out)
+            .Select(argument => values.Values.TryGetValue(argument.Parameter!.Ordinal, out var value) ? value : null)
+            .Where(value => value is not null).Distinct(StringComparer.Ordinal).ToArray();
+        if (written.Length == 0) { MarkMayThrow(operation); return; }
+        var target = "$exceptional-reference:" + operation.Syntax.SpanStart;
+        Add(InstructionKind.BindReference, operation, target: target, source: written[0]);
+        foreach (var source in written.Skip(1)) Add(InstructionKind.MergeReference, operation, target: target, source: source);
+        Add(InstructionKind.Nop, operation, source: target,
+            flags: InstructionFlags.MayThrow | InstructionFlags.InvalidatesAggregateReferenceOnThrow,
+            description: "potential call exception after writes through evaluated reference arguments");
+        Add(InstructionKind.ReleaseReference, operation, target: target);
+    }
+
     private static bool TryReferenceOutputSource(string origin, Dictionary<int, string> arguments, out string source)
     {
         source = UnknownReferenceStorage;

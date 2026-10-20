@@ -46,3 +46,4 @@ SS0046 | SafeSharp.Ownership | Info | Concurrency, cleanup or borrowed escape an
 SS0047 | SafeSharp.Lifetimes | Warning | Callback violates universally quantified delegate lifetime contract
 SS0048 | Ownership | Warning | ValueTask consumption protocol is not satisfied
 SS0049 | SafeSharp.Ownership | Warning | Synchronization guard is not established
+SS0050 | SafeSharp.Lifetimes | Warning | Direct call does not establish explicit type lifetime requirements
