@@ -7,7 +7,7 @@ SafeSharp separates analysis from presentation. The Roslyn analyzers run inside 
 After a package version is published:
 
 ```sh
-dotnet tool install --global SafeSharp.Tool --version 0.3.0-preview.1
+dotnet tool install --global SafeSharp.Tool --version 0.4.0-preview.1
 safesharp --project src/App/App.csproj --format html --output artifacts/ownership.html
 safesharp --solution App.sln --format sarif --output artifacts/ownership.sarif
 ```
@@ -17,7 +17,7 @@ For a package built from this checkout:
 ```sh
 dotnet pack src/SafeSharp.Tool/SafeSharp.Tool.csproj -c Release -o artifacts/packages
 dotnet tool install --tool-path artifacts/tools SafeSharp.Tool \
-  --add-source artifacts/packages --version 0.3.0-preview.1
+  --add-source artifacts/packages --version 0.4.0-preview.1
 artifacts/tools/safesharp --project samples/SafeSharp.Sample/SafeSharp.Sample.csproj \
   --format html --output artifacts/sample-ownership.html
 ```
@@ -78,9 +78,12 @@ The HTML report includes:
 - An SVG graph of the actual lowered basic blocks and successor edges. Select a block to jump to its state inspector; scroll to pan and use the zoom controls to adjust scale.
 - Every captured instruction with the state before and after it, plus the engine's actual live-before/live-after place sets.
 - Resource identities, ownership obligations, resource/completion kinds, possible lifecycle states, aliases, moved field projections, reserved and active loans, activation sites, reborrow parents, and suspension permissions.
+- Reference bindings and their flattened storage targets; ValueTask capability IDs, consumption states, aliases, origins and prior consumption/transfer evidence.
+- Nested async result depth, cached intermediate/terminal identities, composition kinds/dependencies and represented aggregate element resource/ValueTask identities.
 - Nullability, potentially absent references and loans, resource coverage of projections, and explicit infeasible-state markers for pruned branches.
 - Diagnostic metadata and diagrams of the recorded dependency service, implementation, and lifetime paths for captive-service diagnostics.
-- Lifetime-region graphs with required-return and candidate-source roles, assumed constraints, distinct required edges, region bindings, equivalence components and recorded proof metadata. Isolated regions remain visible.
+- Lifetime-region graphs with required-return and candidate-source roles, assumed constraints, distinct required edges, region bindings, equivalence components and recorded proof metadata. Nested contracts retain binder/variable universes, visibility witnesses, promotions and explicit type-outlives evidence; isolated regions and the reserved static upper bound remain visible.
+- Synchronization diagrams separate the required guard from structured recorded capability intervals. Metadata retains the accessed member, required mode/identity when supplied, protocol, acquisition counts and failure reason. It is evidence for a sequential contract check, not a reconstructed concurrent execution.
 
 The report has no network dependency, external JavaScript library, or graph-rendering service. SVG diagrams are rendered by the browser. The method filter and zoom controls use a fixed inline script; source text is never interpolated into JavaScript. Source names, diagnostic text, graph labels, and metadata cross explicit HTML/XML escaping boundaries. With JavaScript disabled, all methods and the native `<details>` inspectors remain available.
 
@@ -109,11 +112,11 @@ report
         index, instruction, liveBefore[], liveAfter[], before, after
 ```
 
-Each state contains `isReachable`, `places`, `resources`, and `loans`. Places expose `mayBeNull`; references expose `mayBeAbsent`, `coversResource`, and field-move projections; loans expose `mayBeAbsent`, `phase`, activation evidence, kind and reborrow parent. Resources distinguish ordinary resources, asynchronous disposal completions and asynchronous result carriers. Completion facts retain disposed resource IDs; result carriers expose `resultState`, `producedResourceId` and `producedResourceIds` for the cached output alternatives. Those IDs refer to actual resource/loan identities in the computed state. The JSON includes all captured facts; the writer does not infer new aliases or invent histories. Flag values such as `Alive, Disposed` or `Reserved, Active` represent joined possibilities, rather than one concrete object's simultaneous runtime state.
+Each state contains `isReachable`, `places`, `referenceStorage`, `resources`, `loans` and `valueTasks`. Reference-storage entries expose the ref binding and its flattened target locations. ValueTask entries expose capability identity, state, aliases, origin and evidence sites. Places expose `mayBeNull`; references expose `mayBeAbsent`, `coversResource`, and field-move projections; loans expose `mayBeAbsent`, `phase`, activation evidence, kind and reborrow parent. Resources distinguish ordinary resources, asynchronous disposal completions and asynchronous result carriers. Completion facts retain disposed resource IDs; result carriers expose `resultState`, `asyncResultDepth`, `producedResourceId` and `producedResourceIds` for the cached output alternatives. Compositions add `asyncComposition` and `dependencyResourceIds`. Aggregate resources expose `elements` containing the represented index, `resourceIds` and `valueTaskIds`, and `summarizesMultipleAggregates` when a single allocation site requires weak updates. Those IDs refer to actual resource/loan identities in the computed state. The JSON includes all captured facts; the writer does not infer new aliases or invent histories. Flag values such as `Alive, Disposed` or `Reserved, Active` represent joined possibilities, rather than one concrete object's simultaneous runtime state.
 
 `Disposed` records a recognized disposal invocation. The analyzer's release obligation is discharged before an exception from the disposer body propagates; it does not establish that partial or throwing cleanup released every underlying resource successfully.
 
-`Pending` and `Completed` describe the separate completion-observation obligation. A resource may have a recognized disposal invocation while its returned completion remains pending. Awaiting that completion observes the obligation even if the await later propagates a fault. The report preserves this distinction; it does not certify successful physical cleanup or repeated-await validity for arbitrary `ValueTask` instances.
+`Pending` and `Completed` describe the separate completion-observation obligation. A resource may have a recognized disposal invocation while its returned completion remains pending. Awaiting that completion observes the obligation even if the await later propagates a fault. The report preserves this distinction. The separate `valueTasks` state and SS0048 diagnose modeled repeated consumption/transfer; completion observation alone is not permission to consume the original handle again. Neither domain certifies successful physical cleanup, completion readiness or arbitrary IValueTaskSource internals.
 
 The top-level `diagnostics` list is the compiler-host result when the CLI is used: configured severity, suppressions, and the complete analyzer catalog are honored. The per-method `issues` list is the underlying engine result before compiler diagnostic suppression. An issue can therefore be visible in raw method facts while being absent from the top-level diagnostics. This distinction allows inspection of suppressed findings without changing a build policy.
 
@@ -138,11 +141,30 @@ safesharp --project App.csproj --format mermaid --output ownership.mmd
 
 Each method becomes a subgraph, and each successor relation becomes an edge. Captive-service diagnostics with a recorded `SafeSharp.DependencyPath` additionally produce a dependency-witness subgraph. These edges preserve the reported path; they do not reconstruct every service registration in a container. Service and lifetime labels appear when the corresponding metadata paths have matching lengths.
 
-Lifetime diagnostics carrying `SafeSharp.RegionNames` and `SafeSharp.RegionConstraints` additionally produce a region subgraph. Its solid edges are the declared outlives assumptions. When `SafeSharp.RegionRequirements` is supplied, dashed edges show the exact callback/input/result requirements. `SafeSharp.RegionRequirementReasons` and `SafeSharp.RegionBindings` retain the source interpretation without changing topology. The renderer preserves isolated names, cycles and source/required roles; it does not add reflexive edges, transitive closure edges or nonexistent proof paths. `SafeSharp.RegionProof` and `SafeSharp.RegionComponents` remain recorded evidence beside the graph. Non-region origins use explicit tokens such as `<Unknown>`, `<Local>` and `<Null>`, so they cannot be confused with valid declared region names.
+Lifetime diagnostics carrying `SafeSharp.RegionNames` and `SafeSharp.RegionConstraints` additionally produce a region subgraph. Its solid edges are the recorded outlives assumptions, including explicit static-upper-bound axioms supplied by higher-ranked solving. When `SafeSharp.RegionRequirements` is supplied, dashed edges show the exact callback/input/result requirements. `SafeSharp.RegionRequirementReasons` and `SafeSharp.RegionBindings` retain the source interpretation without changing topology. The renderer preserves isolated names, cycles and source/required roles; it does not add reflexive edges, transitive closure edges or nonexistent proof paths. `SafeSharp.RegionProof` and `SafeSharp.RegionComponents` remain recorded evidence beside the graph. The reserved `$static` region is accepted as an exact generated name; other arbitrary `$` names are not valid preview identifiers. `SafeSharp.RegionUniverses`, `SafeSharp.RegionVariableUniverses`, `SafeSharp.RegionUniversePromotions`, `SafeSharp.RegionVisibilityProofs`, `SafeSharp.TypeOutlivesAssumptions`, `SafeSharp.TypeOutlivesRequirements`, `SafeSharp.TypeBindings` and `SafeSharp.TypeOutlivesType` retain the solver's additional evidence. These properties do not create extra graph edges: only recorded assumptions and requirements define topology. Non-region origins use explicit tokens such as `<Unknown>`, `<Local>` and `<Null>`, so they cannot be confused with valid declared region names.
 
 Region graph previews are bounded at 64 names, 256 combined distinct assumption/requirement edges and 65,536 characters per property. Malformed or oversized metadata produces an explicit unavailable-preview explanation while the raw properties remain available. No partial graph is presented as the complete constraint set. The JSON and SARIF diagnostic properties retain the original evidence independently of these visualization limits.
 
 Node identifiers are generated independently from source names. DOT string quoting and Mermaid entity escaping prevent names from becoming graph directives. The raw Mermaid output is intended for a Mermaid-capable renderer; it contains no Markdown fences. For a large solution, use the HTML method selector or consume the JSON to focus on selected methods.
+
+## Synchronization evidence
+
+SS0049 can carry a structured requirement and observed guard state. HTML, DOT and Mermaid draw a dashed edge from the accessed member to its required guard, and solid edges from the recorded state to each supplied capability interval. These are contract and state-membership relationships. There are no inferred equality edges between required and observed nodes, even when their labels match, and no thread-schedule or race trace is reconstructed.
+
+| Property | Meaning |
+| --- | --- |
+| `SafeSharp.SynchronizationRequired` | The declared guard path or protocol requirement. |
+| `SafeSharp.SynchronizationRequiredIdentity` | Canonical evaluated guard label when the analyzer has one. |
+| `SafeSharp.SynchronizationAccess` | The accessed member or operation. |
+| `SafeSharp.SynchronizationAccessMode` | Required access mode when supplied; an absent mode stays unspecified. |
+| `SafeSharp.SynchronizationProtocol` | Required Monitor, ThreadingLock or reader/writer protocol/mode. |
+| `SafeSharp.SynchronizationHeldCount` | Number of structured recorded capability intervals. |
+| `SafeSharp.SynchronizationHeld.{i}.Name/Protocol/Minimum/Maximum` | Exact label, mode and acquisition interval for record `i`; `many` is an abstract unbounded maximum. |
+| `SafeSharp.SynchronizationHeld`, `SafeSharp.SynchronizationReason` | Human-readable state and failure reason, retained independently of the graph. |
+
+A zero minimum does not establish a held guard on every incoming path. Zero records means no recorded capability; the renderer does not parse the human-readable Held string to invent entries. Duplicate display labels remain separate records. Full names and intervals appear in the HTML table as well as node titles.
+
+A preview accepts at most 64 records and 65,536 combined characters in synchronization property keys/values. Missing records, invalid intervals, unsupported protocol names, malformed text and oversized input produce an explicit omitted-preview explanation. No partial graph is presented. JSON and SARIF retain every diagnostic property, and HTML/DOT/Mermaid retain the original metadata alongside the complete graph or omission reason. See [synchronization analysis](synchronization-analysis.md) for the protocol semantics and proof limits.
 
 ## Reuse the reporting library
 
@@ -185,14 +207,26 @@ dotnet run --project src/SafeSharp.Tool -c Release -- \
 
 The report uses computed diagnostics, graph edges and snapshots. Opening the file does not execute its illustrative unsafe C# input.
 
+## Nested lifetimes, capabilities, and guard example
+
+The [0.4 boundary report](examples/boundaries.html) is generated from [BoundaryExamples.cs.txt](../samples/BoundaryExamples.cs.txt). Its nested lifetime conversion records the outer input, fresh placeholder, universe visibility, static promotion and failed requirement. The same fixture shows canonical `WhenAll` result identities after disposal, a repeated `ValueTask` consumption beside a reusable `AsTask` alternative, reference storage beside a saved value, and guard diagnostics with the required receiver and actually held monitor.
+
+```sh
+dotnet run --project src/SafeSharp.Tool -c Release -- \
+  --source samples/BoundaryExamples.cs.txt --format html \
+  --output docs/examples/boundaries.html --fail-on none
+```
+
+Use the method selector and diagnostic filter to inspect one boundary at a time. Lifetime graph edges are the solver's recorded assumptions and requirements. Synchronization evidence records the converged sequential lock capabilities at the reported access; it is not a schedule or a proof of general race freedom. The `--fail-on none` option permits this intentionally invalid sample to produce its report; incomplete analysis would still return exit code 2.
+
 ## Async result evidence
 
 An `AsyncFactoryCarrier` represents the obligation to receive or transfer a possible owned factory result, or a known binding to an existing payload. `Deferred` result state means successful production has not yet materialized its result in the analysis; `Materialized` records the cached value. Flag combinations preserve joined alternatives. A pending owned factory lost at an exit has Possible certainty because execution may fault before producing the result.
 
-After a successful receive, the cached output ID is stable across aliases and repeated receives. The output retains its own disposal and transfer state. `Task.FromResult`, `ValueTask.FromResult` and `ValueTask<T>(T)` bind the already evaluated value and preserve its loans; they do not create a second owned resource. Disposing the task itself does not dispose the contained resource. The HTML state inspector and JSON snapshots expose these facts. See [async result ownership](async-result-ownership.md) for the instruction protocol and exact modeled framework operations.
+After a successful receive, the cached output ID is stable across aliases and repeated receives. The output retains its own disposal and transfer state. `Task.FromResult`, `ValueTask.FromResult` and `ValueTask<T>(T)` bind the already evaluated value and preserve its loans; they do not create a second owned resource. Disposing the task itself does not dispose the contained resource. The HTML state inspector and JSON snapshots expose these facts. Nested successful receives preserve intermediate carrier identity until terminal materialization. Framework compositions retain their exact represented dependencies and canonical aggregate caches; a WhenAny result is an original task alternative, not its eventual payload. Lost/faulted/losing producers keep the obligations defined by that model. See [async result ownership](async-result-ownership.md), [nested async ownership](nested-async-ownership.md), [task composition](async-task-composition.md) and [ValueTask capabilities](value-task-consumption.md) for the instruction protocols and exact modeled operations.
 
 ## Verification
 
-The reporting test suite runs real core analysis before checking serialized states, loan phases, activation evidence and completion obligations. It also covers asynchronous result identity, exact assumed/required region graphs, equivalence cycles, disconnected names, malformed/oversized metadata, all-format determinism under a different process culture, exact URI and UTF-16 coordinate handling, missing snapshots, budget failure, authoritative host severity/suppression, arbitrary diagnostic metadata, Unicode/control-character round trips, cancellation, and HTML/DOT/Mermaid injection boundaries. The CLI is additionally exercised against standalone files, MSBuild projects, and the installed local tool package.
+The reporting test suite runs real core analysis before checking serialized states, loan phases, activation evidence and completion obligations. It also covers reference-storage targets, ValueTask capability state, async composition/aggregate identities, exact assumed/required region graphs, nested universe/type-bound metadata and the static node, exact synchronization requirement/interval relationships and malformed-state rejection, equivalence cycles, disconnected names, malformed/oversized metadata, all-format determinism under a different process culture, exact URI and UTF-16 coordinate handling, missing snapshots, budget failure, authoritative host severity/suppression, arbitrary diagnostic metadata, Unicode/control-character round trips, cancellation, and HTML/DOT/Mermaid injection boundaries. The CLI is additionally exercised against standalone files, MSBuild projects, and the installed local tool package.
 
 For the semantic guarantees and their scope, see [the Rust design comparison](rust-design.md), [contracts and semantic analysis](contracts-and-semantics.md), and [the diagnostic reference](diagnostics.md).

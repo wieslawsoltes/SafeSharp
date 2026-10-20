@@ -2,7 +2,9 @@
 
 SafeSharp uses interned identities and word-parallel sets for backward place liveness, and compact predecessor forests for named-region relations. Both optimizations preserve the existing analysis meaning and diagnostic evidence. The measured gains below apply to these engine workloads; the benchmark does not measure a complete solution build or Roslyn's frontend work.
 
-## Reproducible measurements
+The [0.4 measurement record](performance-0.4.md) covers all 19 current scenarios, including reference storage, ValueTask composition, and higher-ranked universes. It reports the observed sparse-temporary slowdown and allocation reduction explicitly. The measurements below remain the historical 0.3 run and should not be compared across runs as an upgrade speedup.
+
+## Historical 0.3 measurements (2026-10-19)
 
 The dependency-free console harness is [`benchmarks/SafeSharp.Benchmarks`](../benchmarks/SafeSharp.Benchmarks). It uses the repository's existing Core dependency and the .NET runtime, without introducing a benchmark package into the analyzer distribution. It runs correctness comparisons before timing, warms both implementations, alternates baseline and optimized samples, and reports median wall-clock duration and bytes allocated on the current thread.
 

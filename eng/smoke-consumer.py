@@ -55,11 +55,14 @@ with tempfile.TemporaryDirectory(prefix="safesharp-consumer-") as temporary:
     <PackageReference Include="SafeSharp.CodeFixes" Version="{args.version}" PrivateAssets="all" />
   </ItemGroup>
 </Project>''', encoding="utf-8")
-    (root / "Consumer.cs").write_text('''using System.IO;
+    (root / "Consumer.cs").write_text('''using System;
+using System.IO;
 using System.Threading.Tasks;
 using SafeSharp;
 [return: Lifetime("a"), Borrowed]
 public delegate MemoryStream StreamSelector([Borrowed, Lifetime("a")] MemoryStream first, [Borrowed, Lifetime("b")] MemoryStream second);
+[return: TypeLifetime("^a", "return")]
+public delegate Func<object> TiedFactory([Lifetime("a")] object value);
 public static class Consumer {
     public static void Good() { using var stream = new MemoryStream(); var view = First(stream); _ = view.Length; }
     [return: Lifetime("a")] private static MemoryStream First([Lifetime("a")] MemoryStream stream) => stream;
@@ -68,8 +71,16 @@ public static class Consumer {
     public static async Task GoodResult() { var pending = OpenAsync(); var configured = pending.ConfigureAwait(false); using var stream = await configured; _ = stream.Length; }
     [return: Lifetime("x"), Borrowed] private static MemoryStream SelectFirst([Borrowed, Lifetime("x")] MemoryStream first, [Borrowed, Lifetime("y")] MemoryStream second) => first;
     public static StreamSelector GoodCallback() => SelectFirst;
+    [return: TypeLifetime("^x", "return")] private static Func<object> Capture([Lifetime("x")] object value) => () => value;
+    public static TiedFactory GoodNestedCallback() => Capture;
+    public static async Task GoodValueTask() { var pending = new ValueTask<int>(Task.FromResult(1)); var task = pending.AsTask(); _ = await task; _ = await task; }
 }
 [Send, Sync] public sealed class Snapshot { public readonly int Value; public Snapshot(int value) { Value = value; } }
+public sealed class GuardedCounter {
+    private readonly object gate = new object();
+    [GuardedBy(nameof(gate))] private int value;
+    public void Good() { lock (gate) value++; }
+}
 ''', encoding="utf-8")
     good = run(["build", "Consumer.csproj", "--nologo", "-v", "minimal"], root)
     if any(code in good for code in ("AD0001", "AD0002", "CS8032", "CS8034")):
@@ -84,6 +95,8 @@ using System.Threading.Tasks;
 using SafeSharp;
 [return: Lifetime("a"), Borrowed]
 public delegate MemoryStream StreamSelector([Borrowed, Lifetime("a")] MemoryStream first, [Borrowed, Lifetime("b")] MemoryStream second);
+[return: TypeLifetime("fresh", "return")]
+public delegate Func<object> UniversalFactory([Lifetime("a")] object value);
 public static class Consumer {
     public static void Bad() { var stream = new MemoryStream(); stream.Dispose(); stream.WriteByte(1); }
     public static void Pending() { var stream = new MemoryStream(); var pending = stream.DisposeAsync(); }
@@ -92,6 +105,9 @@ public static class Consumer {
     public static async Task RepeatResult() { var pending = OpenAsync(); var stream = await pending; stream.Dispose(); var repeated = await pending; _ = repeated.Length; }
     [return: Lifetime("y"), Borrowed] private static MemoryStream SelectSecond([Borrowed, Lifetime("x")] MemoryStream first, [Borrowed, Lifetime("y")] MemoryStream second) => second;
     public static StreamSelector BadCallback() => SelectSecond;
+    [return: TypeLifetime("^x", "return")] private static Func<object> Capture([Lifetime("x")] object value) => () => value;
+    public static UniversalFactory BadNestedCallback() => Capture;
+    public static async Task RepeatValueTask() { var pending = new ValueTask<int>(Task.FromResult(1)); _ = await pending; _ = await pending; }
     public static object? Retained;
     public static void Retain([Borrowed] object value) { var alias = value; Retained = alias; }
     [return: Lifetime("a")] public static MemoryStream Wrong([Lifetime("a")] MemoryStream first, [Lifetime("b")] MemoryStream second) => second;
@@ -104,9 +120,14 @@ public sealed class IncompleteOwner : IDisposable {
     [Owned] private readonly MemoryStream stream = new();
     public void Dispose() { if (DateTime.UtcNow.Ticks > 0) stream.Dispose(); }
 }
+public sealed class GuardedCounter {
+    private readonly object gate = new object();
+    [GuardedBy(nameof(gate))] private int value;
+    public void Bad() { value++; }
+}
 ''', encoding="utf-8")
     bad = run(["build", "Consumer.csproj", "--no-restore", "--nologo", "-v", "minimal"], root, expected=1)
-    expected_rules = {"SS0001", "SS0003", "SS0017", "SS0021", "SS0027", "SS0041", "SS0044", "SS0045", "SS0047"}
+    expected_rules = {"SS0001", "SS0003", "SS0017", "SS0021", "SS0027", "SS0041", "SS0044", "SS0045", "SS0047", "SS0048", "SS0049"}
     if any("error " + rule not in bad for rule in expected_rules) or any(code in bad for code in ("AD0001", "AD0002", "CS8032", "CS8034")):
         raise SystemExit("Bad consumer did not exercise every packaged analyzer family\n" + bad)
     run(["tool", "install", "SafeSharp.Tool", "--version", args.version, "--tool-path", str(root / "tools"),
@@ -129,11 +150,27 @@ public sealed class IncompleteOwner : IDisposable {
                not diagnostic.get("relatedLocations") for diagnostic in borrowed):
             raise SystemExit(f"Packaged tool {mode} report lost borrowed-escape certainty or provenance")
         delegates = [diagnostic for diagnostic in payload["diagnostics"] if diagnostic["id"] == "SS0047"]
-        if any(diagnostic.get("properties", {}).get("SafeSharp.RegionQuantification") != "one universal delegate binder" or
-               not diagnostic.get("properties", {}).get("SafeSharp.RegionRequirements") or
+        if any(not diagnostic.get("properties", {}).get("SafeSharp.RegionRequirements") or
                not diagnostic.get("properties", {}).get("SafeSharp.RegionBindings") or
                not diagnostic.get("relatedLocations") for diagnostic in delegates):
             raise SystemExit(f"Packaged tool {mode} report lost universal delegate evidence")
+        if not any(diagnostic["properties"].get("SafeSharp.RegionQuantification") == "one universal delegate binder"
+                   for diagnostic in delegates):
+            raise SystemExit(f"Packaged tool {mode} report lost the first-order delegate check")
+        nested_delegates = [diagnostic for diagnostic in delegates
+                            if diagnostic["properties"].get("SafeSharp.RegionQuantification", "").startswith("nested universal delegate binders")]
+        if len(nested_delegates) != 1 or any(not nested_delegates[0]["properties"].get(key) for key in
+                ("SafeSharp.RegionUniverses", "SafeSharp.RegionUniversePromotions", "SafeSharp.RegionVisibilityProofs")):
+            raise SystemExit(f"Packaged tool {mode} report lost the nested placeholder leak or its visibility proof")
+        consumed = [diagnostic for diagnostic in payload["diagnostics"] if diagnostic["id"] == "SS0048"]
+        if len(consumed) != 1 or consumed[0].get("certainty") != "Definite" or not consumed[0].get("relatedLocations"):
+            raise SystemExit(f"Packaged tool {mode} report lost ValueTask capability consumption evidence")
+        unguarded = [diagnostic for diagnostic in payload["diagnostics"] if diagnostic["id"] == "SS0049"]
+        if len(unguarded) != 1 or not unguarded[0].get("relatedLocations") or \
+                unguarded[0].get("properties", {}).get("SafeSharp.SynchronizationRequired") != "gate" or \
+                unguarded[0].get("properties", {}).get("SafeSharp.SynchronizationProtocol") != "Monitor" or \
+                "SafeSharp.SynchronizationHeld" not in unguarded[0].get("properties", {}):
+            raise SystemExit(f"Packaged tool {mode} report lost the unheld Monitor guard's evidence")
         pending_results = [diagnostic for diagnostic in payload["diagnostics"] if diagnostic["id"] == "SS0003" and
                            diagnostic.get("method") == "Consumer.PendingResult()"]
         if len(pending_results) != 1 or pending_results[0].get("certainty") != "Possible" or \
@@ -210,4 +247,4 @@ public sealed class IncompleteOwner : IDisposable {
          "-p:SafeSharpPackageVersion=" + args.version], host)
     host_output = run([str(host / "bin/Debug/net10.0/PackageHost.dll"), str(analyzer_path), str(code_fixes_path)], host)
     print(host_output.strip())
-    print("NuGet consumer: fresh package cache; valid lifetime/delegate/async/concurrency contracts accepted; SS0001/03/17/21/27/41/44/45/47 enforced; universal proofs and cached async identities retained; installed CLI source/project modes and packaged MSBuild-budget/EditorConfig precedence verified.")
+    print("NuGet consumer: fresh package cache; valid nested lifetime/delegate/async/ValueTask/Monitor contracts accepted; SS0001/03/17/21/27/41/44/45/47/48/49 enforced; universe visibility, consumption and guard evidence retained; cached async identities, installed CLI source/project modes and packaged MSBuild-budget/EditorConfig precedence verified.")

@@ -1,12 +1,12 @@
 # Diagnostic reference
 
-SafeSharp implements **40 Roslyn diagnostics across five analyzers** for ownership, borrowing, disposal, explicit lifetime regions, concurrency contracts, and dependency injection. They run during compiler and IDE analysis. The ownership engine computes effects over Roslyn control-flow graphs; separate semantic, boundary, lifetime, and concurrency analyzers check their corresponding declarations, implementation obligations, and call boundaries.
+SafeSharp implements **42 Roslyn diagnostics across five analyzers** for ownership, borrowing, disposal, explicit lifetime regions, concurrency contracts, and dependency injection. They run during compiler and IDE analysis. The ownership engine computes effects over Roslyn control-flow graphs; separate semantic, boundary, lifetime, and concurrency analyzers check their corresponding declarations, implementation obligations, and call boundaries.
 
 Every rule below is implemented. “Implemented” describes the stated check within the documented model, not equivalence to Rust's language-level guarantees. `Ownership.Move`, `Borrow`, and `BorrowMut` are metadata-bearing passthrough methods; C# still permits aliasing and value-type copies at runtime. See [implementation status](implementation-status.md), [architecture](architecture.md), [contracts](contracts-and-semantics.md), and [Rust design references](rust-design.md) for the analysis domain and its limits.
 
 ## Rule matrix
 
-“Info” appears as a suggestion in typical IDE configurations. Every diagnostic can be configured with `dotnet_diagnostic.<ID>.severity`. Within SS0001–SS0047, only SS0018–SS0019 and SS0035–SS0039 are unassigned.
+“Info” appears as a suggestion in typical IDE configurations. Every diagnostic can be configured with `dotnet_diagnostic.<ID>.severity`. Within SS0001–SS0049, only SS0018–SS0019 and SS0035–SS0039 are unassigned.
 
 | ID | Implemented check | Analyzer | Default | Enabled |
 | --- | --- | --- | --- | --- |
@@ -50,6 +50,8 @@ Every rule below is implemented. “Implemented” describes the stated check wi
 | [SS0045](#ss0045) | Captured value does not satisfy its concurrency boundary | Concurrency | Warning | Yes |
 | [SS0046](#ss0046) | Cleanup, concurrency or borrowed escape analysis is incomplete | Semantic / Concurrency | Info | Yes |
 | [SS0047](#ss0047) | Callback violates an annotated delegate lifetime contract | Lifetime | Warning | Yes |
+| [SS0048](#ss0048) | ValueTask capability is consumed or transferred more than once | Ownership | Warning | Yes |
+| [SS0049](#ss0049) | Required synchronization guard or lock protocol is not established | Concurrency | Warning | Yes |
 
 The public analyzer classes and descriptor categories are:
 
@@ -67,7 +69,7 @@ The public analyzer classes and descriptor categories are:
 
 Ownership diagnostics include `SafeSharp.Certainty`, `SafeSharp.ResourceId`, and `SafeSharp.Evidence` properties. `Definite` means the modeled alternatives reaching that check violate the rule; `Possible` means the abstract state also admits a nonviolating alternative. At a conditional merge, a resource disposed only on one branch typically yields a possible use-after-disposal. These labels describe the abstract model, including its conservative joins, trusted contracts, and recognized library effects. They are not proof that a particular execution reaches the issue.
 
-Related locations identify acquisition, transfers, conflicting loans, releases, or relevant exits. JSON, SARIF, HTML, Mermaid, and DOT reports retain analysis evidence; see [reporting](reporting.md). Graph states are computed facts, and a displayed control-flow path is not an automatically solved concrete counterexample. Declaration and boundary diagnostics do not carry the core's certainty property unless their analysis produces it. Service diagnostics carry dependency paths; SS0021 records cleanup entrypoints and normal-exit proof scope; lifetime diagnostics record declared regions, constraints, and return provenance; concurrency diagnostics record the required capability and failing component path.
+Related locations identify acquisition, transfers, conflicting loans, releases, or relevant exits. JSON, SARIF, HTML, Mermaid, and DOT reports retain analysis evidence; see [reporting](reporting.md). Graph states are computed facts, and a displayed control-flow path is not an automatically solved concrete counterexample. Declaration and boundary diagnostics do not carry the core's certainty property unless their analysis produces it. Service diagnostics carry dependency paths; SS0021 records cleanup entrypoints and normal-exit proof scope; lifetime diagnostics record declared regions, constraints, and return provenance; concurrency diagnostics record the required capability and failing component path. SS0049 retains the required guard, protocol, held-capability state and failure reason. Nested lifetime failures also retain binder/variable universes, placeholder visibility proofs, promotions and type-outlives assumptions/requirements.
 
 The core runs forward ownership analysis to a fixed point and backward place liveness to determine loan ends. Consequently, a loan can end at its last use before its lexical block closes. This borrows the control-flow approach described by the [Rust compiler borrow-checker guide](https://rustc-dev-guide.rust-lang.org/borrow-check.html). SafeSharp also solves [explicit named lifetime regions](lifetime-regions.md), while Rust's complete region and type system remains outside the implementation. See [advanced protocols](advanced-engine.md) for reserved/active loans and first-class async completion states.
 
@@ -622,7 +624,7 @@ static void Inspect([Lifetime("input")] Resource value) { }
 
 Introduce each region on an actual parameter or result, correct a misspelled endpoint, and use the reserved `this` region only for an instance receiver. Lifetime names are scoped to a method signature. `Outlives("a", "b")` requires `a` to remain valid at least as long as `b`; it does not introduce either name. Equal names share a region, transitive constraints compose, and cycles establish equivalent regions rather than an automatic contradiction.
 
-A parameter with a borrowed lifetime cannot also consume ownership. Use `ReturnsOwned` for a newly owned result and reserve returned `Lifetime` annotations for loans. Resolve conflicting `Borrowed`/`BorrowedMut` return annotations and inconsistent `ReturnsBorrowed` mutability. Invalid declarations are diagnosed before body provenance is used as a proof. See [explicit lifetime declarations](lifetime-regions.md#ss0040).
+A parameter with a borrowed lifetime cannot also consume ownership. Use `ReturnsOwned` for a newly owned result and reserve returned `Lifetime` annotations for loans. Resolve conflicting `Borrowed`/`BorrowedMut` return annotations and inconsistent `ReturnsBorrowed` mutability. Invalid declarations are diagnosed before body provenance is used as a proof. TypeLifetime additionally validates paths through actual generic arguments, array elements and nested callable parameters/results, duplicate annotations, binder-local names and explicit `^` outer references. Outlives.Scope and TypeOutlives.Scope must name an introduced callable binder; type bounds must name a real method/enclosing type parameter and a declared region. These annotations do not introduce an arbitrary field/heap path language. See [explicit lifetime declarations](lifetime-regions.md#ss0040) and [type lifetime declarations](type-lifetimes.md).
 
 ## SS0041
 
@@ -638,7 +640,7 @@ static Resource Choose(
 
 Return a source that satisfies the promised lifetime on every path. If both inputs are legitimate, declare a result region and accurate outlives relations from each supplying input, or give them the same intended region. Add a relation only when callers can uphold it. A stronger named-source promise still restricts origin even when another input has a sufficiently long lifetime.
 
-The checker follows actual CFG assignments, aliases, branches, loops, supported source/call summaries, and conservative `ref`/`out` and captured-storage invalidation. A valid branch cannot erase an unknown alternative. Returning a null creates no resource-lifetime obligation. Contracts on external calls remain trusted; an unknown helper or arbitrary property does not establish provenance by its name. Use an owned-return contract when returning a new owner rather than extending a local loan artificially.
+The checker follows actual CFG assignments, aliases, branches, loops, supported source/call summaries, reference locations and bounded exception/filter/finally continuations. By-value return values are captured before cleanup and validated after it; ref returns preserve the selected storage location and inspect its normal-exit value. Unknown ref/out effects and captured-storage invalidation remain conservative. A valid branch cannot erase an unknown alternative. Returning a null creates no resource-lifetime obligation. Contracts on external calls remain trusted; an unknown helper or arbitrary property does not establish provenance by its name. Use an owned-return contract when returning a new owner rather than extending a local loan artificially.
 
 Diagnostic properties preserve the required/source regions, original declared constraints, components, and available proof paths. Reports can render the declaration graph without inventing missing relations. Region proofs do not authorize disposal or use after move; the ordinary ownership rules still apply. See [return provenance](lifetime-regions.md#what-the-body-checker-follows) and [region reporting](advanced-engine.md#declared-lifetime-region-graphs).
 
@@ -665,11 +667,11 @@ sealed class Selector : ISelector
 
 Keep the implementation's requirements and returned promise compatible with the interface/base API. Omitted annotations inherit the declaration, parameters are matched by ordinal, and consistent lifetime-name renaming is supported. Restating a relation already implied transitively does not introduce a new requirement. Change the public contract and its callers together when a genuinely stronger precondition is necessary.
 
-SS0034 covers incompatible parameter ownership modes; SS0042 covers the explicit lifetime/return comparison. It does not prove full generic variance, arbitrary exception effects, synchronization, or higher-ranked lifetime polymorphism. See [inherited lifetime compatibility](lifetime-regions.md#interface-and-override-compatibility).
+SS0034 covers incompatible parameter ownership modes; SS0042 covers the lifetime/return comparison. Explicit nested TypeLifetime paths, scoped Outlives/TypeOutlives bounds, callable variance and inherited structural type substitutions participate in that comparison. Omitted nested contracts inherit the corresponding declaration. This does not prove arbitrary body contents, exception effects, synchronization or a complete Rust trait/type system. See [inherited lifetime compatibility](lifetime-regions.md#interface-and-override-compatibility) and [nested type contracts](type-lifetimes.md).
 
 ## SS0043
 
-**Lifetime analysis is incomplete.** A named-region solve, inherited-contract comparison, or returned-origin flow analysis reaches its configured bound. A missing violation after this diagnostic is not an established lifetime proof.
+**Lifetime analysis is incomplete.** A named/higher-ranked region solve, nested type or inherited-contract comparison, generic substitution, or returned-origin flow analysis reaches its configured bound. A missing violation after this diagnostic is not an established lifetime proof.
 
 ```editorconfig
 [*.cs]
@@ -680,7 +682,7 @@ safesharp_max_region_steps = 100000
 
 Reduce an unnecessarily complex signature or method, inspect expanding relationships, or raise the relevant bound after measuring analysis cost. The displayed values are defaults. The analyzer caps effective values at 4,096 regions, 100,000 constraints, and 10,000,000 steps; invalid/nonpositive values use defaults. These limits are independent of SS0015's ownership iteration/resource limits and SS0046's aggregate/concurrency/escape budgets.
 
-The reusable solver returns an incomplete solution without partial components or proofs. Suppressing SS0043 suppresses the notification, not the missing proof. See [the reusable region solver](lifetime-regions.md#reusable-region-solver).
+One shared budget covers assumptions, requirements, implicit static relations, type bounds, universe visibility checks and promotions for a higher-ranked problem. Type paths and structural substitution are bounded at depth 64, and path text is also bounded. The reusable solver returns an incomplete solution without partial components or proofs. Suppressing SS0043 suppresses the notification, not the missing proof. See [the reusable region solver](lifetime-regions.md#reusable-region-solver) and [higher-ranked limits](higher-ranked-regions.md).
 
 ## SS0044
 
@@ -733,7 +735,7 @@ The primary diagnostic points to the capture; related locations retain the sched
 
 ## SS0046
 
-**Cleanup, concurrency or borrowed escape analysis is incomplete.** Cleanup summaries, CFG continuation exploration, structural type composition, generic checking, callback resolution, or borrowed-origin propagation exceeds an analysis bound. The corresponding contract property has not been established.
+**Cleanup, concurrency, synchronization or borrowed escape analysis is incomplete.** Cleanup summaries, CFG continuation exploration, structural type composition, generic checking, callback resolution, guard capability flow, or borrowed-origin propagation exceeds an analysis bound. The corresponding contract property has not been established.
 
 ```editorconfig
 [*.cs]
@@ -742,15 +744,15 @@ safesharp_max_contract_steps = 20000
 
 Inspect recursive helpers, deeply expanding structures, or complex callback aliases. Simplify the model or raise the step budget after measuring compiler cost. This key uses per-file configuration before global configuration, defaults to 20,000, and caps positive effective values at 1,000,000. Invalid values use the default.
 
-Aggregate checks additionally bound tracked members to 512, active summaries to 32, cached summaries to 256, and CFG continuation contexts to 8,192. Concurrency checks bound recursive type and delegate alias depth to 128 and each source-visible affinity traversal to 128 distinct types. Borrowed escape checks bound expression depth to 256 and charge propagation work to the per-method contract budget. Their budgets are separate from ownership fixed-point and lifetime-region limits. Existing SS0021 findings may accompany an incomplete aggregate result.
+Aggregate checks additionally bound tracked members to 512, active summaries to 32, cached summaries to 256, and CFG continuation contexts to 8,192. Concurrency checks bound recursive type and delegate alias depth to 128 and each source-visible affinity traversal to 128 distinct types. Synchronization additionally bounds contextual states to 4,096, simultaneously tracked capabilities to 256, operation depth to 256 and candidate targets per reference binding to 256. Borrowed escape checks bound expression depth to 256 and charge propagation work to the per-method contract budget. Their budgets are separate from ownership fixed-point and lifetime-region limits. Existing SS0021 findings may accompany an incomplete aggregate result.
 
-SS0046 is informational and enabled by default. The CLI treats it as incomplete analysis even if its visible diagnostic is suppressed. See [aggregate limits](aggregate-concurrency.md#analysis-limits), [concurrency limits](aggregate-concurrency.md#what-these-contracts-establish), and [borrowed escape analysis](borrowed-escape.md).
+SS0046 is informational and enabled by default. The CLI treats it as incomplete analysis even if its visible diagnostic is suppressed. See [aggregate limits](aggregate-concurrency.md#analysis-limits), [concurrency limits](aggregate-concurrency.md#what-these-contracts-establish), [synchronization limits](synchronization-analysis.md), and [borrowed escape analysis](borrowed-escape.md).
 
 ## SS0047
 
 **Callback does not satisfy its annotated delegate contract.** A method group, anonymous function or distinct typed delegate conversion cannot preserve the target's explicit lifetime, ownership or borrowing promise for every caller lifetime allowed by that delegate.
 
-This check activates when the target delegate declares named lifetime regions or an owned return. Borrowing, consuming or no-escape annotations alone do not activate SS0047.
+This check activates when the target delegate declares named lifetime regions, TypeLifetime/TypeOutlives contracts or an owned return. Borrowing, consuming or no-escape annotations alone do not activate SS0047.
 
 ```csharp
 [return: Lifetime("a"), Borrowed]
@@ -770,7 +772,68 @@ Use a callback returning the promised input, or declare an appropriate `[Outlive
 
 The primary location is the callback conversion, or the invalid returned expression for a lambda analyzed under its target promise. Related locations identify declarations and origins. Universal failures carry exact assumed/required edges, generated-to-source region bindings and a deterministic shortest proof. Graphs distinguish assumptions from requirements. Budget exhaustion receives SS0043 and does not accept a partial result.
 
-This implements one universal outlives binder, including input shortening, output covariance and writable ref/out invariance. Nested universes, implied type bounds and full Rust higher-ranked type/trait solving remain outside the model. See [delegate lifetime contracts](lifetime-delegates.md) and the [public universal solver](universal-regions.md).
+The higher-ranked adapter additionally checks corresponding TypeLifetime paths through generic arguments, arrays and nested delegates. Each callable boundary opens a binder; an outer capture cannot be generalized into an independent nested placeholder. Declared variance, writable-slot/array invariance, scoped outlives relations, explicit type bounds and supported implied input/owner bounds contribute to the obligations. A bound extension receiver with nested contracts needs corresponding evidence and is otherwise conservative.
+
+For example, this delegate conversion attempts to promise a fresh nested lifetime for an outer captured object:
+
+```csharp
+[return: TypeLifetime("fresh", "return")]
+delegate Func<object> Independent([Lifetime("a")] object owner);
+
+[return: TypeLifetime("^input", "return")]
+static Func<object> Capture([Lifetime("input")] object owner) => () => owner;
+
+Independent callback = Capture; // SS0047: an outer lifetime cannot name the fresh placeholder.
+```
+
+A delegate whose result uses `TypeLifetime("^a", "return")` accurately preserves this capture relationship. Nested contents remain declared contracts; this check does not infer arbitrary collection/object contents or reproduce Rust's full higher-ranked trait/type solver. See [delegate contracts](lifetime-delegates.md), the [public universal solver](universal-regions.md), [higher-ranked regions](higher-ranked-regions.md), and [type lifetime contracts](type-lifetimes.md).
+
+## SS0048
+
+**ValueTask capability has already been consumed or transferred.** A represented ValueTask/ValueTask<T> handle is awaited, synchronously consumed, converted or transferred after an earlier consumption or transfer of the same capability. Copies and configured/awaiter aliases retain identity even when the eventual result has no disposal obligation.
+
+```csharp
+async Task Invalid()
+{
+    var pending = new ValueTask<int>(Task.FromResult(42));
+    _ = await pending;
+    _ = await pending; // SS0048: the same single-consumption capability.
+}
+
+async Task Reusable()
+{
+    var pending = new ValueTask<int>(Task.FromResult(42));
+    var task = pending.AsTask();
+    _ = await task;
+    _ = await task; // The retained Task handle is reusable.
+}
+```
+
+Consume the original handle once. When repeated observation is required, retain the result of the supported AsTask or Preserve conversion and use that result. The conversion consumes the original capability; using the original afterward can still fail. Explicit moves invalidate earlier copies, and known consuming parameters, returns or escaping storage transfer the capability. The model enforces the general ValueTask API protocol even when a particular represented construction wraps a Task or inline result; a default ValueTask with no represented inner source introduces no capability.
+
+A join of available and consumed alternatives yields Possible certainty; reuse after every represented path consumed the capability yields Definite certainty. Related locations retain creation and prior consumption/transfer evidence. JSON/HTML snapshots expose the capability ID, state, aliases and sites. Unknown unannotated calls are not assumed to consume a ValueTask; declare Consumes where that boundary transfers it. This check does not establish completion readiness, correctness of arbitrary IValueTaskSource implementations or successful physical cleanup. SS0017 independently tracks unobserved asynchronous disposal. See [ValueTask consumption](value-task-consumption.md).
+
+## SS0049
+
+**Required synchronization guard or lock protocol is not established.** A guarded access or RequiresLock call lacks the matching capability on a modeled incoming path, a guarded reference escapes its required protection, or a supported lock operation violates its protocol. An invalid guard declaration also fails this contract check.
+
+```csharp
+sealed class Counter
+{
+    private readonly object gate = new object();
+    [GuardedBy(nameof(gate))] private int value;
+
+    public void Invalid() { value++; } // SS0049: gate is not held.
+    public void Increment() { lock (gate) value++; }
+
+    [RequiresLock(nameof(gate))]
+    private void IncrementWhileHeld() { value++; }
+}
+```
+
+Acquire the declared guard around the access or call, and release it on the required cleanup paths. A RequiresLock precondition is assumed when checking its body and required at callers; it does not acquire a lock at runtime. Valid guard paths identify the instance receiver, a method parameter or a supported stable field chain. The same field name on a different object is a different guard. Monitor, System.Threading.Lock and ReaderWriterLockSlim use distinct protocols; reader/writer operations additionally require the appropriate mode.
+
+The diagnostic properties `SafeSharp.SynchronizationRequired`, `SafeSharp.SynchronizationProtocol`, `SafeSharp.SynchronizationHeld` and `SafeSharp.SynchronizationReason` preserve the requirement and observed abstract guard state. Structured HeldCount/Held records retain protocol and acquisition intervals; Access/AccessMode and RequiredIdentity preserve the member, mode and evaluated guard label when available. HTML/DOT/Mermaid show required-versus-recorded relationships without inferring identity equality from display names; JSON/SARIF retain the exact properties. Related locations identify the relevant declaration/acquisition. This is a sequential capability analysis over explicit contracts and supported APIs. GuardedBy does not make an otherwise invalid Sync structure valid; that composition check still has its own requirements. Guard analysis does not discover arbitrary synchronization, prove all thread interleavings, establish deadlock freedom or replace CLR memory-order rules. Complex/unknown effects retain the limitations in [synchronization analysis](synchronization-analysis.md); budget exhaustion receives SS0046 rather than a successful proof.
 
 ## Configuration and adoption
 

@@ -6,9 +6,9 @@ Install both packages to obtain diagnostics and IDE actions:
 
 ```xml
 <ItemGroup>
-  <PackageReference Include="SafeSharp.Analyzers" Version="0.3.0-preview.1" PrivateAssets="all" />
-  <PackageReference Include="SafeSharp.CodeFixes" Version="0.3.0-preview.1" PrivateAssets="all" />
-  <PackageReference Include="SafeSharp.Contracts" Version="0.3.0-preview.1" />
+  <PackageReference Include="SafeSharp.Analyzers" Version="0.4.0-preview.1" PrivateAssets="all" />
+  <PackageReference Include="SafeSharp.CodeFixes" Version="0.4.0-preview.1" PrivateAssets="all" />
+  <PackageReference Include="SafeSharp.Contracts" Version="0.4.0-preview.1" />
 </ItemGroup>
 ```
 

@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.4.0-preview.1
+
+### Analysis
+
+- Added reusable higher-ranked region problems, lexical binder trees, placeholders, inference variables and a static upper bound. Universe visibility is intersected across reachable regions; unnameable placeholder requirements produce explicit promotion and leak evidence. Nested and first-order solves share budgets and retain deterministic source-backed proofs without returning partial compatibility results.
+- Added `[TypeLifetime]` paths and `[TypeOutlives]` bounds, plus scoped `[Outlives]` relationships. Roslyn delegate and inherited-contract checks compose declared generic variance, array/ref invariance, nested callable binders, outer captures, explicit and supported implied bounds, and structural generic substitution. Unsupported nested contents remain explicit contract boundaries.
+- Added SS0048 for ValueTask capabilities consumed or transferred more than once. Aliases, moves, joins, stored/configured awaiters, result access, asynchronous cleanup, returned values and consuming calls share capability identity. `AsTask` and `Preserve` consume the original capability and produce modeled reusable handles.
+- Extended asynchronous ownership through bounded nested Task/ValueTask layers and actual Roslyn-selected custom awaiter contracts. Framework `WhenAll`, `WhenAny`, `Unwrap` and `WaitAsync` preserve represented result and completion identities, including canonical aggregate element caches, original-task alternatives, fault boundaries and loser obligations. Unknown calls invalidate represented array contents before potential faults while preserving independent values and captured composition inputs.
+- Added a shared bounded source control-flow router for source origins and lifetime returns. It preserves filter search before cleanup, throwing/rejecting filter effects, nested finally continuations, captured return values and normal-exit postconditions. Unknown effects and exhausted source inference remain conservative.
+- Added a separate core reference-storage domain with flattened targets, reference rebinding, conditional references, evaluated ref/out argument locations, source ref-return targets and simultaneous normal-call write postconditions. Singleton writes update strongly; uncertain targets update weakly. By-value returns and returned storage retain their different cleanup semantics. Exposed ref/out/in array-element storage invalidates canonical content proofs while preserving independent value snapshots and previously captured composition inputs.
+- Added `[GuardedBy]` and `[RequiresLock]` contracts and SS0049 for modeled guarded-access and lock-protocol violations. The concurrency analyzer tracks explicit Monitor, `System.Threading.Lock` and `ReaderWriterLockSlim` capabilities with receiver identity, access modes, aliases and control-flow joins. The synchronization guide records the supported protocols and remaining concurrency limits.
+
+### Implementation and evidence
+
+- Kept the new domains finite and cancellation-aware. Higher-ranked ancestry uses indexed intervals and binary lifting; placeholder-free problems avoid universe scans. Reference storage has a singleton fast path, async chains use visited identities, and summary/continuation worklists reuse indexed states.
+- Extended JSON/HTML snapshots with reference storage, ValueTask capability state, nested async payloads and canonical composition aggregates. Region diagnostics preserve binder and variable universes, visibility witnesses, promotions, type bounds and original proof edges; all report formats retain this evidence, including the reserved static-region node. Synchronization HTML/DOT/Mermaid diagrams distinguish the required guard from structured observed capability intervals, with bounded parsing and exact metadata preservation.
+- Validated 2,268 tests with no failures or skips and a full Release build with zero warnings or errors. Positive, negative and adversarial coverage includes nested binders, generic substitution, exception routing, reference aliases, async compositions, capability reuse and guard protocols. Original Core constructor signatures remain available; a previously compiled consumer is tested against the new assembly.
+- Added three boundary benchmarks and measured all 19 harness scenarios with five warmups and fifteen samples. Four liveness workloads improved against the frozen baseline; sparse temporaries were 19.5% slower while allocating 46.1% less. New domains have current-only results. The [complete 0.4 record](docs/performance-0.4.md) includes all time/allocation rows and raw JSON; the earlier 0.3 measurements remain separately labeled. No whole-build speedup is claimed.
+
+### Packages and integration
+
+- Updated all six package projects and portable symbol packages to `0.4.0-preview.1`, with the same .NET Standard 2.0 contracts/analyzer boundary and minimum Roslyn 4.14 analyzer host.
+- Extended clean SDK consumers and installed CLI checks with nested lifetime leaks, ValueTask reuse and guarded access. The independent Roslyn 4.14 package host exercises the higher-ranked Core API, safe and unsafe nested captures, SS0048, SS0049, report evidence and the live code fix.
+- Updated architecture, diagnostic references, package installation, reporting, pinned Rust design references and the implemented/remaining boundary matrix. Packages remain unpublished until the release workflow runs.
+
 ## 0.3.0-preview.1
 
 ### Analysis
