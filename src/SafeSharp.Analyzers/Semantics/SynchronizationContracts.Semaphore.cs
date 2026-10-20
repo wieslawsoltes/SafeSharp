@@ -37,17 +37,18 @@ internal sealed partial class SynchronizationContracts
             initialized = true;
         }
         if (!initialized) return false; // Metadata and constructor-only initialization need an explicit caller precondition.
-        // Readonly does not imply that the initializer wins: a constructor may replace the field.
-        // Every visible assignment must preserve maxCount=1, and a writable ref escape defeats it.
+        // Readonly does not imply that the initializer wins: constructors and init accessors
+        // may replace the field. Mutable structs can also overwrite their entire this value.
+        // Every visible assignment must preserve maxCount=1, and a ref escape defeats it.
         foreach (var declaration in field.ContainingType.DeclaringSyntaxReferences)
         {
             if (declaration.GetSyntax(cancellationToken) is not TypeDeclarationSyntax type) return false;
             var model = Compilation.GetSemanticModel(type.SyntaxTree);
-            foreach (var constructor in type.Members.OfType<ConstructorDeclarationSyntax>())
-            foreach (var node in constructor.DescendantNodes())
+            foreach (var member in type.Members.Where(member => member is not BaseTypeDeclarationSyntax and not DelegateDeclarationSyntax))
+            foreach (var node in member.DescendantNodesAndSelf())
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                if (++steps > 20000) throw new AnalysisBudgetException("Semaphore field-construction proof exceeded 20000 syntax steps.");
+                if (++steps > 20000) throw new AnalysisBudgetException("Semaphore field-bound proof exceeded 20000 syntax steps.");
                 if (node is AssignmentExpressionSyntax { Left: ThisExpressionSyntax }) return false;
                 // A readonly field may still be exposed as writable ref storage inside its
                 // constructor. Subsequent writes through the alias need not mention the field.

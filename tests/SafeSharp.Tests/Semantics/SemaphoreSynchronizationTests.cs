@@ -102,6 +102,23 @@ public sealed class SemaphoreSynchronizationTests
     }
 
     [Fact]
+    public async Task InitAccessorOverwritesCannotLeaveAFalseBinaryProof()
+    {
+        var source = Imports + "class C { " + Fields + "public SemaphoreSlim Gate { init { gate = value; } } " +
+            "void M() { gate.Wait(); try { this.value++; } finally { gate.Release(); } } }";
+        var diagnostics = await Analyze(source);
+        Assert.Contains(diagnostics, diagnostic => diagnostic.Id == "SS0049" && diagnostic.Location.SourceSpan.Start == source.IndexOf("this.value++;", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task InitAccessorThatPreservesTheMaximumRetainsTheBinaryProof()
+    {
+        var source = Imports + "class C { " + Fields + "public bool Reset { init { gate = new SemaphoreSlim(0, 1); } } " +
+            "void M() { gate.Wait(); try { this.value++; } finally { gate.Release(); } } }";
+        Assert.Empty(await Analyze(source));
+    }
+
+    [Fact]
     public async Task EveryConstructorPreservingTheMaximumRetainsTheBinaryProof()
     {
         var source = Imports + "class C { " + Fields + "C() { gate = new SemaphoreSlim(0, 1); } " +
