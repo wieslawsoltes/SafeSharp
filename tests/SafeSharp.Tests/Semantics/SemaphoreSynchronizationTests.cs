@@ -83,12 +83,22 @@ public sealed class SemaphoreSynchronizationTests
     [InlineData("gate = new SemaphoreSlim(1, 2);")]
     [InlineData("gate = external;")]
     [InlineData("Replace(ref gate);")]
+    [InlineData("ref var alias = ref gate; alias = new SemaphoreSlim(2, 2);")]
+    [InlineData("ref var alias = ref (gate); alias = external;")]
     public async Task ConstructorOverwritesCannotLeaveAFalseBinaryProof(string assignment)
     {
         var source = Imports + "class C { " + Fields + "C(SemaphoreSlim external) { " + assignment +
             " } static void Replace(ref SemaphoreSlim semaphore) {} void M() { gate.Wait(); try { value++; } finally { gate.Release(); } } }";
         var diagnostics = await Analyze(source);
         Assert.Contains(diagnostics, diagnostic => diagnostic.Id == "SS0049" && diagnostic.Location.SourceSpan.Start == source.IndexOf("value++;", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task WholeStructAssignmentCannotLeaveAFalseFieldInitializerProof()
+    {
+        var source = Imports + "struct C { readonly SemaphoreSlim gate = new(1, 1); [GuardedBy(nameof(gate))] int value; " +
+            "public C(C replacement) { this = replacement; } void M() { gate.Wait(); try { value++; } finally { gate.Release(); } } }";
+        Assert.Contains(await Analyze(source), diagnostic => diagnostic.Id == "SS0049");
     }
 
     [Fact]

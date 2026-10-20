@@ -48,6 +48,11 @@ internal sealed partial class SynchronizationContracts
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 if (++steps > 20000) throw new AnalysisBudgetException("Semaphore field-construction proof exceeded 20000 syntax steps.");
+                if (node is AssignmentExpressionSyntax { Left: ThisExpressionSyntax }) return false;
+                // A readonly field may still be exposed as writable ref storage inside its
+                // constructor. Subsequent writes through the alias need not mention the field.
+                if (node is RefExpressionSyntax reference &&
+                    reference.Expression.DescendantNodesAndSelf().Any(target => target is IdentifierNameSyntax && Same(model.GetSymbolInfo(target, cancellationToken).Symbol, field))) return false;
                 if (node is AssignmentExpressionSyntax assignment &&
                     assignment.Left.DescendantNodesAndSelf().Any(target => target is IdentifierNameSyntax && Same(model.GetSymbolInfo(target, cancellationToken).Symbol, field)))
                 {
