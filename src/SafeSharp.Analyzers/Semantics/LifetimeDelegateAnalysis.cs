@@ -268,7 +268,7 @@ internal static partial class LifetimeDelegateAnalysis
             foreach (var name in promised.RootRegionNames)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                Universal(name, "delegate region '" + name + "'");
+                Universal(name, (directCall ? "caller region '" : "delegate region '") + (directCall && name.StartsWith("$caller:", StringComparison.Ordinal) ? name.Substring(8) : name) + "'");
             }
             foreach (var edge in promised.Constraints)
             {
@@ -279,7 +279,7 @@ internal static partial class LifetimeDelegateAnalysis
             foreach (var name in actual.RootRegionNames)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                Inference(name, "callback region '" + name + "'");
+                Inference(name, (directCall ? "callee region '" : "callback region '") + name + "'");
             }
             foreach (var edge in actual.Constraints)
             {
@@ -292,12 +292,12 @@ internal static partial class LifetimeDelegateAnalysis
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 var parameter = actual.Method.Parameters[index];
-                var required = Inference(actual.ParameterRegions[index] ?? "$parameter:" + index, "callback input '" + parameter.Name + "'");
+                var required = Inference(actual.ParameterRegions[index] ?? "$parameter:" + index, (directCall ? "callee input '" : "callback input '") + parameter.Name + "'");
                 actualInputs[index] = required;
                 var supplied = index < boundParameters
                     ? Universal("$bound:" + index, "captured argument '" + parameter.Name + "'")
                     : Universal(promised.ParameterRegions[index - boundParameters] ?? "$parameter:" + (index - boundParameters),
-                        "delegate input '" + promised.Method.Parameters[index - boundParameters].Name + "'");
+                        (directCall ? "argument '" : "delegate input '") + promised.Method.Parameters[index - boundParameters].Name + "'");
                 AddEdge(requirements, supplied, required, site, "Input may be borrowed for a shorter region.");
                 if (parameter.RefKind is RefKind.Ref or RefKind.Out)
                     AddEdge(requirements, required, supplied, site, "Writable ref/out storage is invariant.");

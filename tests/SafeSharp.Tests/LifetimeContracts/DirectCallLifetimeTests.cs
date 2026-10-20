@@ -142,12 +142,24 @@ public sealed class DirectCallLifetimeTests
     [InlineData("values.Clear();")]
     [InlineData("_ = values.Count;")]
     [InlineData("Action action = () => values[0] = new Resource(); action();")]
+    [InlineData("Stored = values;")]
+    [InlineData("var pair = (Values: values, Number: 0); pair.Values.Clear();")]
+    [InlineData("var nested = new[] { values }; nested[0].Clear();")]
+    [InlineData("List<Resource>[] nested = [values]; nested[0].Clear();")]
+    [InlineData("var alias = values ?? new(); alias.Clear();")]
+    [InlineData("var alias = true switch { true => values, false => new List<Resource>() }; alias.Clear();")]
+    [InlineData("var (alias, number) = (values, 0); alias.Clear();")]
+    [InlineData("values?.Clear();")]
+    [InlineData("dynamic receiver = new object(); receiver.Mutate(values);")]
+    [InlineData("Func<List<Resource>> expose = () => values; Publish(expose);")]
     public async Task MutatedNestedContentsCannotReuseTheInputTypeContract(string mutation)
     {
         var diagnostics = await Analyze(Prelude + """
             class C {
                 static void Use([TypeLifetime("item", "arg0")] List<Resource> values) {}
                 static void Mutate(List<Resource> values) {}
+                static void Publish(Func<List<Resource>> source) {}
+                static List<Resource> Stored = new();
                 void M([TypeLifetime("a", "arg0")] List<Resource> values) {
             """ + mutation + " Use(values); } }");
         var diagnostic = Assert.Single(diagnostics);
@@ -215,9 +227,135 @@ public sealed class DirectCallLifetimeTests
         Assert.Contains(diagnostics, diagnostic => diagnostic.Id == "SS0050");
     }
 
+    [Fact]
+    public async Task MatchingOuterGenericTypesDoNotSynthesizeNestedCallableEvidence()
+    {
+        var diagnostics = await Analyze(Prelude + """
+            class C {
+                static void Use([TypeLifetime("item", "arg0.return")] IEnumerable<Func<object>> values) {}
+                void M([TypeLifetime("a", "arg0.return")] IEnumerable<Func<Resource>> values) { Use(values); }
+            }
+            """);
+        Assert.Equal("SS0050", Assert.Single(diagnostics).Id);
+    }
+
+    [Fact]
+    public async Task ADirectFieldWriteInvalidatesNestedContentEvidence()
+    {
+        var diagnostics = await Analyze(Prelude + """
+            sealed class Holder<T> { public T Value = default!; }
+            class C {
+                static void Use([TypeLifetime("item", "arg0")] Holder<Resource> values) {}
+                void M([TypeLifetime("a", "arg0")] Holder<Resource> values) { values.Value = new(); Use(values); }
+            }
+            """);
+        Assert.Equal("SS0050", Assert.Single(diagnostics).Id);
+    }
+
+    [Fact]
+    public async Task AUserDefinedOperatorIsAnOpaqueMutationBoundary()
+    {
+        var diagnostics = await Analyze(Prelude + """
+            sealed class Holder<T> {
+                public T Value = default!;
+                public static Holder<T> operator +(Holder<T> left, Holder<T> right) { left.Value = right.Value; return left; }
+            }
+            class C {
+                static void Use([TypeLifetime("item", "arg0")] Holder<Resource> values) {}
+                void M([TypeLifetime("a", "arg0")] Holder<Resource> values) { _ = values + values; Use(values); }
+            }
+            """);
+        Assert.Equal("SS0050", Assert.Single(diagnostics).Id);
+    }
+
+    [Fact]
+    public async Task AnOpaqueCallCanMutateBorrowedContentsOfAnUnconstrainedType()
+    {
+        var diagnostics = await Analyze(Prelude + """
+            class C {
+                [TypeOutlives("T", "a")]
+                static void Use<T>([Lifetime("a")] T value) {}
+                static void Mutate<T>(T value) {}
+                void M<T>([Lifetime("a")] T value) { Mutate(value); Use(value); }
+            }
+            """);
+        var diagnostic = Assert.Single(diagnostics);
+        Assert.Equal("SS0050", diagnostic.Id);
+        Assert.Contains("invalidated", diagnostic.GetMessage(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ValueTypeArgumentsCanContainBorrowedReferences()
+    {
+        var diagnostics = await Analyze(Prelude + """
+            struct Holder<T> { public T Value; }
+            class C {
+                static void Use([TypeLifetime("item", "arg0")] Holder<Resource> values) {}
+                static void Mutate(Holder<Resource> values) {}
+                void M([TypeLifetime("a", "arg0")] Holder<Resource> values) { Mutate(values); Use(values); }
+            }
+            """);
+        Assert.Equal("SS0050", Assert.Single(diagnostics).Id);
+    }
+
+    [Fact]
+    public async Task ManyReadOnlyCallsReuseTheSameBoundedInputEvidence()
+    {
+        var calls = string.Join(" ", Enumerable.Repeat("Use(values);", 256));
+        var source = Prelude + """
+            class C {
+                static void Use([Borrowed, DoesNotEscape, TypeLifetime("item", "arg0")] List<Resource> values) {}
+                void M([TypeLifetime("a", "arg0")] List<Resource> values) {
+            """ + calls + " } }";
+        Assert.Empty(await Analyze(source));
+    }
+
+    [Fact]
+    public async Task ALocalFunctionUsesItsOwnInputContract()
+    {
+        Assert.Empty(await Analyze(Prelude + """
+            class C {
+                static void Use([TypeLifetime("item", "arg0")] List<Resource> values) {}
+                void M() {
+                    void Local([TypeLifetime("a", "arg0")] List<Resource> values) { Use(values); }
+                }
+            }
+            """));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task EmittedContractsUseTheSameCallerBoundObligations(bool provideBound)
+    {
+        var library = AnalyzerTestHost.CreateCompilation("""
+            using SafeSharp;
+            public static class ExternalApi {
+                [TypeOutlives("T", "scope")]
+                public static void Use<T>([Lifetime("value")] T value, [Lifetime("scope")] ref object owner) {}
+            }
+            """).WithAssemblyName("ExternalCallContracts");
+        using var image = new MemoryStream();
+        var emitted = library.Emit(image);
+        Assert.True(emitted.Success, string.Join(Environment.NewLine, emitted.Diagnostics));
+        var attribute = provideBound ? "[TypeOutlives(\"T\", \"b\")]" : string.Empty;
+        var consumer = "using SafeSharp; class C { " + attribute + """
+            void M<T>([Lifetime("a")] T value, [Lifetime("b")] ref object owner) { ExternalApi.Use(value, ref owner); }
+            }
+            """;
+        var compilation = AnalyzerTestHost.CreateCompilation(consumer).AddReferences(MetadataReference.CreateFromImage(image.ToArray()));
+        var diagnostics = await Analyze(compilation);
+        if (provideBound) Assert.Empty(diagnostics);
+        else Assert.Equal("SS0050", Assert.Single(diagnostics).Id);
+    }
+
     private static async Task<ImmutableArray<Diagnostic>> Analyze(string source, IReadOnlyDictionary<string, string>? settings = null)
     {
-        var compilation = AnalyzerTestHost.CreateCompilation(source);
+        return await Analyze(AnalyzerTestHost.CreateCompilation(source), settings);
+    }
+
+    private static async Task<ImmutableArray<Diagnostic>> Analyze(CSharpCompilation compilation, IReadOnlyDictionary<string, string>? settings = null)
+    {
         var errors = compilation.GetDiagnostics().Where(diagnostic => diagnostic.Severity == DiagnosticSeverity.Error).ToArray();
         Assert.True(errors.Length == 0, string.Join(Environment.NewLine, errors.Select(diagnostic => diagnostic.ToString())));
         var analyzerOptions = new AnalyzerOptions(ImmutableArray<AdditionalText>.Empty, new ConfigProvider(settings));

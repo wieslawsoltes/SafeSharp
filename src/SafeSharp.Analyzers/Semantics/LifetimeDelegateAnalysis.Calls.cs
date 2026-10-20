@@ -142,7 +142,7 @@ internal static partial class LifetimeDelegateAnalysis
         {
             supplied = null;
             receiver = null;
-            effectSummary = effects.Get(invocation, caller.Method, context.Compilation, options.MaxSteps, context.CancellationToken);
+            effectSummary = effects.Get(invocation, caller.Method, options.MaxSteps, context.CancellationToken);
             steps += effectSummary.Steps;
             Step();
             foreach (var region in caller.RootRegionNames) { Step(); rootRegions.Add(Root(region)); }
@@ -179,11 +179,12 @@ internal static partial class LifetimeDelegateAnalysis
                 regions.Add(region);
                 argumentDescriptions.Add(callee.Parameters[ordinal].Name + " = " + (source?.Description ?? "unknown evaluated value"));
                 var needed = required.TypePositions.Where(position => position.Parameter == ordinal).ToArray();
+                if (source is { Parameter: { } suppliedParameter } && effectSummary.InvalidatesContents(suppliedParameter, invocation) &&
+                    (needed.Length != 0 || required.TypeBounds.Any(bound => !bound.IsImplied && bound.Scope.Length == 0)))
+                    return "argument '" + callee.Parameters[ordinal].Name + "' has had its borrowed-content evidence invalidated by a write, reference exposure, or unmodeled call";
                 if (needed.Length == 0) continue;
                 if (source is not { Parameter: { } parameter })
                     return "argument '" + callee.Parameters[ordinal].Name + "' has no stable declared TypeLifetime evidence";
-                if (effectSummary.InvalidatesContents(parameter, invocation))
-                    return "argument '" + callee.Parameters[ordinal].Name + "' has had its borrowed-content evidence invalidated by a write, reference exposure, or unmodeled call";
                 if (!SameShape(parameter.Type, callee.Parameters[ordinal].Type))
                     return "argument '" + callee.Parameters[ordinal].Name + "' changes its nominal type shape; borrowed-content projection is not established";
                 var sourcePositions = caller.TypePositions.Where(position => position.Parameter == parameter.Ordinal).ToDictionary(position => position.Path, StringComparer.Ordinal);

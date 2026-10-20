@@ -14,7 +14,7 @@ internal static partial class LifetimeDelegateAnalysis
     {
         private readonly ConcurrentDictionary<IMethodSymbol, Lazy<CallEffectSummary>> cache = new(SymbolEqualityComparer.Default);
 
-        internal CallEffectSummary Get(IInvocationOperation invocation, IMethodSymbol method, Compilation compilation, int limit, CancellationToken cancellationToken)
+        internal CallEffectSummary Get(IInvocationOperation invocation, IMethodSymbol method, int limit, CancellationToken cancellationToken)
         {
             cancellationToken.ThrowIfCancellationRequested();
             return cache.GetOrAdd(method, _ => new Lazy<CallEffectSummary>(() =>
@@ -76,6 +76,7 @@ internal static partial class LifetimeDelegateAnalysis
         private readonly int limit;
         private readonly CancellationToken cancellationToken;
         private readonly Dictionary<ISymbol, ISymbol> parents = new(SymbolEqualityComparer.Default);
+        private readonly Dictionary<ISymbol, int> ranks = new(SymbolEqualityComparer.Default);
         private readonly Dictionary<ISymbol, List<CallEffect>> slots = new(SymbolEqualityComparer.Default);
         private readonly Dictionary<ISymbol, List<CallEffect>> contents = new(SymbolEqualityComparer.Default);
         private bool nonlocalBranches;
@@ -99,14 +100,14 @@ internal static partial class LifetimeDelegateAnalysis
                     case IAssignmentOperation assignment:
                         if (assignment.Target is ILocalReferenceOperation { Local.RefKind: not RefKind.None }) Content(assignment.Target, cause);
                         else Storage(assignment.Target, cause);
-                        if (assignment is ISimpleAssignmentOperation simple)
-                        {
-                            Alias(simple.Target, simple.Value);
-                            if (simple.IsRef) Content(simple.Value, cause);
-                        }
+                        Alias(assignment.Target, assignment.Value);
+                        if (assignment is ISimpleAssignmentOperation { IsRef: true } || !LocalStorage(assignment.Target)) Content(assignment.Value, cause);
+                        if (assignment is ICompoundAssignmentOperation { OperatorMethod: not null })
+                        { Content(assignment.Target, cause); Content(assignment.Value, cause); }
                         break;
                     case IIncrementOrDecrementOperation increment:
                         Storage(increment.Target, cause);
+                        if (increment.OperatorMethod is not null) Content(increment.Target, cause);
                         break;
                     case IVariableDeclaratorOperation { Initializer.Value: { } value } declaration:
                         foreach (var symbol in Roots(value)) Union(declaration.Symbol, symbol);
@@ -125,18 +126,34 @@ internal static partial class LifetimeDelegateAnalysis
                         foreach (var argument in call.Arguments)
                         {
                             Step();
-                            if (argument.Value.Type?.IsReferenceType == true && !ReadOnlyBoundary(argument.Parameter)) Content(argument.Value, cause);
+                            // An unconstrained T or a value type can contain borrowed references.
+                            // CLR reference-type classification is not a proof of borrowed contents.
+                            if (!ReadOnlyBoundary(argument.Parameter)) Content(argument.Value, cause);
                         }
                         break;
                     case IObjectCreationOperation creation:
                         foreach (var argument in creation.Arguments)
                         {
                             Step();
-                            if (argument.Value.Type?.IsReferenceType == true && !ReadOnlyBoundary(argument.Parameter)) Content(argument.Value, cause);
+                            if (!ReadOnlyBoundary(argument.Parameter)) Content(argument.Value, cause);
                         }
+                        break;
+                    case IReturnOperation { ReturnedValue: { } returned }:
+                        Content(returned, cause);
                         break;
                     case IConversionOperation { Conversion.IsUserDefined: true } conversion:
                         Content(conversion.Operand, cause);
+                        break;
+                    case IBinaryOperation { OperatorMethod: not null } binary:
+                        Content(binary.LeftOperand, cause);
+                        Content(binary.RightOperand, cause);
+                        break;
+                    case IUnaryOperation { OperatorMethod: not null } unary:
+                        Content(unary.Operand, cause);
+                        break;
+                    case IDynamicInvocationOperation dynamicCall:
+                        Content(dynamicCall.Operation, cause);
+                        foreach (var argument in dynamicCall.Arguments) Content(argument, cause);
                         break;
                     case IPropertyReferenceOperation property:
                         // A property is executable code. No arbitrary accessor is assumed pure.
@@ -159,11 +176,13 @@ internal static partial class LifetimeDelegateAnalysis
                 if (!grouped.TryGetValue(representative, out var list)) grouped.Add(representative, list = new List<CallEffect>());
                 list.AddRange(pair.Value);
             }
+            var frozen = new Dictionary<ISymbol, ImmutableArray<CallEffect>>(SymbolEqualityComparer.Default);
+            foreach (var pair in grouped) { Step(); frozen.Add(pair.Key, Ordered(pair.Value)); }
             var expanded = ImmutableDictionary.CreateBuilder<ISymbol, ImmutableArray<CallEffect>>(SymbolEqualityComparer.Default);
             foreach (var symbol in parents.Keys.ToArray())
             {
                 Step();
-                if (grouped.TryGetValue(Find(symbol), out var list)) expanded[symbol] = Ordered(list);
+                if (frozen.TryGetValue(Find(symbol), out var list)) expanded[symbol] = list;
             }
             return new CallEffectSummary(slots.ToImmutableDictionary(pair => pair.Key, pair => Ordered(pair.Value), SymbolEqualityComparer.Default),
                 expanded.ToImmutable(), nonlocalBranches, steps);
@@ -176,19 +195,47 @@ internal static partial class LifetimeDelegateAnalysis
         private static bool ReadOnlyBoundary(IParameterSymbol? parameter) => parameter is not null &&
             SymbolFacts.HasAttribute(parameter, "Borrowed") && SymbolFacts.HasAttribute(parameter, "DoesNotEscape");
 
+        private bool LocalStorage(IOperation target)
+        {
+            var pending = new Stack<IOperation>();
+            pending.Push(target);
+            while (pending.Count != 0)
+            {
+                Step();
+                switch (pending.Pop())
+                {
+                    case ILocalReferenceOperation or IParameterReferenceOperation: break;
+                    case IParenthesizedOperation parentheses: pending.Push(parentheses.Operand); break;
+                    case IConversionOperation conversion: pending.Push(conversion.Operand); break;
+                    case IDeclarationExpressionOperation declaration: pending.Push(declaration.Expression); break;
+                    case ITupleOperation tuple:
+                        foreach (var element in tuple.Elements) pending.Push(element);
+                        break;
+                    default: return false;
+                }
+            }
+            return true;
+        }
+
         private void Storage(IOperation target, CallEffect cause)
         {
-            Step();
-            switch (target)
+            var pending = new Stack<IOperation>();
+            pending.Push(target);
+            while (pending.Count != 0)
             {
-                case IParameterReferenceOperation parameter: Add(slots, parameter.Parameter, cause); break;
-                case ILocalReferenceOperation local: Add(slots, local.Local, cause); break;
-                case IParenthesizedOperation parentheses: Storage(parentheses.Operand, cause); break;
-                case IConversionOperation conversion: Storage(conversion.Operand, cause); break;
-                case ITupleOperation tuple:
-                    foreach (var element in tuple.Elements) Storage(element, cause);
-                    break;
-                default: Content(target, cause); break;
+                Step();
+                switch (pending.Pop())
+                {
+                    case IParameterReferenceOperation parameter: Add(slots, parameter.Parameter, cause); break;
+                    case ILocalReferenceOperation local: Add(slots, local.Local, cause); break;
+                    case IParenthesizedOperation parentheses: pending.Push(parentheses.Operand); break;
+                    case IConversionOperation conversion: pending.Push(conversion.Operand); break;
+                    case IDeclarationExpressionOperation declaration: pending.Push(declaration.Expression); break;
+                    case ITupleOperation tuple:
+                        foreach (var element in tuple.Elements) pending.Push(element);
+                        break;
+                    case { } storage: Content(storage, cause); break;
+                }
             }
         }
 
@@ -217,9 +264,38 @@ internal static partial class LifetimeDelegateAnalysis
                     case IParameterReferenceOperation parameter: yield return parameter.Parameter; break;
                     case IParenthesizedOperation parentheses: pending.Push(parentheses.Operand); break;
                     case IConversionOperation conversion: pending.Push(conversion.Operand); break;
+                    case IDeclarationExpressionOperation declaration: pending.Push(declaration.Expression); break;
                     case IArrayElementReferenceOperation element: pending.Push(element.ArrayReference); break;
                     case IFieldReferenceOperation { Instance: { } owner }: pending.Push(owner); break;
                     case IPropertyReferenceOperation { Instance: { } owner }: pending.Push(owner); break;
+                    case ITupleOperation tuple:
+                        foreach (var element in tuple.Elements) pending.Push(element);
+                        break;
+                    case IArrayCreationOperation { Initializer: { } initializer }: pending.Push(initializer); break;
+                    case IArrayInitializerOperation initializer:
+                        foreach (var element in initializer.ElementValues) pending.Push(element);
+                        break;
+                    case ICollectionExpressionOperation collection:
+                        foreach (var element in collection.Elements) pending.Push(element);
+                        break;
+                    case ISpreadOperation spread: pending.Push(spread.Operand); break;
+                    case ICoalesceOperation coalesce:
+                        pending.Push(coalesce.Value);
+                        pending.Push(coalesce.WhenNull);
+                        break;
+                    case ISwitchExpressionOperation expression:
+                        foreach (var arm in expression.Arms) pending.Push(arm.Value);
+                        break;
+                    case IConditionalAccessOperation access: pending.Push(access.Operation); break;
+                    case IConditionalAccessInstanceOperation instance:
+                        for (var parent = instance.Parent; parent is not null; parent = parent.Parent)
+                        {
+                            Step();
+                            if (parent is not IConditionalAccessOperation conditionalAccess) continue;
+                            pending.Push(conditionalAccess.Operation);
+                            break;
+                        }
+                        break;
                     case IConditionalOperation conditional:
                         pending.Push(conditional.WhenTrue);
                         if (conditional.WhenFalse is { } alternative) pending.Push(alternative);
@@ -231,7 +307,7 @@ internal static partial class LifetimeDelegateAnalysis
         private ISymbol Find(ISymbol symbol)
         {
             Step();
-            if (!parents.TryGetValue(symbol, out var parent)) { parents.Add(symbol, symbol); return symbol; }
+            if (!parents.TryGetValue(symbol, out var parent)) { parents.Add(symbol, symbol); ranks.Add(symbol, 0); return symbol; }
             var representative = parent;
             while (!SymbolEqualityComparer.Default.Equals(parents[representative], representative)) { Step(); representative = parents[representative]; }
             parents[symbol] = representative;
@@ -242,7 +318,13 @@ internal static partial class LifetimeDelegateAnalysis
         {
             var a = Find(first);
             var b = Find(second);
-            if (!SymbolEqualityComparer.Default.Equals(a, b)) parents[b] = a;
+            if (SymbolEqualityComparer.Default.Equals(a, b)) return;
+            if (ranks[a] < ranks[b]) parents[a] = b;
+            else
+            {
+                parents[b] = a;
+                if (ranks[a] == ranks[b]) ranks[a]++;
+            }
         }
 
         private static void Add(Dictionary<ISymbol, List<CallEffect>> map, ISymbol symbol, CallEffect cause)

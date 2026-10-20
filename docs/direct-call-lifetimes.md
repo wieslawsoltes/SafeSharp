@@ -57,11 +57,15 @@ Extra caller type positions do not create new callee demands. Missing evidence f
 
 A compilation-local immutable effect summary is built once per enclosing callable. It records local/parameter replacement, reference exposure, writes into member or element storage, and calls/accessors whose mutation effects are not represented. Conservative alias components connect reference-bearing local aliases to their source inputs, so `alias[0] = replacement` invalidates borrowed-content evidence for the original container as well.
 
+Tuple and array-initializer aliases also connect their contained values. Storing a borrowed value into nonlocal storage or returning it from a deferred callback invalidates the available content evidence because another consumer may receive the alias. Opaque calls can mutate references carried by an unconstrained generic argument or a value type, so the checker does not equate CLR value-type classification with absence of borrowed contents.
+
 The query distinguishes the current invocation's effects from its preconditions. A nested invocation during argument evaluation is an earlier effect and can invalidate evidence before the outer call begins. Ordinary later statements do not invalidate an earlier call. An effect later in an enclosing loop may reach the next iteration, and deferred callback bodies or nonlocal branches retain conservative possibilities. Exposing an array element by reference invalidates the container's content evidence even if the root array variable was never reassigned.
 
 A parameter explicitly marked `[Borrowed, DoesNotEscape]` supplies the modeled read-only, nonretaining boundary for preserving its argument's nested evidence across a call. `DoesNotEscape` alone does not promise immutability. Arbitrary property accessors and instance methods are not assumed pure. This is deliberately conservative: a method that happens not to mutate its arguments but has no relevant contract can invalidate the available proof.
 
 Summaries cache the original work cost and preserve cancellation and configured budget behavior. Immediate effects are sorted by source position, while deferred effects are queried first; a call does not repeatedly scan all irrelevant later effects in its method. No symbols or operations are retained outside the current compilation.
+
+The regression suite includes a callable with 256 repeated read-only invocations, emitted metadata contracts, local function contracts, recursive generic substitution, direct member and array writes, indirect aliases, unknown calls, loop effects, and exact region graphs in all five report formats.
 
 ## Diagnostic evidence and limits
 
