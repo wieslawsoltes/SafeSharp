@@ -6,7 +6,10 @@ updates:
       interval: weekly
     groups:
       roslyn:
-        patterns: ['Microsoft.CodeAnalysis*']
+        # Workspaces and MEF must move together to avoid package downgrades.
+        # The package-host gate preserves the shipping analyzer's older API
+        # floor while the tests and standalone tool can use a newer host.
+        patterns: ['Microsoft.CodeAnalysis*', 'System.Composition*']
   - package-ecosystem: github-actions
     directory: /
     schedule:

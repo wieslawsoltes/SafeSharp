@@ -1,6 +1,8 @@
 using System.Collections.Immutable;
 using System.Composition.Hosting;
 using System.Reflection;
+using System.Reflection.Metadata;
+using System.Reflection.PortableExecutable;
 using System.Runtime.Loader;
 using System.Text.Json;
 using Microsoft.CodeAnalysis;
@@ -19,6 +21,17 @@ if (args.Length != 2)
 
 Require(typeof(Compilation).Assembly.GetName().Version is { Major: 4, Minor: 14 },
     "The package compatibility host must use Roslyn 4.14.");
+
+// The fixture itself runs on .NET 10, which can unify older assembly references
+// to newer platform assemblies. Inspect the actual shipped binaries before
+// loading them so that unification cannot hide an accidental host API increase.
+// Core is read beside the analyzer, independently of the Core asset NuGet chose
+// for this .NET 10 fixture.
+var analyzerPath = Path.GetFullPath(args[0]);
+var codeFixPath = Path.GetFullPath(args[1]);
+AssertCompilerHostReferences(analyzerPath);
+AssertCompilerHostReferences(Path.Combine(Path.GetDirectoryName(analyzerPath)!, "SafeSharp.Core.dll"));
+AssertCompilerHostReferences(codeFixPath);
 
 // These references are resolved by NuGet from the isolated local package feed.
 // An actual ownership result exercises Core's immutable-collection dependency and
@@ -56,7 +69,7 @@ Require(higherRanked.IsComplete && !higherRanked.IsCompatible && !higherRanked.F
     "Packaged higher-ranked solver lost the nested placeholder leak or its original visibility evidence.");
 
 var loader = new PackageAssemblyLoader();
-var reference = new AnalyzerFileReference(Path.GetFullPath(args[0]), loader);
+var reference = new AnalyzerFileReference(analyzerPath, loader);
 var loadFailures = new List<string>();
 reference.AnalyzerLoadFailed += (_, failure) => loadFailures.Add(failure.Message);
 var analyzers = reference.GetAnalyzers(LanguageNames.CSharp);
@@ -66,7 +79,7 @@ var declaredRules = analyzers.SelectMany(analyzer => analyzer.SupportedDiagnosti
 Require(new[] { "SS0001", "SS0017", "SS0021", "SS0024", "SS0041", "SS0044", "SS0045", "SS0047", "SS0048", "SS0049", "SS0050" }.All(declaredRules.Contains),
     "Packaged analyzer discovery lost an analyzer family.");
 
-var codeFixAssembly = loader.LoadFromPath(Path.GetFullPath(args[1]));
+var codeFixAssembly = loader.LoadFromPath(codeFixPath);
 using var composition = new ContainerConfiguration().WithAssembly(codeFixAssembly).CreateContainer();
 var provider = composition.GetExports<CodeFixProvider>().Single(candidate => candidate.FixableDiagnosticIds.Contains("SS0024"));
 var export = provider.GetType().GetCustomAttribute<ExportCodeFixProviderAttribute>();
@@ -299,7 +312,38 @@ Require(guardHtml.Contains("class=\"synchronization-graph\"", StringComparison.O
     !guardHtml.Contains("Synchronization graph omitted", StringComparison.Ordinal),
     "Packaged Reporting lost the computed Monitor guard requirement or invented an observed capability.");
 
-Console.WriteLine("Package host: Roslyn 4.14 discovered every analyzer family; checked direct-call and delegate lifetime obligations, nested lifetime leaks, canonical array references, stored/repeated async results, ValueTask consumption, Monitor and asynchronous semaphore guards; MEF fixed SS0024 in a live compilation; packaged Core ownership/universal/higher-ranked solvers and Reporting executed.");
+Console.WriteLine("Package host: shipped analyzer, code-fix and bundled Core references preserve the .NET Standard 2.0/Roslyn 4.14 host contract; Roslyn 4.14 discovered every analyzer family; checked direct-call and delegate lifetime obligations, nested lifetime leaks, canonical array references, stored/repeated async results, ValueTask consumption, Monitor and asynchronous semaphore guards; MEF fixed SS0024 in a live compilation; packaged Core ownership/universal/higher-ranked solvers and Reporting executed.");
+
+static void AssertCompilerHostReferences(string path)
+{
+    using var stream = File.OpenRead(path);
+    using var image = new PEReader(stream);
+    var metadata = image.GetMetadataReader();
+    Require(metadata.IsAssembly, "Expected a packaged managed assembly: " + path);
+    var references = metadata.AssemblyReferences
+        .Select(handle => metadata.GetAssemblyReference(handle))
+        .Select(reference => (Name: metadata.GetString(reference.Name), reference.Version))
+        .ToArray();
+    Require(references.Any(reference => reference.Name == "netstandard" &&
+        reference.Version <= new Version(2, 0, 0, 0)),
+        Path.GetFileName(path) + " must retain the .NET Standard 2.0 compiler-host target.");
+
+    foreach (var reference in references)
+    {
+        // These assemblies are supplied by Roslyn/the IDE, not bundled with our
+        // analyzers. Keep their compile-time API requirements within the 4.14
+        // host family even when the tests or standalone tool use newer versions.
+        Version? ceiling = reference.Name.StartsWith("Microsoft.CodeAnalysis", StringComparison.Ordinal)
+            ? new Version(4, 14, 0, 0)
+            : reference.Name.StartsWith("System.Composition", StringComparison.Ordinal) ||
+              reference.Name is "System.Collections.Immutable" or "System.Reflection.Metadata"
+                ? new Version(9, 0, 0, 0)
+                : null;
+        Require(ceiling is null || reference.Version <= ceiling,
+            Path.GetFileName(path) + " references " + reference.Name + " " + reference.Version +
+            ", above the supported compiler-host version " + ceiling + ".");
+    }
+}
 
 static Diagnostic[] MethodDiagnostics(Compilation compilation, ImmutableArray<Diagnostic> diagnostics, string typeName, string methodName)
 {

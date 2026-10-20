@@ -105,3 +105,5 @@ The workflow validates the version, restores, builds, tests, packs all six packa
 References: [NuGet trusted publishing](https://learn.microsoft.com/en-us/nuget/nuget-org/trusted-publishing), [analyzer package layout](https://learn.microsoft.com/en-us/nuget/guides/analyzers-conventions), [Roslyn analyzer configuration](https://learn.microsoft.com/en-us/dotnet/fundamentals/code-analysis/configuration-options).
 
 The benchmark console project is excluded from all NuGet packages. CI runs the `all` suite with one informational timing sample: independent liveness equivalence checks and expected-result checks for the current higher-ranked lifetime, reference-storage and composed ValueTask scenarios. The newer boundary scenarios have no historical implementation baseline. Correctness and package compatibility are gates; wall-clock speed ratios are recorded measurements, not pass/fail assertions. See [performance](performance.md).
+
+For package-family alignment and compiler-host compatibility checks during dependency updates, see [dependency maintenance](dependency-maintenance.md).
