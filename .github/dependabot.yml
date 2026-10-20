@@ -1,29 +1,10 @@
 version: 2
 updates:
-  # Explicit project directories keep modern hosts separate from the shipping
-  # compiler API floor. Add new project directories to the appropriate entry.
-  # Shared Directory.Build.props dependencies are discovered through imports.
+  # NuGet discovery follows ProjectReference edges into other directories.
+  # Apply the same generation policy to the whole graph, including shipping
+  # components reached through modern hosts. Package checks remain authoritative.
   - package-ecosystem: nuget
-    directories:
-      - /src/SafeSharp.Tool
-      - /src/SafeSharp.Contracts
-      - /src/SafeSharp.Reporting
-      - /tests/SafeSharp.Tests
-      - /benchmarks/SafeSharp.Benchmarks
-      - /samples/SafeSharp.Sample
-    schedule:
-      interval: weekly
-    groups:
-      roslyn:
-        # Workspaces and MEF must move together to avoid package downgrades.
-        patterns: ['Microsoft.CodeAnalysis*', 'System.Composition*']
-  # These compile references define the shipped Roslyn 4.14/MEF 9 API floor.
-  # Permit servicing; changing the host generation requires an explicit review.
-  - package-ecosystem: nuget
-    directories:
-      - /src/SafeSharp.Analyzers
-      - /src/SafeSharp.CodeFixes
-      - /eng/package-host
+    directory: /
     schedule:
       interval: weekly
     ignore:
@@ -31,20 +12,15 @@ updates:
         update-types: ['version-update:semver-major', 'version-update:semver-minor']
       - dependency-name: System.Composition*
         update-types: ['version-update:semver-major', 'version-update:semver-minor']
-    groups:
-      compiler-host-servicing:
-        patterns: ['Microsoft.CodeAnalysis*', 'System.Composition*']
-  # Core shares one package ID across its .NET Standard 2.0 and .NET 10 assets.
-  # Keep generation changes deliberate; the package metadata gate checks the
-  # actual netstandard Core DLL bundled with the analyzer.
-  - package-ecosystem: nuget
-    directory: /src/SafeSharp.Core
-    schedule:
-      interval: weekly
-    ignore:
       - dependency-name: System.Collections.Immutable
         update-types: ['version-update:semver-major', 'version-update:semver-minor']
+    groups:
+      roslyn:
+        # Compatible servicing remains automatic. Generation changes, including
+        # those in tests and the tool, need a reviewed compatibility decision.
+        patterns: ['Microsoft.CodeAnalysis*', 'System.Composition*']
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+
