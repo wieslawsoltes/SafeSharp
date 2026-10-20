@@ -75,12 +75,15 @@ public sealed class HtmlReportWriter : IAnalysisReportWriter
             {
                 var witness = DependencyWitness.FromDiagnostic(diagnostic);
                 var regions = RegionWitness.FromDiagnostic(diagnostic);
+                var synchronization = SynchronizationWitness.FromDiagnostic(diagnostic);
                 writer.Write("<details class=\"evidence\"><summary>");
-                writer.Write(regions is not null ? "Lifetime region graph and diagnostic properties" :
+                writer.Write(synchronization is not null ? "Synchronization evidence and diagnostic properties" :
+                    regions is not null ? "Lifetime region graph and diagnostic properties" :
                     witness is null ? "Diagnostic properties" : "Service dependency witness and diagnostic properties");
                 writer.Write("</summary>");
                 if (witness is not null) WriteDependencyWitness(writer, witness);
                 if (regions is not null) HtmlRegionRenderer.Write(writer, regions, diagnosticIndex, cancellationToken);
+                if (synchronization is not null) SynchronizationGraphRenderer.WriteHtml(writer, synchronization, diagnosticIndex, cancellationToken);
                 TableStart(writer, "Compiler diagnostic metadata", "Property", "Value");
                 foreach (var property in diagnostic.Properties.OrderBy(property => property.Key, StringComparer.Ordinal))
                     Row(writer, property.Key, property.Value ?? "(null)");

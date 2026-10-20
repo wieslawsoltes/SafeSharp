@@ -5,6 +5,10 @@ namespace SafeSharp.Analyzers.Semantics;
 /// <summary>Explicit concurrency contracts and bounded structural contract analysis.</summary>
 public static class ConcurrencyDiagnostics
 {
+    public static readonly DiagnosticDescriptor MissingSynchronizationGuard = Create("SS0049", "Synchronization guard is not established",
+        "Access to '{0}' requires guard '{1}': {2}",
+        "Guarded storage and declared lock preconditions require a matching capability on every incoming path. Monitor, System.Threading.Lock and reader/writer guards have distinct protocols.");
+
     public static readonly DiagnosticDescriptor InvalidConcurrencyContract = Create("SS0044", "Concurrency contract is not structurally satisfied",
         "Type '{0}' does not satisfy its {1} contract: {2}",
         "Send permits declared transfer; Sync permits declared sharing. Composition and generic requirements must hold for every instance field. These contracts do not prove arbitrary synchronization.");

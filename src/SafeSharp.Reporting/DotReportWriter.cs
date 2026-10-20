@@ -100,6 +100,13 @@ public sealed class DotReportWriter : IAnalysisReportWriter
             writer.Write("    "); writer.Write(prefix); writer.Write("_metadata [shape=note, label=\"");
             writer.Write(ReportText.Dot(witness.MetadataLabel(diagnostic))); writer.Write("\"];\n  }\n");
         }
+        for (var diagnosticIndex = 0; diagnosticIndex < report.Diagnostics.Length; diagnosticIndex++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var diagnostic = report.Diagnostics[diagnosticIndex];
+            if (SynchronizationWitness.FromDiagnostic(diagnostic) is { } synchronization)
+                SynchronizationGraphRenderer.WriteDot(writer, synchronization, diagnostic, diagnosticIndex, cancellationToken);
+        }
         writer.Write("}\n");
     }
 }

@@ -91,5 +91,13 @@ public sealed class MermaidReportWriter : IAnalysisReportWriter
             }
             writer.Write("  end\n");
         }
+        for (var diagnosticIndex = 0; diagnosticIndex < report.Diagnostics.Length; diagnosticIndex++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var diagnostic = report.Diagnostics[diagnosticIndex];
+            if (SynchronizationWitness.FromDiagnostic(diagnostic) is { } synchronization)
+                SynchronizationGraphRenderer.WriteMermaid(writer, synchronization, diagnostic, diagnosticIndex, cancellationToken);
+        }
+
     }
 }
