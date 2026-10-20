@@ -214,4 +214,14 @@ public sealed class AggregateReferenceStorageOwnershipTests
             " values[0].Dispose(); } }");
         Assert.Contains(diagnostics, diagnostic => diagnostic.Id == "SS0003");
     }
+
+    [Theory]
+    [InlineData("Borrowed", true)]
+    [InlineData("BorrowedMut", false)]
+    public async Task UntrackedScalarReferencesKeepTheExistingReceiverPermission(string contract, bool conflicts)
+    {
+        var diagnostics = await AnalyzerTestHost.GetDiagnosticsAsync(Prelude + "void M([" + contract +
+            "] int[] values) { ref int element = ref values[0]; element++; } }");
+        Assert.Equal(conflicts, diagnostics.Any(diagnostic => diagnostic.Id == "SS0007"));
+    }
 }
