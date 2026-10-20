@@ -4,7 +4,7 @@ using SafeSharp.Analyzers.Analysis;
 
 namespace SafeSharp.Analyzers.Semantics;
 
-internal enum GuardLockKind { Monitor, ThreadingLock, Read, UpgradeableRead, Write }
+internal enum GuardLockKind { Monitor, ThreadingLock, Read, UpgradeableRead, Write, SemaphoreSlim }
 
 internal readonly struct GuardKey : IEquatable<GuardKey>
 {
@@ -27,8 +27,8 @@ internal readonly struct GuardHold : IEquatable<GuardHold>
     internal Location? Acquisition { get; }
     internal GuardHold Acquire(Location site) => new(Math.Min(Saturation, Minimum + 1),
         Maximum >= Saturation ? int.MaxValue : Maximum + 1, site);
-    internal GuardHold Release() => new(Math.Max(0, Minimum - 1),
-        Maximum == int.MaxValue ? int.MaxValue : Math.Max(0, Maximum - 1), Acquisition);
+    internal GuardHold Release(int count = 1) => new(Math.Max(0, Minimum - count),
+        Maximum == int.MaxValue ? int.MaxValue : Math.Max(0, Maximum - count), Acquisition);
     internal GuardHold Join(GuardHold other) => new(Math.Min(Minimum, other.Minimum),
         Math.Max(Maximum, other.Maximum), Acquisition ?? other.Acquisition);
     public bool Equals(GuardHold other) => Minimum == other.Minimum && Maximum == other.Maximum;
@@ -68,15 +68,16 @@ internal sealed class GuardValue
 {
     internal static readonly GuardValue Unknown = new(0);
     internal GuardValue(int identity, ImmutableArray<GuardObligation> obligations = default, bool? boolean = null,
-        GuardCondition? condition = null, GuardKey? scope = null)
+        GuardCondition? condition = null, GuardKey? scope = null, int pendingWait = 0)
     { Identity = identity; Obligations = obligations.IsDefault ? ImmutableArray<GuardObligation>.Empty : obligations;
-        Boolean = boolean; Condition = condition; Scope = scope; }
+        Boolean = boolean; Condition = condition; Scope = scope; PendingWait = pendingWait; }
     internal int Identity { get; }
     internal ImmutableArray<GuardObligation> Obligations { get; }
     internal bool? Boolean { get; }
     internal GuardCondition? Condition { get; }
     internal GuardKey? Scope { get; }
-    internal GuardValue WithoutCondition() => Condition is null ? this : new(Identity, Obligations, Boolean, scope: Scope);
+    internal int PendingWait { get; }
+    internal GuardValue WithoutCondition() => Condition is null ? this : new(Identity, Obligations, Boolean, scope: Scope, pendingWait: PendingWait);
     internal GuardValue Join(GuardValue other)
     {
         var obligations = Obligations;
@@ -85,9 +86,10 @@ internal sealed class GuardValue
         return new GuardValue(Identity == other.Identity ? Identity : 0, obligations,
             Boolean == other.Boolean ? Boolean : null,
             Condition is not null && other.Condition is not null && Condition.Same(other.Condition) ? Condition : null,
-            Scope.HasValue && other.Scope.HasValue && Scope.Value.Equals(other.Scope.Value) ? Scope : null);
+            Scope.HasValue && other.Scope.HasValue && Scope.Value.Equals(other.Scope.Value) ? Scope : null,
+            PendingWait == other.PendingWait ? PendingWait : 0);
     }
-    internal bool Same(GuardValue other) => Identity == other.Identity && Boolean == other.Boolean &&
+    internal bool Same(GuardValue other) => Identity == other.Identity && Boolean == other.Boolean && PendingWait == other.PendingWait &&
         Nullable.Equals(Scope, other.Scope) && (Condition is null ? other.Condition is null :
             other.Condition is not null && Condition.Same(other.Condition)) && Obligations.Length == other.Obligations.Length &&
         Obligations.All(other.Obligations.Contains);
@@ -134,6 +136,8 @@ internal sealed class SynchronizationState
     internal Dictionary<int, LexicalGuard> LexicalScopes { get; } = new();
     internal Dictionary<GuardKey, GuardHold> Held { get; } = new();
     internal Dictionary<GuardKey, GuardHold> Expected { get; } = new();
+    internal HashSet<int> SemaphoreMutexes { get; } = new();
+    internal Dictionary<int, PendingSemaphoreWait> PendingWaits { get; } = new();
     internal GuardValue Returned { get; set; } = GuardValue.Unknown;
     internal SynchronizationState Clone()
     {
@@ -144,6 +148,8 @@ internal sealed class SynchronizationState
         foreach (var pair in LexicalScopes) result.LexicalScopes.Add(pair.Key, pair.Value);
         foreach (var pair in Held) result.Held.Add(pair.Key, pair.Value);
         foreach (var pair in Expected) result.Expected.Add(pair.Key, pair.Value);
+        result.SemaphoreMutexes.UnionWith(SemaphoreMutexes);
+        foreach (var pair in PendingWaits) result.PendingWaits.Add(pair.Key, pair.Value);
         return result;
     }
     internal GuardValue Get(int slot) => References.TryGetValue(slot, out var storage) ? Read(storage) : Direct(slot);
@@ -169,6 +175,8 @@ internal sealed class SynchronizationState
         // A saved TryEnter/IsEntered result is historical after another operation on this lock.
         foreach (var slot in Values.Where(pair => pair.Value.Condition?.Key.Equals(key) == true).Select(pair => pair.Key).ToArray())
             Values[slot] = Values[slot].WithoutCondition();
+        foreach (var token in PendingWaits.Where(pair => pair.Value.Key.Equals(key)).Select(pair => pair.Key).ToArray())
+            PendingWaits[token] = PendingWaits[token].WithoutCondition();
         Refine(key, hold);
     }
     internal void Refine(GuardKey key, GuardHold hold)
@@ -181,6 +189,7 @@ internal sealed class SynchronizationState
         {
             GuardProtocol.Monitor => Get(new GuardKey(identity, GuardLockKind.Monitor)).Minimum > 0,
             GuardProtocol.ThreadingLock => Get(new GuardKey(identity, GuardLockKind.ThreadingLock)).Minimum > 0,
+            GuardProtocol.SemaphoreSlim => SemaphoreMutexes.Contains(identity) && Get(new GuardKey(identity, GuardLockKind.SemaphoreSlim)).Minimum > 0,
             _ => Get(new GuardKey(identity, GuardLockKind.Write)).Minimum > 0 || !write &&
                 (Get(new GuardKey(identity, GuardLockKind.Read)).Minimum > 0 || Get(new GuardKey(identity, GuardLockKind.UpgradeableRead)).Minimum > 0)
         };
@@ -188,6 +197,16 @@ internal sealed class SynchronizationState
     internal bool Join(SynchronizationState other)
     {
         var changed = false;
+        foreach (var identity in SemaphoreMutexes.Where(identity => !other.SemaphoreMutexes.Contains(identity)).ToArray())
+        { SemaphoreMutexes.Remove(identity); changed = true; }
+        foreach (var token in PendingWaits.Keys.Union(other.PendingWaits.Keys).ToArray())
+        {
+            var hasBefore = PendingWaits.TryGetValue(token, out var before);
+            var hasOther = other.PendingWaits.TryGetValue(token, out var incoming);
+            var after = hasBefore && hasOther ? before!.Join(incoming!) : (hasBefore ? before! : incoming!).Optional();
+            if (hasBefore && before!.Same(after)) continue;
+            PendingWaits[token] = after; changed = true;
+        }
         foreach (var slot in Values.Keys.Union(other.Values.Keys).ToArray())
         {
             var before = Direct(slot); var after = before.Join(other.Direct(slot));

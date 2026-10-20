@@ -51,6 +51,22 @@ public sealed class SynchronizationReportTests
     [InlineData(ReportFormat.Html)]
     [InlineData(ReportFormat.Dot)]
     [InlineData(ReportFormat.Mermaid)]
+    public void SemaphorePermitsRenderAsADistinctCapabilityProtocol(ReportFormat format)
+    {
+        var properties = Properties(1);
+        properties[Prefix + "Protocol"] = "SemaphoreSlim";
+        properties[Prefix + "Held.0.Protocol"] = "SemaphoreSlim";
+        var output = Render(format, properties);
+        Assert.DoesNotContain("Synchronization graph omitted", output);
+        Assert.Contains("SemaphoreSlim", output);
+        Assert.Equal(4, NodeCount(output, format));
+        Assert.Equal(2, EdgeCount(output, format));
+    }
+
+    [Theory]
+    [InlineData(ReportFormat.Html)]
+    [InlineData(ReportFormat.Dot)]
+    [InlineData(ReportFormat.Mermaid)]
     public void EmptyObservedStateDoesNotParseHumanReadableHeldText(ReportFormat format)
     {
         var properties = Properties(0);

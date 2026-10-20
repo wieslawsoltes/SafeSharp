@@ -67,6 +67,7 @@ internal sealed partial class SynchronizationAnalysis
             {
                 var key = Key(identity, contract.Protocol, contract.Write);
                 entry.Held[key] = entry.Expected[key] = new GuardHold(1, 1, contract.Location);
+                if (contract.Protocol == GuardProtocol.SemaphoreSlim) entry.SemaphoreMutexes.Add(identity);
             }
         }
     }
@@ -128,7 +129,7 @@ internal sealed partial class SynchronizationAnalysis
             if (operatorMethod is not null && !contracts.Required(operatorMethod).IsEmpty) return true;
             if (operation is IMemberReferenceOperation member && !contracts.Members(member.Member).IsEmpty) return true;
             if (operation is IInvocationOperation call && (contracts.IsMonitor(call.TargetMethod) || contracts.IsThreadingLock(call.TargetMethod) ||
-                contracts.IsReaderWriter(call.TargetMethod) || !contracts.Required(call.TargetMethod).IsEmpty || !contracts.Returns(call.TargetMethod).IsEmpty)) return true;
+                contracts.IsReaderWriter(call.TargetMethod) || contracts.IsSemaphore(call.TargetMethod) || !contracts.Required(call.TargetMethod).IsEmpty || !contracts.Returns(call.TargetMethod).IsEmpty)) return true;
             foreach (var child in operation.ChildOperations) pending.Push(child);
         }
         return false;
@@ -240,6 +241,7 @@ internal sealed partial class SynchronizationAnalysis
                     : field.Field.Type.IsReferenceType ? Allocation(operation) : 0;
                 if (write) evaluatedTargets[operation] = (receiver.Identity, Array.Empty<GuardValue>());
                 var requirements = Obligations(field.Field, receiver.Identity, Array.Empty<GuardValue>()).AddRange(receiver.Obligations);
+                if (id != 0 && contracts.IsSemaphoreMutexField(field.Field, cancellationToken)) state.SemaphoreMutexes.Add(id);
                 var value = new GuardValue(id, requirements);
                 Validate(value, operation, state, write);
                 return preserve || !types.IsKnownImmutable(field.Field.Type) ? value : new GuardValue(id);
@@ -251,8 +253,10 @@ internal sealed partial class SynchronizationAnalysis
                 if (write) evaluatedTargets[operation] = (receiver.Identity, arguments);
                 var accessor = write ? property.Property.SetMethod : property.Property.GetMethod;
                 if (accessor is not null) Require(accessor, receiver.Identity, arguments, operation, state);
+                if (TrySemaphoreAwaitableProperty(property, receiver, state, out var semaphoreResult)) return semaphoreResult;
                 if (!SynchronizationContracts.Same(property.Property.ContainingType, contracts.ThreadingLock) &&
-                    !SynchronizationContracts.Same(property.Property.ContainingType, contracts.ReaderWriter)) InvalidateCapturedCells(state);
+                    !SynchronizationContracts.Same(property.Property.ContainingType, contracts.ReaderWriter) &&
+                    !SynchronizationContracts.Same(property.Property.ContainingType, contracts.SemaphoreSlim)) InvalidateCapturedCells(state);
                 MayThrow(state);
                 if (TryLockProperty(property, receiver, state, out var fact)) return fact;
                 var value = new GuardValue(0, Obligations(property.Property, receiver.Identity, arguments).AddRange(receiver.Obligations));
@@ -321,6 +325,7 @@ internal sealed partial class SynchronizationAnalysis
                 MayThrow(exceptional);
                 foreach (var argument in outputs) AssignArgument(argument, GuardValue.Unknown, creation, state, addresses);
                 if (creation.Initializer is not null) Child(creation.Initializer);
+                if (identity != 0 && contracts.IsSemaphoreMutexCreation(creation)) state.SemaphoreMutexes.Add(identity);
                 return new GuardValue(identity);
             }
             case IArrayCreationOperation array:
@@ -335,7 +340,12 @@ internal sealed partial class SynchronizationAnalysis
                 MayThrow(state); return preserve || !types.IsKnownImmutable(element.Type!) ? new GuardValue(0, array.Obligations) : GuardValue.Unknown;
             }
             case IAwaitOperation awaited:
-                Child(awaited.Operation); Suspend(operation, state); MayThrow(state); return GuardValue.Unknown;
+            {
+                var value = Child(awaited.Operation);
+                Suspend(operation, state);
+                if (value.PendingWait != 0) return CompleteSemaphoreWait(value.PendingWait, awaited, state);
+                MayThrow(state); return GuardValue.Unknown;
+            }
             case IReturnOperation returned:
             {
                 var value = returned.ReturnedValue is null ? GuardValue.Unknown : Child(returned.ReturnedValue, keep: returnedByReference());
@@ -402,7 +412,7 @@ internal sealed partial class SynchronizationAnalysis
 
     private GuardValue Invoke(IInvocationOperation call, SynchronizationState state, int depth)
     {
-        var known = contracts.IsMonitor(call.TargetMethod) || contracts.IsThreadingLock(call.TargetMethod) || contracts.IsReaderWriter(call.TargetMethod);
+        var known = contracts.IsMonitor(call.TargetMethod) || contracts.IsThreadingLock(call.TargetMethod) || contracts.IsReaderWriter(call.TargetMethod) || contracts.IsSemaphore(call.TargetMethod);
         var receiver = call.Instance is null ? GuardValue.Unknown : Evaluate(call.Instance, state, !known, depth: depth);
         if (call.Instance is not null && !known) Validate(receiver, call.Instance, state, true);
         var values = new GuardValue[call.TargetMethod.Parameters.Length];
@@ -424,6 +434,7 @@ internal sealed partial class SynchronizationAnalysis
         foreach (var address in addresses) values[address.Key] = state.Read(address.Value);
         for (var index = 0; index < values.Length; index++) values[index] ??= GuardValue.Unknown;
         Require(call.TargetMethod, receiver.Identity, values, call, state);
+        if (TrySemaphoreAwaitableCall(call, receiver, state, out var waitResult)) return waitResult;
         // A call may throw before it grants an acquisition or publishes an out flag.
         PrepareAcquisitionFlag(call, values, state, addresses);
         if (!known && receiver.Scope is null) InvalidateCapturedCells(state);
@@ -463,6 +474,8 @@ internal sealed partial class SynchronizationAnalysis
             return state.Get(new GuardKey(values.FirstOrDefault()?.Identity ?? 0, GuardLockKind.Monitor)).Minimum > 0;
         if (contracts.IsThreadingLock(call.TargetMethod) && name == "Exit")
             return state.Get(new GuardKey(receiver.Identity, GuardLockKind.ThreadingLock)).Minimum > 0;
+        if (contracts.IsSemaphore(call.TargetMethod) && name == "Release")
+            return SemaphoreReleaseCount(call) is { } count && count > 0 && state.Get(new GuardKey(receiver.Identity, GuardLockKind.SemaphoreSlim)).Minimum >= count;
         if (!contracts.IsReaderWriter(call.TargetMethod)) return false;
         var kind = name switch { "ExitReadLock" => GuardLockKind.Read, "ExitWriteLock" => GuardLockKind.Write,
             "ExitUpgradeableReadLock" => GuardLockKind.UpgradeableRead, _ => (GuardLockKind?)null };
@@ -476,6 +489,7 @@ internal sealed partial class SynchronizationAnalysis
         var monitor = contracts.IsMonitor(method);
         var threading = contracts.IsThreadingLock(method);
         var readerWriter = contracts.IsReaderWriter(method);
+        if (contracts.IsSemaphore(method)) return SemaphoreIntrinsic(call, receiver, state, out result);
         // The ref struct Scope is a separate symbol; Dispose releases its recorded capability.
         if (method.Name == "Dispose" && receiver.Scope is { } scope)
         {
@@ -671,10 +685,11 @@ internal sealed partial class SynchronizationAnalysis
 
     private void Suspend(IOperation operation, SynchronizationState state)
     {
-        foreach (var pair in state.Held.Where(pair => pair.Value.Maximum > 0))
+        foreach (var pair in state.Held.Where(pair => pair.Value.Maximum > 0 && pair.Key.Kind != GuardLockKind.SemaphoreSlim))
             Report(operation, "suspension", Name(pair.Key.Identity), "a thread-affine synchronization capability may cross await/yield", state, pair.Key.Kind.ToString(), pair.Value.Acquisition);
         // Continuing on another thread must never reuse a former thread's proof.
-        foreach (var key in state.Held.Keys.ToArray()) state.Set(key, new GuardHold(0, state.Get(key).Maximum, state.Get(key).Acquisition));
+        foreach (var key in state.Held.Keys.Where(key => key.Kind != GuardLockKind.SemaphoreSlim).ToArray())
+            state.Set(key, new GuardHold(0, state.Get(key).Maximum, state.Get(key).Acquisition));
     }
 
     private void ValidateExit(SynchronizationState state, IOperation? returned)
@@ -685,6 +700,7 @@ internal sealed partial class SynchronizationAnalysis
         if (!context.Exceptional && returned is not null)
             Escape(state.Returned, returned, state, "the returned reference has no matching GuardedBy return contract",
                 ReturnObligations(method, receiverIdentity, method.Parameters.Select(parameter => state.Get(Slot(parameter))).ToArray()));
+        ValidatePendingSemaphoreWaits(state);
         foreach (var key in state.Held.Keys.Union(state.Expected.Keys))
         {
             var before = state.Expected.TryGetValue(key, out var expected) ? expected : default; var after = state.Get(key);
@@ -698,7 +714,7 @@ internal sealed partial class SynchronizationAnalysis
 
     private void MayThrow(SynchronizationState state)
     {
-        if (state.Held.Count == 0 && !router.HasExceptionalTarget(context)) return;
+        if (state.Held.Count == 0 && !state.PendingWaits.Values.Any(wait => wait.IsPending) && !router.HasExceptionalTarget(context)) return;
         foreach (var destination in router.Exceptions(context)) Propagate(destination, state);
     }
 
@@ -736,7 +752,13 @@ internal sealed partial class SynchronizationAnalysis
             {
                 var value = state.Values[slot];
                 if (value.Condition is not { } alias || !alias.Key.Equals(fact.Key) || !alias.Before.Equals(fact.Before) || !alias.Acquired.Equals(fact.Acquired)) continue;
-                state.Values[slot] = new GuardValue(value.Identity, value.Obligations, acquired == alias.WhenTrue, alias, value.Scope);
+                state.Values[slot] = new GuardValue(value.Identity, value.Obligations, acquired == alias.WhenTrue, alias, value.Scope, value.PendingWait);
+            }
+            foreach (var token in state.PendingWaits.Keys.ToArray())
+            {
+                var wait = state.PendingWaits[token];
+                if (wait.Result.Condition is { } alias && alias.Key.Equals(fact.Key) && alias.Before.Equals(fact.Before) && alias.Acquired.Equals(fact.Acquired))
+                    state.PendingWaits[token] = wait.WithResult(new GuardValue(0, boolean: acquired == alias.WhenTrue, condition: alias));
             }
             if (fact.Observed && truth == fact.WhenTrue) state.Expected[fact.Key] = fact.Acquired;
         }
@@ -787,7 +809,8 @@ internal sealed partial class SynchronizationAnalysis
         return id;
     }
     private static GuardKey Key(int id, GuardProtocol protocol, bool write) => new(id, protocol switch
-    { GuardProtocol.ThreadingLock => GuardLockKind.ThreadingLock, GuardProtocol.ReaderWriter => write ? GuardLockKind.Write : GuardLockKind.Read, _ => GuardLockKind.Monitor });
+    { GuardProtocol.ThreadingLock => GuardLockKind.ThreadingLock, GuardProtocol.ReaderWriter => write ? GuardLockKind.Write : GuardLockKind.Read,
+        GuardProtocol.SemaphoreSlim => GuardLockKind.SemaphoreSlim, _ => GuardLockKind.Monitor });
 
     private void CollectCaptures()
     {

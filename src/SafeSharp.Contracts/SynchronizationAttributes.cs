@@ -16,6 +16,8 @@ public enum LockAccess
 /// The path names <c>this</c>, a method parameter, or a chain of readonly fields. Guards are matched
 /// by receiver and symbol identity. Monitor, System.Threading.Lock, and ReaderWriterLockSlim
 /// protocols remain distinct; a lock on another instance does not satisfy this contract.
+/// A SemaphoreSlim guard requires a proven maximum count of one and a successfully acquired
+/// permit. Its permit may cross await; obtaining an unobserved WaitAsync task is insufficient.
 /// </summary>
 [AttributeUsage(AttributeTargets.Field | AttributeTargets.Property | AttributeTargets.ReturnValue,
     AllowMultiple = true, Inherited = false)]
