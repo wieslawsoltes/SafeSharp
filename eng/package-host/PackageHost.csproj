@@ -12,8 +12,15 @@
          from the newer Workspaces assemblies bundled with SafeSharp.Tool. -->
     <PackageReference Include="Microsoft.CodeAnalysis.CSharp.Workspaces" Version="4.14.0" />
     <PackageReference Include="System.Composition" Version="9.0.0" />
+  </ItemGroup>
+  <!-- Dependency discovery can restore external packages before a local release exists. -->
+  <ItemGroup Condition="'$(SafeSharpPackageVersion)' != ''">
     <PackageReference Include="SafeSharp.Contracts" Version="$(SafeSharpPackageVersion)" />
     <PackageReference Include="SafeSharp.Core" Version="$(SafeSharpPackageVersion)" />
     <PackageReference Include="SafeSharp.Reporting" Version="$(SafeSharpPackageVersion)" />
   </ItemGroup>
+  <Target Name="RequireSafeSharpPackageVersion" BeforeTargets="CoreCompile"
+          Condition="'$(SafeSharpPackageVersion)' == ''">
+    <Error Text="Set SafeSharpPackageVersion to the local package version under test, or run eng/smoke-consumer.py with --version." />
+  </Target>
 </Project>
