@@ -128,6 +128,34 @@ public sealed class AggregateReferenceStorageTests
     }
 
     [Fact]
+    public void ALoopRetainsTheHeldAddressAndConvergesWithWeakGenerations()
+    {
+        var graph = new AnalysisGraph("Repeated array with held ref", [
+            new FlowBlock(0, [Allocate("old"), Array("array"), Set("array", "old"), Bind("reference", "array")], [1]),
+            new FlowBlock(1, [Array("array"), Allocate("new"), Set("array", "new")], [1, 2]),
+            new FlowBlock(2, [Dispose("reference"), Read("current", "array"), Dispose("current")], [])], 0, Site(1000));
+        var result = new OwnershipAnalysisEngine().Analyze(graph, new AnalysisOptions(captureSnapshots: true));
+        Assert.False(result.BudgetExceeded);
+        var exit = result.Blocks.Single(block => block.Id == 2).Exit;
+        Assert.True(exit.Resources.Single(resource => resource.Id == "array").SummarizesMultipleAggregates);
+        Assert.Equal(ResourceStatus.Alive | ResourceStatus.Disposed, exit.Resources.Single(resource => resource.Id == "old").Status);
+        Assert.Contains(result.Issues, issue => issue.Id == "SS0003" && issue.ResourceId == "old");
+    }
+
+    [Fact]
+    public void ClonedBranchesExpandValueTaskAddressesAgainstTheirOwnMaterializedCells()
+    {
+        var graph = new AnalysisGraph("Branch-local ValueTask cell", [
+            new FlowBlock(0, [new FlowInstruction(InstructionKind.TrackValueTask, Site(0), "task", resourceId: "capability"),
+                Array("array"), Bind("reference", "array", "[*]")], [1, 2]),
+            new FlowBlock(1, [Set("array", "task", "[1]"), new FlowInstruction(InstructionKind.ConsumeValueTask, Site(7), source: "reference")], [3]),
+            new FlowBlock(2, [], [3]),
+            new FlowBlock(3, [Read("value", "array", "[1]"), new FlowInstruction(InstructionKind.ConsumeValueTask, Site(9), source: "value")], [])], 0, Site(1000));
+        var result = new OwnershipAnalysisEngine().Analyze(graph, new AnalysisOptions(captureSnapshots: true));
+        Assert.Contains(result.Issues, issue => issue.Id == "SS0048" && issue.Site.Start == 9 && issue.Certainty == IssueCertainty.Possible);
+    }
+
+    [Fact]
     public void IncompleteWildcardTargetExpansionWithholdsTheAnalysis()
     {
         var instructions = new List<FlowInstruction> { Array("array") };
