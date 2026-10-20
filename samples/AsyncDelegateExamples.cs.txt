@@ -1,0 +1,69 @@
+// Intentionally unsafe inputs for the SafeSharp report tool. Do not execute.
+using System.IO;
+using System.Threading.Tasks;
+using SafeSharp;
+
+[return: Lifetime("a"), Borrowed]
+public delegate MemoryStream StreamPicker(
+    [Borrowed, Lifetime("a")] MemoryStream first,
+    [Borrowed, Lifetime("b")] MemoryStream second);
+
+[Outlives("b", "a")]
+[return: Lifetime("a"), Borrowed]
+public delegate MemoryStream OrderedStreamPicker(
+    [Borrowed, Lifetime("a")] MemoryStream first,
+    [Borrowed, Lifetime("b")] MemoryStream second);
+
+public static class DelegateExamples
+{
+    [return: Lifetime("x"), Borrowed]
+    private static MemoryStream First(
+        [Borrowed, Lifetime("x")] MemoryStream first,
+        [Borrowed, Lifetime("y")] MemoryStream second) => first;
+
+    [return: Lifetime("y"), Borrowed]
+    private static MemoryStream Second(
+        [Borrowed, Lifetime("x")] MemoryStream first,
+        [Borrowed, Lifetime("y")] MemoryStream second) => second;
+
+    public static StreamPicker Compatible() => First;
+
+    // The required path from delegate b through callback y to delegate a is
+    // missing from the delegate's assumptions. The report shows those exact edges.
+    public static StreamPicker Incompatible() => Second; // SS0047
+
+    public static OrderedStreamPicker ExplicitRelationship() => Second;
+
+    public static StreamPicker WrongLambda() =>
+        ([Borrowed] MemoryStream first, [Borrowed] MemoryStream second) => second; // SS0047
+}
+
+public static class AsyncResultExamples
+{
+    // The source summary establishes ownership of the payload, independently of
+    // the Task object. Task.FromResult also has a direct completed-producer model.
+    private static Task<MemoryStream> OpenAsync() => Task.FromResult(new MemoryStream());
+
+    public static async Task Correct()
+    {
+        var pending = OpenAsync();
+        var configured = pending.ConfigureAwait(false);
+        using var result = await configured;
+        _ = result.Length;
+    }
+
+    public static void AbandonedProduction()
+    {
+        var pending = OpenAsync(); // Possible SS0003: a successful owned result would be lost.
+    }
+
+    public static async Task RepeatedReceipt()
+    {
+        var pending = OpenAsync();
+        var alias = pending;
+        var result = await pending;
+        result.Dispose();
+        var sameResult = await alias;
+        _ = sameResult.Length; // SS0001: another await preserves the disposed payload identity.
+    }
+}

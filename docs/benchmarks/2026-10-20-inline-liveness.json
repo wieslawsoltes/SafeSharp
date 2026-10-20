@@ -1,0 +1,62 @@
+{
+  "generatedAtUtc": "2026-10-20T12:40:45.8252027+00:00",
+  "runtime": ".NET 10.0.13",
+  "operatingSystem": "Ubuntu 24.04.3 LTS",
+  "architecture": "X64",
+  "logicalProcessors": 2,
+  "optimizedCoreSha256": "211ce92ac515727c394d710aba32565a79a4846073a9b1e91b569e6878002a85",
+  "baselineCoreSha256": null,
+  "Suite": "liveness",
+  "Warmup": 5,
+  "Iterations": 15,
+  "Filter": null,
+  "tieredCompilation": "0",
+  "notes": "Medians of alternating baseline/optimized synchronous samples; construction excluded, solve and requested outputs included. Allocated bytes are per current thread. Microbenchmarks are not whole-project build speedups.",
+  "results": [
+    {
+      "Name": "liveness/tiny",
+      "Details": "4 blocks, 32 instructions, 16 places; small-method setup included",
+      "BaselineMilliseconds": 0.0585,
+      "OptimizedMilliseconds": 0.0315,
+      "Speedup": 1.8571428571428572,
+      "BaselineAllocatedBytes": 37408,
+      "OptimizedAllocatedBytes": 11416
+    },
+    {
+      "Name": "liveness/dense-joins",
+      "Details": "64 blocks, 4096 instructions, 127 distinct places with dense live boundaries",
+      "BaselineMilliseconds": 1080.5253,
+      "OptimizedMilliseconds": 5.9227,
+      "Speedup": 182.43795903895185,
+      "BaselineAllocatedBytes": 26743480,
+      "OptimizedAllocatedBytes": 333280
+    },
+    {
+      "Name": "liveness/projection-loop",
+      "Details": "96 blocks, 3072 instructions, projected places and backward edges",
+      "BaselineMilliseconds": 6043.0251,
+      "OptimizedMilliseconds": 18.3624,
+      "Speedup": 329.09778133577305,
+      "BaselineAllocatedBytes": 106279400,
+      "OptimizedAllocatedBytes": 599944
+    },
+    {
+      "Name": "liveness/sparse-temporaries",
+      "Details": "1 block, 8192 instructions, 4096 short-lived distinct temporaries",
+      "BaselineMilliseconds": 89.4838,
+      "OptimizedMilliseconds": 32.4193,
+      "Speedup": 2.7602014849179346,
+      "BaselineAllocatedBytes": 3016632,
+      "OptimizedAllocatedBytes": 1314896
+    },
+    {
+      "Name": "liveness/unchanged-boundaries",
+      "Details": "32 blocks, 4096 no-op boundaries and one live input",
+      "BaselineMilliseconds": 42.0092,
+      "OptimizedMilliseconds": 1.9667,
+      "Speedup": 21.360248131387603,
+      "BaselineAllocatedBytes": 1738296,
+      "OptimizedAllocatedBytes": 253720
+    }
+  ]
+}

@@ -29,11 +29,28 @@ jobs:
           dotnet-version: 10.0.x
       - run: dotnet restore SafeSharp.sln
       - run: dotnet build SafeSharp.sln -c Release --no-restore
-      - run: dotnet test tests/SafeSharp.Tests/SafeSharp.Tests.csproj -c Release --no-build --logger trx --results-directory artifacts/tests
+      - run: dotnet test tests/SafeSharp.Tests/SafeSharp.Tests.csproj -c Release --no-build --logger trx --results-directory artifacts/tests --collect:"XPlat Code Coverage"
+      - name: Verify coverage collection
+        shell: python
+        run: |
+          import pathlib
+          import xml.etree.ElementTree as ET
+
+          reports = list(pathlib.Path("artifacts/tests").rglob("coverage.cobertura.xml"))
+          if not reports:
+              raise SystemExit("Coverlet did not produce a Cobertura report.")
+          for report in reports:
+              coverage = ET.parse(report).getroot()
+              if coverage.tag != "coverage" or int(coverage.get("lines-covered", "0")) <= 0:
+                  raise SystemExit(f"{report}: expected coverage with executed source lines.")
+              print(f"{report}: {coverage.get('lines-covered')} source lines covered")
       - run: python tests/cli/verify.py --tool src/SafeSharp.Tool/bin/Release/net10.0/SafeSharp.Tool.dll
+      # Build the independent benchmark oracle and verify every scenario's semantics;
+      # single-sample timings are informational, never a performance gate.
+      - run: dotnet run --project benchmarks/SafeSharp.Benchmarks -c Release -- all --iterations 1 --warmup 0 --json artifacts/benchmarks/smoke.json
       - run: dotnet pack SafeSharp.sln -c Release --no-build -o artifacts/packages
       - run: python eng/verify-packages.py artifacts/packages
-      - run: python eng/smoke-consumer.py artifacts/packages --version 0.1.0-preview.1
+      - run: python eng/smoke-consumer.py artifacts/packages --version 0.4.0-preview.1
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:

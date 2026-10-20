@@ -30,29 +30,6 @@ internal static class CallbackOwnershipAnalysis
             context.ReportDiagnostic(Diagnostic.Create(SemanticDiagnostics.IgnoredMustUse, operation.Syntax.GetLocation(), source.Name));
     }
 
-    public static void AnalyzeAssignment(OperationAnalysisContext context, ContractSymbols symbols)
-    {
-        var assignment = (ISimpleAssignmentOperation)context.Operation;
-        var storage = ContractSymbols.Unwrap(assignment.Target) switch
-        {
-            IFieldReferenceOperation field => (ISymbol)field.Field,
-            IPropertyReferenceOperation property => property.Property,
-            _ => null,
-        };
-        if (storage is null) return;
-        var reported = new HashSet<ISymbol>(SymbolEqualityComparer.Default);
-        foreach (var reference in BorrowedOrigins(assignment.Value, symbols))
-        {
-            context.CancellationToken.ThrowIfCancellationRequested();
-            var parameter = reference.Parameter;
-            if (!reported.Add(parameter)) continue;
-            if (!symbols.Has(parameter, "Borrowed") && !symbols.Has(parameter, "BorrowedMut") && !symbols.Has(parameter, "DoesNotEscape")) continue;
-            context.ReportDiagnostic(Diagnostic.Create(SemanticDiagnostics.StoredBorrowedParameter, reference.Syntax.GetLocation(),
-                additionalLocations: storage.Locations.Where(l => l.IsInSource), properties: null,
-                messageArgs: new object[] { parameter.Name, storage.Name }));
-        }
-    }
-
     public static void AnalyzeInvocation(OperationAnalysisContext context, ContractSymbols symbols, ServiceLifetimeAnalysis services)
     {
         var invocation = (IInvocationOperation)context.Operation;
@@ -108,38 +85,6 @@ internal static class CallbackOwnershipAnalysis
                 context.ReportDiagnostic(Diagnostic.Create(SemanticDiagnostics.EscapingUsingCapture, capture.Location,
                     additionalLocations: capture.Symbol.Locations.Where(l => l.IsInSource), properties: null, messageArgs: new object[] { capture.Name }));
         }
-    }
-
-    private static IEnumerable<IParameterReferenceOperation> BorrowedOrigins(IOperation value, ContractSymbols symbols)
-    {
-        value = ContractSymbols.Unwrap(value);
-        if (value is IParameterReferenceOperation parameter)
-        {
-            yield return parameter;
-            yield break;
-        }
-        IEnumerable<IOperation>? children = value switch
-        {
-            IConditionalOperation conditional => conditional.WhenFalse is null ? new[] { conditional.WhenTrue } : new[] { conditional.WhenTrue, conditional.WhenFalse },
-            ICoalesceOperation coalesce => new[] { coalesce.Value, coalesce.WhenNull },
-            ITupleOperation tuple => tuple.Elements,
-            IArrayCreationOperation array when array.Initializer is not null => array.Initializer.ElementValues,
-            _ => null,
-        };
-        if (value is IInvocationOperation invocation)
-        {
-            var attribute = symbols.Find(invocation.TargetMethod.GetAttributes(), "ReturnsBorrowed");
-            var source = attribute?.ConstructorArguments.FirstOrDefault().Value as string;
-            if (source == "this" && invocation.Instance is not null) children = new[] { invocation.Instance };
-            else if (source is not null)
-            {
-                var sourceArgument = invocation.Arguments.FirstOrDefault(a => a.Parameter?.Name == source);
-                if (sourceArgument is not null) children = new[] { sourceArgument.Value };
-            }
-        }
-        if (children is null) yield break;
-        foreach (var child in children)
-            foreach (var origin in BorrowedOrigins(child, symbols)) yield return origin;
     }
 
     private static IEnumerable<CapturedValue> Captures(IAnonymousFunctionOperation lambda, System.Threading.CancellationToken cancellationToken)

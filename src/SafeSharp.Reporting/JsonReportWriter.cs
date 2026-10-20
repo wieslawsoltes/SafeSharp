@@ -142,6 +142,9 @@ public sealed class JsonReportWriter : IAnalysisReportWriter
         json.Property("ownership", instruction.Ownership.ToString());
         json.Property("flags", instruction.Flags.ToString());
         json.Property("description", instruction.Description);
+        json.Property("asyncResultDepth", instruction.AsyncResultDepth);
+        json.Property("asyncComposition", instruction.AsyncComposition.ToString());
+        json.Property("projection", instruction.Projection);
         json.Name("source"); WriteSite(json, instruction.Site);
         json.EndObject();
     }
@@ -175,15 +178,51 @@ public sealed class JsonReportWriter : IAnalysisReportWriter
             json.EndObject();
         }
         json.EndArray();
+        json.Name("referenceStorage"); json.StartArray();
+        foreach (var binding in state.ReferenceStorage)
+        {
+            json.StartObject();
+            json.Property("reference", binding.Reference);
+            json.Name("targets"); WriteStrings(json, binding.Targets);
+            json.EndObject();
+        }
+        json.EndArray();
         json.Name("resources"); json.StartArray();
         foreach (var resource in state.Resources.OrderBy(resource => resource.Id, StringComparer.Ordinal))
         {
             json.StartObject();
             json.Property("id", resource.Id);
+            json.Property("kind", resource.Kind.ToString());
             json.Property("ownership", resource.Ownership.ToString());
             json.Property("status", resource.Status.ToString());
             json.Name("origin"); WriteSite(json, resource.Origin);
             json.Name("ownerResourceIds"); WriteStrings(json, resource.OwnerResourceIds);
+            json.Name("disposedResourceIds"); WriteStrings(json, resource.DisposedResourceIds);
+            if (resource.AsyncComposition != AsyncCompositionKind.None)
+            {
+                json.Property("asyncComposition", resource.AsyncComposition.ToString());
+                json.Name("dependencyResourceIds"); WriteStrings(json, resource.DependencyResourceIds);
+            }
+            if (resource.Kind == ResourceKind.Aggregate)
+            {
+                json.Property("summarizesMultipleAggregates", resource.SummarizesMultipleAggregates);
+                json.Name("elements"); json.StartArray();
+                foreach (var element in resource.Elements)
+                {
+                    json.StartObject(); json.Property("index", element.Index);
+                    json.Name("resourceIds"); WriteStrings(json, element.ResourceIds);
+                    json.Name("valueTaskIds"); WriteStrings(json, element.ValueTaskIds);
+                    json.EndObject();
+                }
+                json.EndArray();
+            }
+            if (resource.Kind == ResourceKind.AsyncFactoryCarrier || resource.ResultState != AsyncResultState.None)
+            {
+                json.Property("resultState", resource.ResultState.ToString());
+                json.Property("asyncResultDepth", resource.AsyncResultDepth);
+                json.Property("producedResourceId", resource.ProducedResourceId);
+                json.Name("producedResourceIds"); WriteStrings(json, resource.ProducedResourceIds);
+            }
             json.EndObject();
         }
         json.EndArray();
@@ -195,11 +234,29 @@ public sealed class JsonReportWriter : IAnalysisReportWriter
             json.Property("resourceId", loan.ResourceId);
             json.Property("holder", loan.Holder);
             json.Property("kind", loan.Kind.ToString());
+            json.Property("phase", loan.Phase.ToString());
             json.Property("parentId", loan.ParentId);
             json.Property("projection", loan.Projection);
             json.Property("allowsSuspension", loan.AllowsSuspension);
             json.Property("mayBeAbsent", loan.MayBeAbsent);
             json.Name("origin"); WriteSite(json, loan.Origin);
+            json.Name("activationSites"); json.StartArray();
+            foreach (var site in loan.ActivationSites) WriteSite(json, site);
+            json.EndArray();
+            json.EndObject();
+        }
+        json.EndArray();
+        json.Name("valueTasks"); json.StartArray();
+        foreach (var valueTask in state.ValueTasks)
+        {
+            json.StartObject();
+            json.Property("id", valueTask.Id);
+            json.Property("state", valueTask.State.ToString());
+            json.Name("origin"); WriteSite(json, valueTask.Origin);
+            json.Name("places"); WriteStrings(json, valueTask.Places);
+            json.Name("evidenceSites"); json.StartArray();
+            foreach (var site in valueTask.EvidenceSites) WriteSite(json, site);
+            json.EndArray();
             json.EndObject();
         }
         json.EndArray();
