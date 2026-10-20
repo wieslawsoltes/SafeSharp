@@ -16,9 +16,10 @@ namespace SafeSharp.Analyzers.Semantics;
 /// Target regions are arbitrary universally supplied regions; the callback's regions are fresh
 /// inference variables. Input shortening and output covariance must not imply a new relation
 /// between the target's independent regions. Writable C# ref/out slots require invariance.
-/// This models one explicit binder, not nested higher-ranked trait/type inference.
+/// Explicit TypeLifetime paths additionally introduce nested callable binders and Roslyn variance.
+/// Higher-ranked trait resolution and arbitrary CLR type inference remain outside this contract domain.
 /// </remarks>
-internal static class LifetimeDelegateAnalysis
+internal static partial class LifetimeDelegateAnalysis
 {
     internal static void Analyze(OperationAnalysisContext context, LifetimeContractProvider contracts, MethodSummaryProvider summaries)
     {
@@ -44,7 +45,8 @@ internal static class LifetimeDelegateAnalysis
             {
                 var actual = contracts.Get(lambda.Symbol, cancellationToken);
                 if (!actual.DeclarationIssues.IsEmpty) return;
-                if (actual.ReturnRegion is not null || actual.BorrowedSource is not null || actual.ReturnsOwned || lambda.Symbol.ReturnsVoid)
+                if (actual.ReturnRegion is not null || actual.BorrowedSource is not null || actual.ReturnsOwned || lambda.Symbol.ReturnsVoid ||
+                    HasTypeContracts(actual) || HasTypeContracts(promised))
                 {
                     Compare(context, creation, lambda.Symbol, promised, contracts, summaries, 0, options);
                     return;
@@ -108,10 +110,11 @@ internal static class LifetimeDelegateAnalysis
         }
 
         Binding binding;
-        UniversalRegionSolution result;
+        UniversalRegionSolution? result = null;
+        HigherRankedRegionSolution? ranked = null;
         try
         {
-            binding = new Binding(promised, actual, boundParameters, creation.Target.Syntax.GetLocation(), options, cancellationToken);
+            binding = new Binding(promised, actual, boundParameters, creation.Target.Syntax.GetLocation(), options, cancellationToken, context.Compilation);
             var promisesAsyncPayload = summaries.AsyncResults.IsCarrier(promised.Method.ReturnType);
             if (promised.ReturnRegion is not null && !binding.AddReturn(actual, summary, promisesAsyncPayload))
             {
@@ -120,28 +123,49 @@ internal static class LifetimeDelegateAnalysis
                         "the callback's returned borrow has no proven input or receiver provenance");
                 return;
             }
-            result = new UniversalRegionSolver().Solve(binding.Problem(), options, cancellationToken);
+            if (HasTypeContracts(actual) || HasTypeContracts(promised))
+            {
+                var targetMethod = ((INamedTypeSymbol)creation.Type!).DelegateInvokeMethod!;
+                if (binding.AddTypes(actual, method, targetMethod, boundParameters) is { } typeMismatch)
+                {
+                    Report(context, creation.Target.Syntax.GetLocation(), method, promised, typeMismatch);
+                    return;
+                }
+                ranked = new HigherRankedRegionSolver().Solve(binding.RankedProblem(), binding.RemainingOptions(), cancellationToken);
+            }
+            else result = new UniversalRegionSolver().Solve(binding.Problem(), options, cancellationToken);
         }
         catch (BindingBudgetException exhausted)
         {
             ReportBudget(context, creation, method, exhausted.Reason);
             return;
         }
-        if (!result.IsComplete)
+        if (!(ranked?.IsComplete ?? result!.IsComplete))
         {
-            ReportBudget(context, creation, method, result.BudgetReason ?? "universal delegate obligations");
+            ReportBudget(context, creation, method, ranked?.BudgetReason ?? result?.BudgetReason ?? "universal delegate obligations");
             return;
         }
-        if (result.IsCompatible) return;
-        var failure = result.Failures[0];
-        var properties = binding.Properties(failure, result);
+        if (ranked?.IsCompatible ?? result!.IsCompatible) return;
         var related = promised.DeclarationLocations.Concat(actual.DeclarationLocations)
             .Concat(method.Locations).Where(location => location.IsInSource && location != creation.Target.Syntax.GetLocation()).Distinct();
+        var failures = ranked?.Failures ?? result!.Failures;
+        if (failures.IsEmpty && ranked is not null)
+        {
+            var typeFailure = ranked.TypeFailures[0];
+            context.ReportDiagnostic(Diagnostic.Create(LifetimeContractAnalyzer.DelegateContract, creation.Target.Syntax.GetLocation(), related,
+                binding.TypeProperties(typeFailure, ranked), method.Name, promised.Method.ContainingType.ToDisplayString(),
+                "the borrowed contents of type '" + binding.DescribeType(typeFailure.Requirement.Type) + "' are not known to outlive " + binding.Describe(typeFailure.Region)));
+            return;
+        }
+        var failure = failures[0];
+        var properties = binding.Properties(failure, ranked?.Closure ?? result!.Closure!, ranked);
         context.ReportDiagnostic(Diagnostic.Create(LifetimeContractAnalyzer.DelegateContract, creation.Target.Syntax.GetLocation(), related, properties,
             method.Name, promised.Method.ContainingType.ToDisplayString(),
             "the callback requires " + binding.Describe(failure.Longer) + " to outlive " + binding.Describe(failure.Shorter) +
-            ", but the delegate permits these lifetimes to be independent"));
+            (ranked is { Promotions.IsEmpty: false } ? "; a nested lifetime cannot escape its visible binder" : ", but the delegate permits these lifetimes to be independent")));
     }
+
+    private static bool HasTypeContracts(LifetimeContractModel contract) => !contract.TypePositions.IsEmpty || contract.TypeBounds.Any(bound => !bound.IsImplied);
 
     private static string? ParameterMismatch(IMethodSymbol actual, IMethodSymbol promised, int boundParameters, CancellationToken cancellationToken)
     {
@@ -214,7 +238,7 @@ internal static class LifetimeDelegateAnalysis
         internal string Reason { get; }
     }
 
-    private sealed class Binding
+    private sealed partial class Binding
     {
         private readonly LifetimeContractModel promised;
         private readonly Dictionary<string, string> universals = new(StringComparer.Ordinal);
@@ -226,19 +250,21 @@ internal static class LifetimeDelegateAnalysis
         private readonly SourceSite? site;
         private readonly CancellationToken cancellationToken;
         private readonly RegionSolverOptions options;
+        private readonly Compilation compilation;
 
         internal Binding(LifetimeContractModel promised, LifetimeContractModel actual, int boundParameters, Location location,
-            RegionSolverOptions options, CancellationToken cancellationToken)
+            RegionSolverOptions options, CancellationToken cancellationToken, Compilation compilation, bool receiverSuppliedByCaller = false)
         {
             this.promised = promised;
             this.cancellationToken = cancellationToken;
             this.options = options;
+            this.compilation = compilation;
             site = LifetimeContractProvider.Source(location);
             // Every input needs at least one edge. Reject this lower bound before allocating
             // the input map or copying signatures larger than the configured graph budget.
             if ((long)promised.Constraints.Length + actual.Constraints.Length + actual.Method.Parameters.Length > options.MaxConstraints)
                 throw new BindingBudgetException("outlives-constraint count");
-            foreach (var name in promised.RegionNames)
+            foreach (var name in promised.RootRegionNames)
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 Universal(name, "delegate region '" + name + "'");
@@ -246,9 +272,10 @@ internal static class LifetimeDelegateAnalysis
             foreach (var edge in promised.Constraints)
             {
                 cancellationToken.ThrowIfCancellationRequested();
+                if (!universals.ContainsKey(edge.Longer) || !universals.ContainsKey(edge.Shorter)) continue;
                 AddEdge(assumptions, universals[edge.Longer], universals[edge.Shorter], edge.Site, "Delegate assumption: " + edge.Reason);
             }
-            foreach (var name in actual.RegionNames)
+            foreach (var name in actual.RootRegionNames)
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 Inference(name, "callback region '" + name + "'");
@@ -256,6 +283,7 @@ internal static class LifetimeDelegateAnalysis
             foreach (var edge in actual.Constraints)
             {
                 cancellationToken.ThrowIfCancellationRequested();
+                if (!inference.ContainsKey(edge.Longer) || !inference.ContainsKey(edge.Shorter)) continue;
                 AddEdge(requirements, inference[edge.Longer], inference[edge.Shorter], edge.Site, "Callback requirement: " + edge.Reason);
             }
             actualInputs = new string[actual.Method.Parameters.Length];
@@ -274,8 +302,8 @@ internal static class LifetimeDelegateAnalysis
                     AddEdge(requirements, required, supplied, site, "Writable ref/out storage is invariant.");
             }
             if (LifetimeContractModel.HasReceiver(actual.Method))
-                AddEdge(requirements, Universal("$receiver", "captured receiver"), inference["this"], site,
-                    "The captured receiver has a lifetime independent of later delegate inputs.");
+                AddEdge(requirements, receiverSuppliedByCaller && universals.TryGetValue("this", out var suppliedReceiver) ? suppliedReceiver : Universal("$receiver", "captured receiver"), inference["this"], site,
+                    receiverSuppliedByCaller ? "The inherited receiver is supplied by the caller." : "The captured receiver has a lifetime independent of later delegate inputs.");
         }
 
         internal bool AddReturn(LifetimeContractModel actual, MethodSummary summary, bool promisesAsyncPayload)
@@ -310,20 +338,23 @@ internal static class LifetimeDelegateAnalysis
         }
 
         internal UniversalRegionProblem Problem() => new(new RegionProblem(universals.Values, assumptions), inference.Values, requirements);
-        internal string Describe(string name) => descriptions[name];
+        internal string Describe(string name) => descriptions.TryGetValue(name, out var description) ? description : "the static lifetime";
 
-        internal ImmutableDictionary<string, string?> Properties(UniversalRegionFailure failure, UniversalRegionSolution result) =>
+        internal ImmutableDictionary<string, string?> Properties(UniversalRegionFailure failure, RegionSolution closure, HigherRankedRegionSolution? ranked = null) =>
+            AdditionalProperties(Properties(failure.Longer, failure.Shorter, failure.Proof, closure), ranked);
+
+        private ImmutableDictionary<string, string?> Properties(string longer, string shorter, RegionProof proof, RegionSolution closure) =>
             ImmutableDictionary<string, string?>.Empty
                 .Add("SafeSharp.DelegateType", promised.Method.ContainingType.ToDisplayString())
                 .Add("SafeSharp.RegionNames", string.Join(", ", universals.Values.Concat(inference.Values).OrderBy(name => name, StringComparer.Ordinal)))
                 .Add("SafeSharp.RegionConstraints", string.Join("; ", assumptions.Select(edge => edge.Longer + " : " + edge.Shorter)))
-                .Add("SafeSharp.RequiredRegion", failure.Shorter)
-                .Add("SafeSharp.SourceRegions", failure.Longer)
-                .Add("SafeSharp.RegionProof", string.Join(" -> ", failure.Proof.Steps.Select(edge => edge.Longer).Concat(new[] { failure.Shorter })))
+                .Add("SafeSharp.RequiredRegion", shorter)
+                .Add("SafeSharp.SourceRegions", longer)
+                .Add("SafeSharp.RegionProof", string.Join(" -> ", proof.Steps.Select(edge => edge.Longer).Concat(new[] { shorter })))
                 .Add("SafeSharp.RegionBindings", string.Join("; ", descriptions.OrderBy(pair => pair.Key, StringComparer.Ordinal).Select(pair => pair.Key + " = " + pair.Value)))
                 .Add("SafeSharp.RegionRequirements", string.Join("; ", requirements.Select(edge => edge.Longer + " : " + edge.Shorter)))
                 .Add("SafeSharp.RegionRequirementReasons", string.Join("; ", requirements.Select(edge => edge.Longer + " : " + edge.Shorter + " (" + edge.Reason + ")")))
-                .Add("SafeSharp.RegionComponents", string.Join("; ", result.Closure!.Components.Select(component => string.Join(", ", component.Members))))
+                .Add("SafeSharp.RegionComponents", string.Join("; ", closure.Components.Select(component => string.Join(", ", component.Members))))
                 .Add("SafeSharp.RegionQuantification", "one universal delegate binder");
 
         private string Universal(string key, string description)

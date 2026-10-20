@@ -89,7 +89,9 @@ internal sealed class RegionWitness
 
     internal static bool IsRegionProperty(string name) => name is "SafeSharp.RegionNames" or "SafeSharp.RegionConstraints"
         or "SafeSharp.RequiredRegion" or "SafeSharp.SourceRegions" or "SafeSharp.RegionProof" or "SafeSharp.RegionComponents"
-        or "SafeSharp.RegionRequirements" or "SafeSharp.RegionRequirementReasons" or "SafeSharp.RegionBindings" or "SafeSharp.RegionQuantification";
+        or "SafeSharp.RegionRequirements" or "SafeSharp.RegionRequirementReasons" or "SafeSharp.RegionBindings" or "SafeSharp.RegionQuantification"
+        or "SafeSharp.RegionUniverses" or "SafeSharp.RegionVariableUniverses" or "SafeSharp.RegionUniversePromotions" or "SafeSharp.RegionVisibilityProofs"
+        or "SafeSharp.TypeOutlivesAssumptions" or "SafeSharp.TypeOutlivesRequirements" or "SafeSharp.TypeBindings" or "SafeSharp.TypeOutlivesType";
 
     internal string MetadataLabel(ReportDiagnostic diagnostic) =>
         (OmissionReason is null ? "Diagnostic metadata (not graph edges)" : OmissionReason + "\nDiagnostic metadata") + "\n" +
@@ -135,6 +137,9 @@ internal sealed class RegionWitness
     // validation. In particular, the producer reserves the receiver name "this" separately.
     private static bool IsIdentifier(string value)
     {
+        // The higher-ranked solver exposes this exact reserved upper bound as a graph vertex.
+        // Keep arbitrary '$' names invalid; the exception must not broaden delimiter handling.
+        if (value == "$static") return true;
         if (value.Length == 0) return false;
         for (var index = 0; index < value.Length; index++)
         {

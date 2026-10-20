@@ -105,15 +105,28 @@ public sealed class LifetimeContractAnalyzer : DiagnosticAnalyzer
                 return;
             }
             string? incompatibility;
-            try { incompatibility = Incompatibility(contract, solved, promised, inheritedSolution, ref comparisonSteps, cancellationToken); }
+            string? typeBudget = null;
+            ImmutableDictionary<string, string?>? typeProperties = null;
+            try
+            {
+                incompatibility = Incompatibility(contract, solved, promised, inheritedSolution, ref comparisonSteps, cancellationToken);
+                if (incompatibility is null)
+                    incompatibility = LifetimeDelegateAnalysis.InheritedTypeMismatch(contract, promised, method, inherited, options, provider.Compilation,
+                        ref comparisonSteps, cancellationToken, out typeBudget, out typeProperties);
+            }
             catch (CompatibilityBudgetException)
             {
                 report(Diagnostic.Create(BudgetExceeded, method.Locations.FirstOrDefault(), method.Name, "inherited-contract comparison steps"));
                 return;
             }
+            if (typeBudget is not null)
+            {
+                report(Diagnostic.Create(BudgetExceeded, method.Locations.FirstOrDefault(), method.Name, typeBudget));
+                return;
+            }
             if (incompatibility is null) continue;
             report(Diagnostic.Create(InheritedContract, method.Locations.FirstOrDefault(), inherited.Locations.Where(location => location.IsInSource),
-                properties: null, messageArgs: new object[] { method.Name, inherited.ToDisplayString(), incompatibility }));
+                properties: typeProperties, messageArgs: new object[] { method.Name, inherited.ToDisplayString(), incompatibility }));
         }
     }
 
@@ -185,6 +198,6 @@ public sealed class LifetimeContractAnalyzer : DiagnosticAnalyzer
 
     private static DiagnosticDescriptor Rule(string id, string title, string message) => new(id, title, message,
         "SafeSharp.Lifetimes", DiagnosticSeverity.Warning, isEnabledByDefault: true,
-        description: "Checks explicit named lifetime regions, borrowed provenance, and one-binder universal outlives obligations at annotated delegate conversions. This is not a full Rust type or trait system.",
+        description: "Checks explicit lifetime regions, borrowed provenance, nested callable binders, declared type variance and type-outlives obligations at inherited contracts and delegate conversions. This is not a full Rust type or trait system.",
         helpLinkUri: "https://github.com/wieslawsoltes/SafeSharp/blob/main/docs/lifetime-regions.md#" + id.ToLowerInvariant());
 }
