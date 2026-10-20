@@ -96,7 +96,7 @@ public sealed class ReferenceOriginSummaryTests
     [InlineData("var value = new Resource(); ref Resource alias = ref value; var box = new Box(); box[ReplaceIndex(ref alias, external)] = external; return value;")]
     [InlineData("var value = new Resource(); ref Resource alias = ref RefReturn(ref value); alias = external; return value;")]
     [InlineData("ref Resource alias = ref new Box().RefValue; alias = new Resource(); return alias;")]
-    [InlineData("var value = new Resource(); ref Resource alias = ref value; try { return alias; } catch { return external; }")]
+    [InlineData("var value = new Resource(); ref Resource alias = ref value; try { external.Read(); return alias; } catch { return external; }")]
     [InlineData("var value = new Resource(); ref Resource alias = ref value; try { alias = new Resource(); } finally { alias = external; } return value;")]
     [InlineData("var value = new Resource(); Action rewrite = () => value = external; rewrite(); return value;")]
     [InlineData("var value = new Resource(); Action rewrite = () => value = external; Invoke(rewrite); return value;")]

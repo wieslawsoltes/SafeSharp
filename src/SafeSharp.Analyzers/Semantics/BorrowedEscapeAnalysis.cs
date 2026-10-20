@@ -401,6 +401,27 @@ internal sealed class BorrowedEscapeAnalysis
             if (target.Name == "GetResult") return Payload(receiver, operation.Type, state);
         }
         var summary = summaries.Get(unreduced, cancellationToken);
+        if (!summary.ReturnOrigins.IsEmpty)
+        {
+            var results = new List<Value>();
+            foreach (var origin in summary.ReturnOrigins)
+            {
+                Step();
+                var value = origin.Source == MethodOriginAnalysis.Fresh ? Container(operation, Value.Empty, state) :
+                    origin.Source == MethodOriginAnalysis.Null ? Value.Empty : origin.Source == MethodOriginAnalysis.Receiver ? receiver : Value.External;
+                foreach (var parameter in unreduced.Parameters)
+                {
+                    if (origin.Source != MethodOriginAnalysis.Parameter(parameter.Ordinal)) continue;
+                    var ordinal = parameter.Ordinal - (target.ReducedFrom is null ? 0 : 1);
+                    value = ordinal < 0 ? receiver : arguments.TryGetValue(ordinal, out var argument) ? argument : Value.External;
+                    break;
+                }
+                for (var layer = 0; layer < origin.PayloadDepth; layer++)
+                    value = Container(operation, value, state, isPayload: true, layer: layer + 1);
+                results.Add(value);
+            }
+            return Union(results);
+        }
         if (summary.ReturnsOwned) return Container(operation, Value.Empty, state);
         var values = new List<Value>();
         foreach (var source in summary.BorrowedSources)
@@ -555,9 +576,9 @@ internal sealed class BorrowedEscapeAnalysis
         }
     }
 
-    private Value Container(IOperation operation, Value contents, State state, bool isPayload = false)
+    private Value Container(IOperation operation, Value contents, State state, bool isPayload = false, int layer = 0)
     {
-        var key = "$container:" + operation.Syntax.SyntaxTree.FilePath + ":" + operation.Syntax.SpanStart + ":" + operation.Syntax.Span.Length;
+        var key = "$container:" + operation.Syntax.SyntaxTree.FilePath + ":" + operation.Syntax.SpanStart + ":" + operation.Syntax.Span.Length + ":" + layer;
         state.Values[key] = Merge(Read(key, state), contents);
         RememberValue(key, state.Values[key]);
         var keys = ImmutableHashSet.Create(StringComparer.Ordinal, key);
