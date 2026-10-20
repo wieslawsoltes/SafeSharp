@@ -160,4 +160,18 @@ public sealed class AggregateReferenceStorageTests
         var result = Analyze(Array("array"), Read("value", "array", "[*]"), new FlowInstruction(InstructionKind.AssumeNull, Site(8), source: "value"));
         Assert.True(result.Blocks[0].Exit.IsReachable);
     }
+
+    [Fact]
+    public void ElementIdentityDoesNotInventAChildLoanFromAContainerLoan()
+    {
+        // This records the representation boundary, not an accepted borrowing proof. A
+        // separate parent-capability domain is required to propagate deep array permissions.
+        var result = Analyze(Allocate("owned"), Array("array"), Set("array", "owned"),
+            new FlowInstruction(InstructionKind.BorrowShared, Site(3), "view", "array"),
+            Bind("reference", "view"), Copy("snapshot", "reference"));
+        var value = Assert.Single(result.Blocks[0].Exit.Places.Single(place => place.Place == "snapshot").References);
+        Assert.Equal("owned", value.ResourceId);
+        Assert.Null(value.LoanId);
+        Assert.Contains(result.Issues, issue => issue.Id == "SS0003" && issue.ResourceId == "owned");
+    }
 }

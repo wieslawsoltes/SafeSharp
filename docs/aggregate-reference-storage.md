@@ -101,6 +101,16 @@ concurrent array mutation are outside this sequential domain. Unknown-index
 access is conservative and does not prove complete array-element cleanup or
 precise iteration counts.
 
+Storage identity is also separate from deep-container borrowing permissions.
+The existing array-element model does not derive a child loan for an element
+from a loan of its containing array, and this change does not add that permission
+domain. In particular, preserving a ref's element identity does not establish
+that a later write through that ref respects every subsequently created loan of
+the container. Direct receiver writes retain their existing borrow checks;
+general parent-capability propagation through captured element refs remains an
+explicit limitation. A clean ownership report is not a deep-container borrowing
+proof.
+
 ## Design references and tests
 
 This is original C# implementation. Rust's distinction between a place and the
