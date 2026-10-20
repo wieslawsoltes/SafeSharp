@@ -58,6 +58,27 @@ public sealed class PlaceLivenessTests
         }
     }
 
+    [Fact]
+    public void ValueWritesReadCapturedAddressesWhileRebindingAndReleaseKillTheBinding()
+    {
+        var block = new FlowBlock(0,
+        [
+            new(InstructionKind.BindReference, Site, target: "reference", source: "first"),
+            new(InstructionKind.Alias, Site, target: "reference", source: "incoming"),
+            new(InstructionKind.BindReference, Site, target: "reference", source: "second"),
+            new(InstructionKind.Alias, Site, target: "reference.field", source: "next"),
+            new(InstructionKind.ReleaseReference, Site, target: "reference"),
+            new(InstructionKind.Read, Site, source: "unrelated"),
+        ], []);
+        var blocks = new Dictionary<int, FlowBlock> { [0] = block };
+        var liveness = Compute(blocks);
+        Assert.Contains("reference", liveness.Before[0][1]);
+        Assert.Contains("reference.field", liveness.Before[0][3]);
+        foreach (var index in new[] { 0, 2, 4 })
+            Assert.DoesNotContain(liveness.Before[0][index], place => place == "reference" || place.StartsWith("reference.", StringComparison.Ordinal));
+        AssertMatchesOracle(blocks, 100);
+    }
+
     [Theory]
     [InlineData(0)]
     [InlineData(1)]

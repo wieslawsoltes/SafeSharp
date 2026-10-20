@@ -76,7 +76,7 @@ public sealed class AggregateReferenceStorageOwnershipTests
         var diagnostics = await AnalyzerTestHost.GetDiagnosticsAsync(Prelude + """
             void M() {
                 var values = new[] { new Resource() }; var original = values;
-                ref Resource alias = ref First(ref values[0], values = new[] { new Resource() });
+                ref Resource alias = ref First(ref values[0], (values = new[] { new Resource() }).Length);
                 alias.Dispose(); values[0].Dispose();
             } }
             """);

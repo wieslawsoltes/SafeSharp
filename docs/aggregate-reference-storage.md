@@ -65,6 +65,12 @@ arrays. Reads and writes through either generation's references remain weak. A
 single abstract allocation identity is never treated as proof that all runtime
 array instances have been replaced or released.
 
+Liveness distinguishes writing the referenced value from replacing the reference
+binding. A value write still uses the captured address, including when it targets
+a projected field; ref rebinding and release end the former binding's liveness.
+This retains an old aggregate generation even when the next use of its held ref
+is an overwrite rather than a read.
+
 ## Calls and exceptions
 
 Source-proven normal ref/out outputs are installed into the same canonical cells.

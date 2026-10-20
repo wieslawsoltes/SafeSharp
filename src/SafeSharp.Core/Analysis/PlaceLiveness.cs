@@ -25,6 +25,14 @@ internal sealed class PlaceLiveness
         cancellationToken.ThrowIfCancellationRequested();
         var result = new PlaceLiveness();
         var blockArray = blocks.Values.ToArray();
+        var referenceRoots = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var block in blockArray)
+        foreach (var instruction in block.Instructions)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (instruction.Kind is InstructionKind.BindReference or InstructionKind.MergeReference or InstructionKind.BindAggregateElementReference)
+                referenceRoots.Add(instruction.Target!);
+        }
         var universe = new PlaceUniverse(blockArray, cancellationToken);
         var indices = new Dictionary<int, int>(blockArray.Length);
         for (var index = 0; index < blockArray.Length; index++) indices.Add(blockArray[index].Id, index);
@@ -38,7 +46,7 @@ internal sealed class PlaceLiveness
         {
             cancellationToken.ThrowIfCancellationRequested();
             var block = blockArray[index];
-            compiled[index] = new BlockEffects(block, universe, indices, predecessors[block.Id], cancellationToken);
+            compiled[index] = new BlockEffects(block, universe, referenceRoots, indices, predecessors[block.Id], cancellationToken);
             inputs[index] = outputs[index] = universe.Empty;
             queue.Enqueue(index);
             queued[index] = true;
@@ -103,7 +111,7 @@ internal sealed class PlaceLiveness
 
     private sealed class BlockEffects
     {
-        internal BlockEffects(FlowBlock block, PlaceUniverse universe, Dictionary<int, int> indices,
+        internal BlockEffects(FlowBlock block, PlaceUniverse universe, ISet<string> referenceRoots, Dictionary<int, int> indices,
             List<int> predecessors, CancellationToken cancellationToken)
         {
             Successors = block.Successors.Where(indices.ContainsKey).Select(id => indices[id]).ToArray();
@@ -114,7 +122,7 @@ internal sealed class PlaceLiveness
             for (var index = block.Instructions.Length - 1; index >= 0; index--)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                var effect = new InstructionEffect(block.Instructions[index], universe);
+                var effect = new InstructionEffect(block.Instructions[index], universe, referenceRoots, cancellationToken);
                 Instructions[index] = effect;
                 effect.Apply(generated, cancellationToken);
                 effect.Kill?.AddTo(killed, cancellationToken);
@@ -132,13 +140,32 @@ internal sealed class PlaceLiveness
 
     private readonly struct InstructionEffect
     {
-        internal InstructionEffect(FlowInstruction instruction, PlaceUniverse universe)
+        internal InstructionEffect(FlowInstruction instruction, PlaceUniverse universe, ISet<string> referenceRoots, CancellationToken cancellationToken)
         {
             var target = instruction.Kind == InstructionKind.Nop ? -1 : universe.Index(instruction.Target);
             Kill = target < 0 ? null : universe.KillFor(target);
             Source = instruction.Kind == InstructionKind.Nop ? -1 : universe.Index(instruction.Source);
-            MergeTarget = instruction.Kind is InstructionKind.MergeAlias or InstructionKind.MergeReference ? target : -1;
+            // A value write through a ref consumes its captured address, even when it kills
+            // the old value. Rebinding/releasing the ref instead replaces that address.
+            var readsAddress = target >= 0 && instruction.Kind is not (InstructionKind.BindReference or
+                InstructionKind.BindAggregateElementReference or InstructionKind.ReleaseReference) &&
+                IsReferenceTarget(instruction.Target!, referenceRoots, cancellationToken);
+            MergeTarget = instruction.Kind is InstructionKind.MergeAlias or InstructionKind.MergeReference || readsAddress ? target : -1;
             Owner = universe.Index(instruction.Owner);
+        }
+
+        private static bool IsReferenceTarget(string target, ISet<string> referenceRoots, CancellationToken cancellationToken)
+        {
+            if (referenceRoots.Count == 0) return false;
+            if (referenceRoots.Contains(target)) return true;
+            var separator = Math.Max(target.LastIndexOf('.'), target.LastIndexOf('['));
+            while (separator > 0)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (referenceRoots.Contains(target.Substring(0, separator))) return true;
+                separator = Math.Max(target.LastIndexOf('.', separator - 1), target.LastIndexOf('[', separator - 1));
+            }
+            return false;
         }
 
         internal ProjectionKill? Kill { get; }
