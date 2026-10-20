@@ -48,6 +48,7 @@ public sealed class SemaphoreSynchronizationTests
     [InlineData("void M() { other.Wait(); try { value++; } finally { other.Release(); } }")]
     [InlineData("void M() { lock (gate) value++; }")]
     [InlineData("void M() { gate.WaitAsync(); value++; }")]
+    [InlineData("async Task M() { dynamic pending = gate.WaitAsync(); await pending.ConfigureAwait(false); value++; }")]
     [InlineData("void M() { var pending = gate.WaitAsync(); gate.Wait(); try { value++; } finally { gate.Release(); } }")]
     [InlineData("async Task M() { await gate.WaitAsync().ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing); value++; }")]
     [InlineData("async Task M() { await gate.WaitAsync(); value++; }")]

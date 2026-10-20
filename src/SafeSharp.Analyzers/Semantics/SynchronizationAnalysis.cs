@@ -296,6 +296,10 @@ internal sealed partial class SynchronizationAnalysis
                 return GuardValue.Unknown;
             }
             case IInvocationOperation invocation: return Invoke(invocation, state, depth + 1);
+            case IDynamicInvocationOperation or IDynamicMemberReferenceOperation or IDynamicIndexerAccessOperation or IDynamicObjectCreationOperation:
+                foreach (var child in operation.ChildOperations)
+                    Escape(Child(child), child, state, "dynamic dispatch can retain the protected reference");
+                InvalidateCapturedCells(state); MayThrow(state); return GuardValue.Unknown;
             case IInvalidOperation invalid when TryEnterLexicalLock(invalid, state, depth, out var locked): return locked;
             case IObjectCreationOperation creation:
             {
