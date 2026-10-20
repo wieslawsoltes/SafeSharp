@@ -242,6 +242,7 @@ internal sealed partial class OperationLowerer
             {
                 var arguments = EvaluateArguments(creation.Arguments, creation.Constructor);
                 ActivateArguments(arguments);
+                InvalidateCallAggregates(creation, creation.Constructor, arguments);
                 MarkMayThrow(creation);
                 ApplyOutputArguments(creation.Arguments, arguments.Values, creation.Constructor is { } constructor ? _summaries.Get(constructor, _cancellationToken) : null);
                 TouchArguments(arguments);
@@ -405,6 +406,7 @@ internal sealed partial class OperationLowerer
             Add(InstructionKind.ActivateBorrow, property, source: receiverLoan, description: "activate mutable receiver at getter call");
         ActivateArguments(arguments);
         if (receiverLoan is not null) Add(InstructionKind.Write, property, source: receiverLoan);
+        InvalidateCallAggregates(property, getter, arguments, owner, property.Instance?.Type);
         MarkMayThrow(property);
         TouchArguments(arguments);
         if (receiverLoan is not null) Add(InstructionKind.Read, property, source: receiverLoan);
@@ -526,6 +528,7 @@ internal sealed partial class OperationLowerer
         ActivateArguments(arguments);
         if (receiverLoan is not null) Add(InstructionKind.Write, invocation, source: receiverLoan);
         TransferCallbackCaptures(invocation);
+        InvalidateCallAggregates(invocation, method, arguments, instance, invocation.Instance?.Type);
         MarkMayThrow(invocation);
         ApplyOutputArguments(invocation.Arguments, arguments.Values, summary);
         TouchArguments(arguments);
@@ -678,6 +681,7 @@ internal sealed partial class OperationLowerer
         var arguments = new CallArguments();
         if (source is not null) AddArgument(arguments, source, method.Parameters.FirstOrDefault(), conversion, method, summary);
         ActivateArguments(arguments);
+        InvalidateCallAggregates(conversion, method, arguments);
         MarkMayThrow(conversion);
         TouchArguments(arguments);
         string? result = null;

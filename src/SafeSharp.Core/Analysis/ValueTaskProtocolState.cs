@@ -164,7 +164,7 @@ internal sealed class ValueTaskProtocolState : IEquatable<ValueTaskProtocolState
                 else
                 {
                     var caches = OwnershipTransfer.IncludingFactoryResults(state, state.Resolve(instruction.Source), transferOnly: true)
-                        .Where(reference => state.Resources.ContainsKey(reference.ResourceId))
+                        .Where(reference => reference.Projection.Length == 0 && state.Resources.ContainsKey(reference.ResourceId))
                         .SelectMany(reference => OwnershipTransfer.ContainedCaches(state.Resources[reference.ResourceId], transferOnly: true))
                         .Distinct(StringComparer.Ordinal).ToDictionary(cache => cache, cache => Resolve(cache).ToArray(), StringComparer.Ordinal);
                     foreach (var reference in references.Concat(contained))
@@ -186,9 +186,9 @@ internal sealed class ValueTaskProtocolState : IEquatable<ValueTaskProtocolState
                 break;
             case InstructionKind.SetAggregateElement:
                 var owners = state.Resolve(instruction.Owner);
-                if (owners.Count == 0 || owners.Any(owner => !state.Resources.TryGetValue(owner.ResourceId, out var aggregate) || aggregate.Kind != ResourceKind.Aggregate))
+                if (owners.Count == 0 || owners.Any(owner => owner.Projection.Length != 0 || !state.Resources.TryGetValue(owner.ResourceId, out var aggregate) || aggregate.Kind != ResourceKind.Aggregate))
                 {
-                    var mayRetainLocally = owners.Any(owner => state.Resources.TryGetValue(owner.ResourceId, out var aggregate) && aggregate.Kind == ResourceKind.Aggregate);
+                    var mayRetainLocally = owners.Any(owner => owner.Projection.Length == 0 && state.Resources.TryGetValue(owner.ResourceId, out var aggregate) && aggregate.Kind == ResourceKind.Aggregate);
                     var represented = references.Concat(ContainedProtocols(state, state.Resolve(instruction.Source)));
                     Validate(instruction, mayRetainLocally ? represented.Select(value => value.WithAbsence(false)) : represented, issues);
                     var stored = references.Concat(ContainedProtocols(state, state.Resolve(instruction.Source), transferOnly: true));
@@ -201,7 +201,7 @@ internal sealed class ValueTaskProtocolState : IEquatable<ValueTaskProtocolState
                 Assign(instruction.Target!, Array.Empty<ReferenceFact>());
                 break;
             case InstructionKind.ReceiveAsyncResult:
-                Assign(instruction.Target!, state.Resolve(instruction.Source)
+                Assign(instruction.Target!, state.Resolve(instruction.Source).Where(carrier => carrier.Projection.Length == 0)
                     .SelectMany(carrier => Resolve(OwnershipTransfer.AsyncResultCache(carrier.ResourceId))));
                 break;
             case InstructionKind.CreateAggregate:

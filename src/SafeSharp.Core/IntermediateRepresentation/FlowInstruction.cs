@@ -48,7 +48,9 @@ public enum InstructionKind
     /// <summary>Ends a temporary storage binding without overwriting the value in its targets.</summary>
     ReleaseReference,
     /// <summary>Observes only a composed proxy, without discarding an ordinary generic factory output.</summary>
-    ObserveAsyncComposition
+    ObserveAsyncComposition,
+    /// <summary>Weakens represented aggregate contents which an unmodeled call may replace.</summary>
+    InvalidateAggregateContents
 }
 
 public enum ResourceOwnership { Owned, Borrowed, External, Scoped }
@@ -141,6 +143,7 @@ public sealed class FlowInstruction
             kind == InstructionKind.ConsumeValueTask || kind == InstructionKind.PreserveAwaitable ||
             kind == InstructionKind.SetAggregateElement || kind == InstructionKind.ReadAggregateElement ||
             kind == InstructionKind.BeginAsyncComposition || kind == InstructionKind.CompleteAsyncComposition || kind == InstructionKind.ObserveAsyncComposition ||
+            kind == InstructionKind.InvalidateAggregateContents ||
             kind == InstructionKind.BindReference || kind == InstructionKind.MergeReference) && string.IsNullOrEmpty(source))
             throw new ArgumentException("This instruction requires a source place.", nameof(source));
     }

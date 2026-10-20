@@ -38,6 +38,9 @@ internal sealed partial class OwnershipTransfer
             case InstructionKind.ReadAggregateElement:
                 ReadAggregateElement(state, instruction, references, liveAfter, issues);
                 break;
+            case InstructionKind.InvalidateAggregateContents:
+                InvalidateAggregateContents(state, references);
+                break;
             case InstructionKind.BeginAsyncComposition:
                 BeginAsyncComposition(state, instruction, references, blockId, instructionIndex, liveAfter, issues);
                 break;
@@ -124,7 +127,7 @@ internal sealed partial class OwnershipTransfer
                 foreach (var reference in references)
                 {
                     ObserveComposedDisposal(state, instruction, reference);
-                    if (state.Resources.TryGetValue(reference.ResourceId, out var composition) && composition.Composition != AsyncCompositionKind.None)
+                    if (reference.Projection.Length == 0 && state.Resources.TryGetValue(reference.ResourceId, out var composition) && composition.Composition != AsyncCompositionKind.None)
                         state.Resources[composition.Id] = composition.Transition(TransferStatus(composition.Status, ResourceStatus.Completed, !reference.CoversResource),
                             "composition-observation", "The composed operation is observed without assuming successful payload production.", instruction.Site);
                 }

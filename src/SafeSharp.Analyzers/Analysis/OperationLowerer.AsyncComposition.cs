@@ -12,6 +12,42 @@ internal sealed partial class OperationLowerer
     private static bool TracksOwnershipValue(ITypeSymbol? type) => SymbolFacts.IsTracked(type) || IsValueTaskType(type) ||
         type is IArrayTypeSymbol array && TracksOwnershipValue(array.ElementType);
 
+    private void InvalidateCallAggregates(IOperation operation, IMethodSymbol? method, CallArguments arguments,
+        string? receiver = null, ITypeSymbol? receiverType = null)
+    {
+        if (method is null || _summaries.AsyncResults.Classify(method) != AsyncResultOriginOperation.None ||
+            _summaries.AsyncResults.ClassifyComposition(method) != AsyncCompositionKind.None) return;
+        foreach (var argument in arguments.Values)
+        {
+            if (argument.Key < 0 || argument.Key >= method.Parameters.Length) continue;
+            var parameter = method.Parameters[argument.Key];
+            if (parameter.RefKind == RefKind.Out || !MayRepresentAggregate(parameter.Type) ||
+                SymbolFacts.HasAttribute(parameter, "Borrowed") || SymbolFacts.HasAttribute(parameter, "Consumes") || SymbolFacts.HasAttribute(parameter, "Owned")) continue;
+            Add(InstructionKind.InvalidateAggregateContents, operation, source: argument.Value,
+                description: "retain possible original elements across an unmodeled call mutation");
+        }
+        if (receiver is not null && MayRepresentAggregate(receiverType) && !IsArrayQuery(method, receiverType))
+            Add(InstructionKind.InvalidateAggregateContents, operation, source: receiver,
+                description: "retain possible original elements across an unmodeled receiver mutation");
+    }
+
+    private static bool MayRepresentAggregate(ITypeSymbol? type) => type is IArrayTypeSymbol ||
+        type?.SpecialType is SpecialType.System_Object or SpecialType.System_Array || type?.TypeKind is TypeKind.Interface or TypeKind.TypeParameter ||
+        type is INamedTypeSymbol named && (SymbolFacts.IsMemoryView(named) ||
+            OwnedAwaitablePayload(named) is { } payload && MayRepresentAggregate(payload));
+
+    private static bool IsArrayQuery(IMethodSymbol method, ITypeSymbol? receiverType)
+    {
+        // Arrays have no user-defined instance implementation. Only these framework queries
+        // and copies have an explicit non-mutation model; SetValue and Initialize do not.
+        var type = method.ContainingType;
+        if (type.ContainingAssembly.Identity.Name is not ("System.Private.CoreLib" or "mscorlib" or "System.Runtime" or "netstandard")) return false;
+        return type.SpecialType == SpecialType.System_Array && method.Name is "GetValue" or "GetLength" or "GetLongLength" or
+            "GetLowerBound" or "GetUpperBound" or "get_Length" or "get_LongLength" or "get_Rank" or "get_IsReadOnly" or
+            "get_IsFixedSize" or "get_IsSynchronized" or "get_SyncRoot" or "GetEnumerator" or "Clone" or "CopyTo" ||
+            receiverType is IArrayTypeSymbol && type.SpecialType == SpecialType.System_Object;
+    }
+
     private string? ComposeAsync(IInvocationOperation invocation, string? receiver, CallArguments arguments)
     {
         var kind = _summaries.AsyncResults.ClassifyComposition(invocation.TargetMethod);

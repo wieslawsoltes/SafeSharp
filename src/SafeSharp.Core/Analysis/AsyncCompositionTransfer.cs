@@ -41,7 +41,7 @@ internal sealed partial class OwnershipTransfer
         CheckMoved(state, instruction, values, issues);
         foreach (var owner in owners)
         {
-            if (!state.Resources.TryGetValue(owner.ResourceId, out var aggregate) || aggregate.Kind != ResourceKind.Aggregate)
+            if (owner.Projection.Length != 0 || !state.Resources.TryGetValue(owner.ResourceId, out var aggregate) || aggregate.Kind != ResourceKind.Aggregate)
             { external = true; continue; }
             var key = instruction.Projection ?? "[*]";
             var cache = AggregateElementCache(aggregate.Id, key);
@@ -54,7 +54,7 @@ internal sealed partial class OwnershipTransfer
         }
         if (external)
         {
-            var transferred = owners.Any(owner => state.Resources.TryGetValue(owner.ResourceId, out var resource) && resource.Kind == ResourceKind.Aggregate)
+            var transferred = owners.Any(owner => owner.Projection.Length == 0 && state.Resources.TryGetValue(owner.ResourceId, out var resource) && resource.Kind == ResourceKind.Aggregate)
                 ? values.Select(value => value.WithAbsence(false)).ToArray() : values;
             CheckUse(state, instruction, transferred, issues);
             CheckBorrowedEscape(state, instruction, transferred, issues);
@@ -76,7 +76,9 @@ internal sealed partial class OwnershipTransfer
         CheckUse(state, instruction, owners, issues);
         foreach (var owner in owners)
         {
-            if (!state.Resources.TryGetValue(owner.ResourceId, out var aggregate) || aggregate.Kind != ResourceKind.Aggregate)
+            // A structural projection designates a different value. Until its storage is
+            // represented, it cannot reuse the enclosing array's canonical element caches.
+            if (owner.Projection.Length != 0 || !state.Resources.TryGetValue(owner.ResourceId, out var aggregate) || aggregate.Kind != ResourceKind.Aggregate)
             { opaque = true; continue; }
             var key = instruction.Projection ?? "[*]";
             foreach (var element in aggregate.ElementKeys.Where(element => key.IndexOf('*') >= 0 || element == key || element.IndexOf('*') >= 0))
@@ -99,6 +101,24 @@ internal sealed partial class OwnershipTransfer
         CheckOverwrite(state, instruction, instruction.Target!, values, issues, liveAfter);
         state.Assign(instruction.Target!, values, nullable);
         state.ValueTasks.Assign(instruction.Target!, protocols);
+    }
+
+    private static void InvalidateAggregateContents(AbstractState state, ReferenceFact[] roots)
+    {
+        // An opaque call can replace an array element while another local still owns its old
+        // value. Keep that value as a possible element, without allowing cleanup through the
+        // stale array cache to prove that every original owner has been released. Independent
+        // by-value snapshots remain exact. No replacement receives an invented fresh identity.
+        var aggregates = IncludingFactoryResults(state, roots).Where(reference => reference.Projection.Length == 0 &&
+                state.Resources.TryGetValue(reference.ResourceId, out var resource) && resource.Kind == ResourceKind.Aggregate)
+            .Select(reference => reference.ResourceId).Distinct(StringComparer.Ordinal).ToArray();
+        foreach (var id in aggregates)
+        foreach (var key in state.Resources[id].ElementKeys)
+        {
+            var cache = AggregateElementCache(id, key);
+            state.Assign(cache, state.Resolve(cache).Select(value => value.WithAbsence(false)), mayBeNull: true);
+            state.ValueTasks.Assign(cache, state.ValueTasks.Resolve(cache).Select(value => value.WithAbsence(false)));
+        }
     }
 
     private static void BeginAsyncComposition(AbstractState state, FlowInstruction instruction, ReferenceFact[] dependencies,
@@ -133,7 +153,7 @@ internal sealed partial class OwnershipTransfer
             var many = candidates.Select(candidate => candidate.ResourceId).Distinct(StringComparer.Ordinal).Skip(1).Any();
             state.Assign(AsyncResultCache(id), candidates.Select(candidate => many ? candidate.WithAbsence(false) : candidate));
             state.Resources[id] = state.Resources[id].WithResultState(AsyncResultState.Materialized |
-                (dependencies.Any(dependency => !state.Resources.TryGetValue(dependency.ResourceId, out var aggregate) || aggregate.Kind != ResourceKind.Aggregate)
+                (dependencies.Any(dependency => dependency.Projection.Length != 0 || !state.Resources.TryGetValue(dependency.ResourceId, out var aggregate) || aggregate.Kind != ResourceKind.Aggregate)
                     ? AsyncResultState.Deferred : AsyncResultState.None));
         }
     }
@@ -155,9 +175,9 @@ internal sealed partial class OwnershipTransfer
             state.Resources[id] = state.Resources[id].WithElement(group.Key);
         }
         var snapshots = new List<ReferenceFact>();
-        if (inputs.Any(input => state.Resources.TryGetValue(input.ResourceId, out var aggregate) && aggregate.Kind == ResourceKind.Aggregate))
+        if (inputs.Any(input => input.Projection.Length == 0 && state.Resources.TryGetValue(input.ResourceId, out var aggregate) && aggregate.Kind == ResourceKind.Aggregate))
             snapshots.Add(new ReferenceFact(id, coversResource: !retained));
-        snapshots.AddRange(inputs.Where(input => !state.Resources.TryGetValue(input.ResourceId, out var aggregate) || aggregate.Kind != ResourceKind.Aggregate));
+        snapshots.AddRange(inputs.Where(input => input.Projection.Length != 0 || !state.Resources.TryGetValue(input.ResourceId, out var aggregate) || aggregate.Kind != ResourceKind.Aggregate));
         state.Forget(place);
         return snapshots.ToArray();
     }
@@ -166,7 +186,7 @@ internal sealed partial class OwnershipTransfer
     {
         foreach (var input in inputs)
         {
-            if (!state.Resources.TryGetValue(input.ResourceId, out var aggregate) || aggregate.Kind != ResourceKind.Aggregate) continue;
+            if (input.Projection.Length != 0 || !state.Resources.TryGetValue(input.ResourceId, out var aggregate) || aggregate.Kind != ResourceKind.Aggregate) continue;
             foreach (var key in aggregate.ElementKeys.OrderBy(key => key, StringComparer.Ordinal))
                 yield return (key, state.Resolve(AggregateElementCache(aggregate.Id, key))
                     .Select(value => input.CoversResource ? value : value.WithAbsence(false)).ToArray());
@@ -178,15 +198,15 @@ internal sealed partial class OwnershipTransfer
     {
         var active = new HashSet<string>(StringComparer.Ordinal);
         foreach (var reference in references)
-            if (state.Resources.TryGetValue(reference.ResourceId, out var resource) && resource.Composition != AsyncCompositionKind.None)
+            if (reference.Projection.Length == 0 && state.Resources.TryGetValue(reference.ResourceId, out var resource) && resource.Composition != AsyncCompositionKind.None)
                 ReceiveComposition(state, instruction, reference, blockId, index, liveAfter, issues, active);
     }
 
     private static void ObserveComposedDisposal(AbstractState state, FlowInstruction instruction, ReferenceFact reference)
     {
-        if (!state.Resources.TryGetValue(reference.ResourceId, out var resource) || resource.Composition != AsyncCompositionKind.WhenAll) return;
+        if (reference.Projection.Length != 0 || !state.Resources.TryGetValue(reference.ResourceId, out var resource) || resource.Composition != AsyncCompositionKind.WhenAll) return;
         foreach (var input in AggregateInputs(state, state.Resolve(AsyncDependencyCache(resource.Id))).SelectMany(element => element.Values))
-            if (state.Resources.TryGetValue(input.ResourceId, out var completion) && completion.Kind == ResourceKind.AsyncDisposalCompletion)
+            if (input.Projection.Length == 0 && state.Resources.TryGetValue(input.ResourceId, out var completion) && completion.Kind == ResourceKind.AsyncDisposalCompletion)
                 state.Resources[completion.Id] = completion.Transition(TransferStatus(completion.Status, ResourceStatus.Completed,
                     !reference.CoversResource || !input.CoversResource), "completion", "WhenAll observes every disposal completion, including when one faults.", instruction.Site);
     }
@@ -199,6 +219,7 @@ internal sealed partial class OwnershipTransfer
     private static void ReceiveComposition(AbstractState state, FlowInstruction instruction, ReferenceFact reference,
         int blockId, int index, ISet<string> liveAfter, IssueCollector? issues, HashSet<string> active)
     {
+        if (reference.Projection.Length != 0) return;
         var carrier = state.Resources[reference.ResourceId];
         if (carrier.Composition == AsyncCompositionKind.None || (carrier.ResultState & AsyncResultState.Deferred) == 0 || !active.Add(carrier.Id)) return;
         var resultCache = AsyncResultCache(carrier.Id);
@@ -219,7 +240,7 @@ internal sealed partial class OwnershipTransfer
         else
         {
             var elements = AggregateInputs(state, dependencies).ToArray();
-            var unknown = dependencies.Any(dependency => !state.Resources.TryGetValue(dependency.ResourceId, out var aggregate) || aggregate.Kind != ResourceKind.Aggregate);
+            var unknown = dependencies.Any(dependency => dependency.Projection.Length != 0 || !state.Resources.TryGetValue(dependency.ResourceId, out var aggregate) || aggregate.Kind != ResourceKind.Aggregate);
             if (carrier.Composition == AsyncCompositionKind.WhenAny)
             {
                 var choices = elements.SelectMany(element => element.Values).ToArray();
@@ -271,13 +292,13 @@ internal sealed partial class OwnershipTransfer
         {
             if (!state.Resources.TryGetValue(dependency.ResourceId, out var resource)) continue;
             CheckMoved(state, instruction, new[] { dependency }, issues);
-            if (resource.Kind == ResourceKind.AsyncDisposalCompletion)
+            if (dependency.Projection.Length == 0 && resource.Kind == ResourceKind.AsyncDisposalCompletion)
             {
                 state.Resources[resource.Id] = resource.Transition(TransferStatus(resource.Status, ResourceStatus.Completed, !dependency.CoversResource),
                     "completion", "Successful completion of the composed task observes this disposal completion.", instruction.Site);
                 continue;
             }
-            if (resource.Composition != AsyncCompositionKind.None)
+            if (dependency.Projection.Length == 0 && resource.Composition != AsyncCompositionKind.None)
             {
                 if (active.Contains(resource.Id)) continue; // A finite allocation-site cycle gives no fresh output evidence.
                 ReceiveComposition(state, instruction, dependency, blockId, index, liveAfter, issues, active);

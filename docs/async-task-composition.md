@@ -73,6 +73,27 @@ Unknown indices produce alternatives; they do not prove that every element was
 visited or disposed. Allocation sites retained across loop iterations use weak
 updates so a new array cannot silently reactivate an older aliased element.
 
+An unmodeled call can replace an array element. SafeSharp weakens represented
+element contents before the call's possible exception boundary, including for
+array values passed through `object`, interfaces, constructors, and writable
+reference arguments. Cleanup through a later element read therefore cannot
+definitively discharge an owner that the call may have removed from the array:
+
+```csharp
+var values = new[] { new Resource() };
+Unknown(values);       // May replace values[0], even before throwing.
+values[0].Dispose();   // The original resource can still have an SS0003 obligation.
+```
+
+An independently captured resource value remains available for explicit cleanup.
+The input snapshot already captured by `WhenAll` or `WhenAny` also retains its
+original task identities. Trusted async operations, explicit shared `[Borrowed]`
+parameter contracts, and modeled framework array queries preserve their stated
+semantics. Ordinary source helpers do not acquire a no-mutation promise merely
+because their source is available: general array-element effect summaries remain
+a boundary. This conservative content invalidation does not infer arbitrary
+callee disposal, retention, or replacement ownership.
+
 ValueTask consumption capabilities also follow represented array elements and
 nested carrier caches. Copying a `ValueTask` out of the same element twice retains
 one capability, and returning an already consumed capability inside an aggregate
@@ -119,7 +140,8 @@ a limit reports `SS0015` rather than silently dropping dependencies.
   failed. It does not infer which individual tasks succeeded from an exception.
 - Unknown-index and external heap contents remain conservative. Precise mutable
   ref aliases into aggregate element caches and arbitrary container ownership
-  contracts require additional storage models.
+  contracts require additional storage models. An unrepresented structural
+  projection cannot reuse its enclosing aggregate's element or task-result cache.
 - Runtime readiness, races with concurrent array mutation, custom awaiter or
   builder internals, and scheduler behavior are not proven by this sequential
   ownership domain.
