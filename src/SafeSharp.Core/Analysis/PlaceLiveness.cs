@@ -157,7 +157,7 @@ internal sealed class PlaceLiveness
         private static bool IsReferenceTarget(string target, ISet<string> referenceRoots, CancellationToken cancellationToken)
         {
             if (referenceRoots.Count == 0) return false;
-            if (referenceRoots.Contains(target)) return true;
+            if (referenceRoots.Contains(target) || referenceRoots.Contains(string.Empty)) return true;
             var separator = Math.Max(target.LastIndexOf('.'), target.LastIndexOf('['));
             while (separator > 0)
             {

@@ -357,14 +357,10 @@ public sealed class PlaceLivenessTests
     private static void AssertMatchesOracle(IReadOnlyDictionary<int, FlowBlock> blocks, int budget)
     {
         var predecessors = Predecessors(blocks);
-        // Preserve the frozen pre-ref-storage solver as an independent oracle. The newer
-        // MergeReference opcode has the same structural liveness as its existing MergeAlias
-        // instruction: it reads the previous target as well as the new source.
-        var oracleBlocks = blocks.ToDictionary(pair => pair.Key, pair => new FlowBlock(pair.Value.Id,
-            pair.Value.Instructions.Select(instruction => instruction.Kind == InstructionKind.MergeReference
-                ? new FlowInstruction(InstructionKind.MergeAlias, instruction.Site, instruction.Target, instruction.Source,
-                    owner: instruction.Owner) : instruction), pair.Value.Successors));
-        var expected = HashSetLivenessOracle.Compute(oracleBlocks, predecessors, budget, default);
+        // Both solvers receive the same IR. The independent string-set oracle handles
+        // reference binding and address use directly; translating MergeReference to
+        // MergeAlias would erase the fact that its target can hold a captured address.
+        var expected = HashSetLivenessOracle.Compute(blocks, predecessors, budget, default);
         var actual = PlaceLiveness.Compute(blocks, predecessors, budget, default);
         Assert.Equal(expected.BudgetExceeded, actual.BudgetExceeded);
         foreach (var id in blocks.Keys)
