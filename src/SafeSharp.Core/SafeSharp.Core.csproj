@@ -5,7 +5,7 @@
   </PropertyGroup>
   <ItemGroup>
     <!-- The analyzer uses this asset with the compiler host's Immutable 9 API. -->
-    <PackageReference Include="System.Collections.Immutable" Version="9.0.0" Condition="'$(TargetFramework)' == 'netstandard2.0'" />
+    <PackageReference Include="System.Collections.Immutable" Version="9.0.21" Condition="'$(TargetFramework)' == 'netstandard2.0'" />
     <!-- .NET 10 consumers use the native API. The SDK may prune this reference
          when Immutable is supplied by the target framework itself. -->
     <PackageReference Include="System.Collections.Immutable" Version="10.0.13" Condition="'$(TargetFramework)' == 'net10.0'" />
