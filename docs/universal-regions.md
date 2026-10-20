@@ -2,7 +2,7 @@
 
 The reusable `SafeSharp.Core.Regions.UniversalRegionSolver` checks one binder of universally quantified outlives constraints. A caller declares the universal region names and the relations that are already assumed. Fresh inference names describe the candidate implementation or conversion. Required edges may constrain those inference names, but they must not establish an additional relation between universal regions that the caller never promised.
 
-This is the outlives portion of a universally quantified signature check. It does not implement nested universes, placeholder leak checks, arbitrary Rust higher-ranked type/trait solving, or a complete C# variance engine.
+This API is the first-order outlives portion of a universally quantified signature check. It retains its original one-binder semantics. The separate [higher-ranked region API](higher-ranked-regions.md) adds lexical universes, placeholders, visibility/leak checking and type-outlives obligations; [TypeLifetime contracts](type-lifetimes.md) connect that API to nested Roslyn delegate/type paths and declared variance. Neither API reproduces arbitrary Rust trait/type solving.
 
 ## The compatibility condition
 

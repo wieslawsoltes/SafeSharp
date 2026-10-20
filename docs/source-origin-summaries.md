@@ -1,6 +1,6 @@
 # Source origin summaries
 
-`MethodSummaryProvider` uses explicit ownership and lifetime contracts first. For eligible source methods, `MethodOriginAnalysis` proves a finite set of possible origins for a returned value and for each caller-visible `out` slot. The ownership engine then applies those boundary summaries and independently checks disposal, moves, loans, and lifetime validity.
+`MethodSummaryProvider` uses explicit ownership and lifetime contracts first. For eligible source methods, `MethodOriginAnalysis` proves a finite set of possible origins for a returned value and supported caller-visible `ref`/`out` slots, plus ref-return storage targets and nested async terminal provenance. The ownership engine then applies those boundary summaries and independently checks disposal, moves, loans, and lifetime validity.
 
 An inferred fresh result means that every represented normal-return alternative is a fresh tracked allocation or `null`, with at least one fresh alternative. It does not mean that arbitrary execution succeeds, that disposal cannot throw, or that an allocation remains valid after unsupported external effects. A borrowed result must contain only named input or receiver origins, optionally with `null`. An unknown origin on any alternative prevents either proof.
 
@@ -63,14 +63,16 @@ Nested functions and delegates can retain mutable captured cells. The solver gat
 
 The following boundaries remain explicit:
 
-- Bodies containing catch or finally regions retain opaque inferred origins. Normal CFG edges alone cannot prove values returned by catches or replacements performed by cleanup continuations.
-- Ref-returning methods, ref-return calls, and ref-return getters require explicit contracts. This domain does not infer interprocedural storage-return postconditions.
+- Source summaries and lifetime return analysis share a bounded filter/handler/finally continuation router. Returned values are validated after cleanup; a selected ref-return location is read at the normal exit. Unknown throw/cleanup effects remain conservative, and an unhandled exception produces no normal postcondition.
+- Ref-returning methods/calls/getters can expose parameter storage targets with explicit external/unknown alternatives. Caller locations are captured during argument evaluation. Exact interprocedural exceptional write histories and arbitrary external storage-return contracts remain unmodeled.
 - Field, property, and array-element storage is external to the local origin map. The analysis does not infer a fresh transferable owner merely because a ref to an external field was assigned an allocation.
 - Unknown target operations, dynamic invocation/construction/member access, function-pointer calls, and address-taking retain opaque summaries rather than silently preserving an earlier origin. Event accessor calls invalidate captured variable cells.
 - Compound, deconstruction, and replacement-operator writes invalidate affected slots. A postfix result separately retains its pre-update value origin.
-- General writable ref postconditions, whole-program aliasing, recursive/virtual dispatch, and exact callback mutation effects remain contract boundaries. Explicit contracts remain trusted at these boundaries.
+- Normal-exit parameter/null ref-write postconditions and a bounded fresh-output case are represented. Distinct fresh outputs requiring richer correlations, whole-program aliasing, recursive/virtual dispatch and exact callback mutation effects remain contract boundaries. Explicit contracts remain trusted at these boundaries.
 
-Each source analysis has a 100,000-step work budget, a 4,096-block-visit cap, and a 128-level expression depth cap. Cancellation is checked during traversal, transfer, and joins. Exhaustion yields an opaque summary, never a partially inferred fresh or borrowed result. These are bounds for optional source inference; they do not change the ownership engine's configured limits.
+Each source analysis has a 100,000-step work budget, an 8,192-work-iteration cap, a 4,096-continuation-context cap and a 128-level expression depth cap. Source-call expansion is bounded at depth 24; nested async origin depth is bounded at 16. Cancellation is checked during traversal, transfer, and joins. Exhaustion yields an opaque summary, never a partially inferred fresh or borrowed result. These are bounds for optional source inference; they do not change the ownership engine's configured limits.
+
+The detailed exception routing, normal-output and ref-return semantics are documented in [source summary analysis](source-summary-analysis.md) and [reference storage](reference-storage-analysis.md). The separate borrowed-escape domain still uses conservative handler/capture histories and does not inherit a full exception proof from these summaries.
 
 ## Rust design reference and implementation cost
 

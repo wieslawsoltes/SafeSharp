@@ -15,7 +15,8 @@ namespace SafeSharp.Analyzers.Semantics;
 public sealed class ConcurrencyContractAnalyzer : DiagnosticAnalyzer
 {
     public override ImmutableArray<DiagnosticDescriptor> SupportedDiagnostics => ImmutableArray.Create(
-        ConcurrencyDiagnostics.InvalidConcurrencyContract, ConcurrencyDiagnostics.UnsafeConcurrencyCapture, ConcurrencyDiagnostics.IncompleteContractAnalysis);
+        ConcurrencyDiagnostics.InvalidConcurrencyContract, ConcurrencyDiagnostics.UnsafeConcurrencyCapture,
+        ConcurrencyDiagnostics.IncompleteContractAnalysis, ConcurrencyDiagnostics.MissingSynchronizationGuard);
 
     public override void Initialize(AnalysisContext context)
     {
@@ -24,12 +25,49 @@ public sealed class ConcurrencyContractAnalyzer : DiagnosticAnalyzer
         context.RegisterCompilationStartAction(start =>
         {
             var contracts = new ConcurrencyContracts(start.Compilation);
+            var synchronization = new SynchronizationContracts(start.Compilation);
+            if (synchronization.Available)
+            {
+                start.RegisterOperationBlockAction(block => SynchronizationAnalysis.Analyze(block, synchronization, contracts));
+                start.RegisterSymbolAction(symbol => ValidateSynchronization(symbol, synchronization), SymbolKind.Field, SymbolKind.Property, SymbolKind.Method, SymbolKind.NamedType);
+            }
             if (!contracts.Available) return;
             start.RegisterSymbolAction(symbol => AnalyzeType(symbol, contracts), SymbolKind.NamedType);
             start.RegisterSymbolAction(symbol => AnalyzeMethod(symbol, contracts), SymbolKind.Method);
             start.RegisterSyntaxNodeAction(syntax => AnalyzeGenericName(syntax, contracts), SyntaxKind.GenericName);
             start.RegisterOperationAction(operation => AnalyzeInvocation(operation, contracts), OperationKind.Invocation);
         });
+    }
+
+    private static void ValidateSynchronization(SymbolAnalysisContext context, SynchronizationContracts contracts)
+    {
+        var symbol = context.Symbol;
+        if (symbol.IsImplicitlyDeclared || symbol is INamedTypeSymbol { TypeKind: not TypeKind.Delegate }) return;
+        var declarationMethod = symbol as IMethodSymbol ?? (symbol as INamedTypeSymbol)?.DelegateInvokeMethod;
+        var declarations = declarationMethod is { } method
+            ? contracts.Declared(method).AddRange(contracts.Returns(method)) : contracts.Members(symbol);
+        foreach (var contract in declarations)
+            if (contract.Error is not null) context.ReportDiagnostic(Diagnostic.Create(ConcurrencyDiagnostics.MissingSynchronizationGuard,
+                contract.Location, symbol.Name, contract.Text, contract.Error));
+        if (symbol is IPropertySymbol property)
+            foreach (var inherited in contracts.PropertyBases(property))
+                foreach (var declared in contracts.Members(property).Where(contract => contract.Error is null))
+                    if (!contracts.Members(inherited).Any(contract => contract.SamePath(declared)))
+                        context.ReportDiagnostic(Diagnostic.Create(ConcurrencyDiagnostics.MissingSynchronizationGuard,
+                            declared.Location, property.Name, declared.Text, "an implementation cannot strengthen an inherited property guard"));
+        if (symbol is not IMethodSymbol implementation) return;
+        foreach (var inherited in contracts.Bases(implementation))
+            foreach (var declared in contracts.Returns(implementation).Where(contract => contract.Error is null))
+                if (!contracts.Returns(inherited).Any(contract => contract.SamePath(declared)))
+                    context.ReportDiagnostic(Diagnostic.Create(ConcurrencyDiagnostics.MissingSynchronizationGuard,
+                        declared.Location, implementation.Name, declared.Text, "an implementation cannot add a guard requirement to an inherited return contract"));
+        foreach (var inherited in contracts.Bases(implementation))
+        foreach (var declared in contracts.Declared(implementation).Where(contract => contract.Error is null))
+        {
+            if (contracts.Required(inherited).Any(contract => contract.SamePath(declared) && (contract.Write || !declared.Write))) continue;
+            context.ReportDiagnostic(Diagnostic.Create(ConcurrencyDiagnostics.MissingSynchronizationGuard,
+                declared.Location, implementation.Name, declared.Text, "an implementation cannot strengthen an inherited lock precondition"));
+        }
     }
 
     private static void AnalyzeType(SymbolAnalysisContext context, ConcurrencyContracts contracts)

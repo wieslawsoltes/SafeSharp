@@ -23,8 +23,11 @@ public sealed class LifetimeContractAnalyzer : DiagnosticAnalyzer
     public static readonly DiagnosticDescriptor DelegateContract = Rule("SS0047", "Callback does not satisfy the delegate lifetime contract",
         "Callback '{0}' is incompatible with delegate '{1}': {2}");
 
+    public static readonly DiagnosticDescriptor CallContract = Rule("SS0050", "Call does not satisfy its lifetime contract",
+        "Call to '{0}' does not establish its lifetime contract: {1}");
+
     public override ImmutableArray<DiagnosticDescriptor> SupportedDiagnostics =>
-        ImmutableArray.Create(InvalidDeclaration, ReturnViolation, InheritedContract, BudgetExceeded, DelegateContract);
+        ImmutableArray.Create(InvalidDeclaration, ReturnViolation, InheritedContract, BudgetExceeded, DelegateContract, CallContract);
 
     public override void Initialize(AnalysisContext context)
     {
@@ -35,6 +38,7 @@ public sealed class LifetimeContractAnalyzer : DiagnosticAnalyzer
             var contracts = new LifetimeContractProvider(start.Compilation);
             if (!contracts.Available) return;
             var summaries = new MethodSummaryProvider(start.Compilation);
+            var callEffects = new LifetimeDelegateAnalysis.CallEffectsProvider();
             var declarations = new ConcurrentDictionary<IMethodSymbol, byte>(SymbolEqualityComparer.Default);
             var bodies = new ConcurrentDictionary<IMethodSymbol, byte>(SymbolEqualityComparer.Default);
             start.RegisterSymbolAction(symbolContext =>
@@ -54,6 +58,7 @@ public sealed class LifetimeContractAnalyzer : DiagnosticAnalyzer
                     symbolContext.ReportDiagnostic, symbolContext.CancellationToken);
             }, SymbolKind.NamedType);
             start.RegisterOperationAction(operationContext => LifetimeDelegateAnalysis.Analyze(operationContext, contracts, summaries), OperationKind.DelegateCreation);
+            start.RegisterOperationAction(operationContext => LifetimeDelegateAnalysis.AnalyzeCall(operationContext, contracts, callEffects), OperationKind.Invocation);
             start.RegisterOperationBlockAction(blockContext =>
             {
                 if (blockContext.OwningSymbol is not IMethodSymbol method) return;
@@ -105,15 +110,28 @@ public sealed class LifetimeContractAnalyzer : DiagnosticAnalyzer
                 return;
             }
             string? incompatibility;
-            try { incompatibility = Incompatibility(contract, solved, promised, inheritedSolution, ref comparisonSteps, cancellationToken); }
+            string? typeBudget = null;
+            ImmutableDictionary<string, string?>? typeProperties = null;
+            try
+            {
+                incompatibility = Incompatibility(contract, solved, promised, inheritedSolution, ref comparisonSteps, cancellationToken);
+                if (incompatibility is null)
+                    incompatibility = LifetimeDelegateAnalysis.InheritedTypeMismatch(contract, promised, method, inherited, options, provider.Compilation,
+                        ref comparisonSteps, cancellationToken, out typeBudget, out typeProperties);
+            }
             catch (CompatibilityBudgetException)
             {
                 report(Diagnostic.Create(BudgetExceeded, method.Locations.FirstOrDefault(), method.Name, "inherited-contract comparison steps"));
                 return;
             }
+            if (typeBudget is not null)
+            {
+                report(Diagnostic.Create(BudgetExceeded, method.Locations.FirstOrDefault(), method.Name, typeBudget));
+                return;
+            }
             if (incompatibility is null) continue;
             report(Diagnostic.Create(InheritedContract, method.Locations.FirstOrDefault(), inherited.Locations.Where(location => location.IsInSource),
-                properties: null, messageArgs: new object[] { method.Name, inherited.ToDisplayString(), incompatibility }));
+                properties: typeProperties, messageArgs: new object[] { method.Name, inherited.ToDisplayString(), incompatibility }));
         }
     }
 
@@ -185,6 +203,6 @@ public sealed class LifetimeContractAnalyzer : DiagnosticAnalyzer
 
     private static DiagnosticDescriptor Rule(string id, string title, string message) => new(id, title, message,
         "SafeSharp.Lifetimes", DiagnosticSeverity.Warning, isEnabledByDefault: true,
-        description: "Checks explicit named lifetime regions, borrowed provenance, and one-binder universal outlives obligations at annotated delegate conversions. This is not a full Rust type or trait system.",
+        description: "Checks explicit lifetime regions, borrowed provenance, nested callable binders, declared type variance and type-outlives obligations at inherited contracts and delegate conversions. This is not a full Rust type or trait system.",
         helpLinkUri: "https://github.com/wieslawsoltes/SafeSharp/blob/main/docs/lifetime-regions.md#" + id.ToLowerInvariant());
 }

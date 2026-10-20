@@ -10,7 +10,7 @@ namespace SafeSharp.Analyzers.Analysis;
 /// Lowers semantic operations to explicit ownership effects. Syntax is used only for locations and
 /// stable IDs; classification uses symbols, interface implementations and contracts.
 /// </summary>
-internal sealed class OperationLowerer
+internal sealed partial class OperationLowerer
 {
     private readonly IMethodSymbol _method;
     private readonly MethodSummaryProvider _summaries;
@@ -63,9 +63,12 @@ internal sealed class OperationLowerer
         {
             var returning = block.FallThroughSuccessor?.Semantics == ControlFlowBranchSemantics.Return ||
                             block.ConditionalSuccessor?.Semantics == ControlFlowBranchSemantics.Return;
-            var source = Evaluate(branchValue, read: !returning);
+            var returningReference = returning && (_method.ReturnsByRef || _method.ReturnsByRefReadonly);
+            var source = returningReference ? Address(branchValue) : Evaluate(branchValue, read: !returning);
             if (returning && source is not null)
-                Add(InstructionKind.Alias, branchValue, target: ReturnPlace, source: source, description: "evaluate return value before cleanup");
+                Add(returningReference ? InstructionKind.BindReference : InstructionKind.Alias, branchValue,
+                    target: ReturnPlace, source: source, description: returningReference
+                        ? "capture returned storage before cleanup" : "evaluate return value before cleanup");
         }
         return _instructions;
     }
@@ -76,7 +79,7 @@ internal sealed class OperationLowerer
         {
             // An out parameter has no incoming value; writes target the caller's storage.
             if (parameter.RefKind == RefKind.Out) continue;
-            if (!SymbolFacts.IsTracked(parameter.Type) && !HasOwnershipContract(parameter) &&
+            if (!TracksOwnershipValue(parameter.Type) && !IsValueTaskType(parameter.Type) && !HasOwnershipContract(parameter) &&
                 !SymbolFacts.Implements(parameter.Type, "System.IServiceProvider")) continue;
             var ownership = SymbolFacts.HasAttribute(parameter, "Owned") || SymbolFacts.HasAttribute(parameter, "Consumes")
                 ? ResourceOwnership.Owned : SymbolFacts.HasAttribute(parameter, "Borrowed") || SymbolFacts.HasAttribute(parameter, "BorrowedMut")
@@ -124,7 +127,7 @@ internal sealed class OperationLowerer
         }
     }
 
-    private static bool TracksCapture(ConcurrencyCapture capture) => SymbolFacts.IsTracked(capture.Type) ||
+    private static bool TracksCapture(ConcurrencyCapture capture) => TracksOwnershipValue(capture.Type) || IsValueTaskType(capture.Type) ||
         HasOwnershipContract(capture.Symbol) || SymbolFacts.Implements(capture.Type, "System.IServiceProvider");
 
     private string CapturePlace(ConcurrencyCapture capture) => capture.Name == "this" && capture.Symbol is ITypeSymbol ? "this" : Place(capture.Symbol);
@@ -151,6 +154,9 @@ internal sealed class OperationLowerer
         _seeds.Add(new FlowInstruction(InstructionKind.Allocate, Site(location), target: place, resourceId: "input:" + place,
             ownership: ownership, flags: ResourceFlags(type) | (type?.IsReferenceType == true && place != "this" ? InstructionFlags.MayBeNull : InstructionFlags.None),
             description: ownership + " input " + place));
+        if (IsValueTaskType(type))
+            _seeds.Add(new FlowInstruction(InstructionKind.TrackValueTask, Site(location), target: place,
+                source: place, resourceId: "value-task-input:" + place, description: "track single-consumption ValueTask input"));
     }
 
     private static InstructionFlags ResourceFlags(ITypeSymbol? type) =>
@@ -199,6 +205,7 @@ internal sealed class OperationLowerer
             case IFlowCaptureOperation capture:
             {
                 var value = Evaluate(capture.Value, false);
+                CaptureReferenceStorage(capture, value);
                 if (value is not null) Add(InstructionKind.Alias, capture, target: Capture(capture.Id), source: value);
                 else Add(InstructionKind.Forget, capture, target: Capture(capture.Id));
                 ForgetTemporary(value, capture);
@@ -206,6 +213,7 @@ internal sealed class OperationLowerer
             }
             case IVariableDeclaratorOperation declaration:
             {
+                if (declaration.Symbol.RefKind != RefKind.None) return DeclareReference(declaration);
                 var value = Evaluate(declaration.Initializer?.Value, false);
                 if (value is not null) Add(InstructionKind.Alias, declaration, target: Place(declaration.Symbol), source: value);
                 ForgetTemporary(value, declaration);
@@ -226,22 +234,27 @@ internal sealed class OperationLowerer
                 if (target is not null) Add(InstructionKind.Write, increment, source: target);
                 return target;
             }
+            case ICollectionExpressionOperation collection:
+                return CreateCollection(collection);
+            case IArrayCreationOperation arrayCreation:
+                return CreateArray(arrayCreation);
             case IObjectCreationOperation creation:
             {
                 var arguments = EvaluateArguments(creation.Arguments, creation.Constructor);
                 ActivateArguments(arguments);
-                MarkMayThrow(creation);
+                InvalidateCallAggregates(creation, creation.Constructor, arguments);
+                MarkCallMayThrow(creation, creation.Arguments, arguments);
                 ApplyOutputArguments(creation.Arguments, arguments.Values, creation.Constructor is { } constructor ? _summaries.Get(constructor, _cancellationToken) : null);
                 TouchArguments(arguments);
                 var awaitable = KnownAwaitableCreation(creation, arguments);
                 EndArguments(arguments);
                 if (creation.Initializer is not null) Evaluate(creation.Initializer);
-                if (awaitable is not null) return awaitable;
-                if (!SymbolFacts.IsTracked(creation.Type)) return null;
+                if (awaitable is not null) return TrackProducedValueTask(creation, awaitable);
+                if (!TracksOwnershipValue(creation.Type)) return TrackProducedValueTask(creation, null);
                 var target = Temporary(creation);
                 Add(InstructionKind.Allocate, creation, target: target, resourceId: "new:" + creation.Syntax.SpanStart,
                     flags: ResourceFlags(creation.Type), description: "acquire " + creation.Type?.ToDisplayString());
-                return target;
+                return TrackProducedValueTask(creation, target);
             }
             case IInvocationOperation invocation:
                 return Invoke(invocation);
@@ -251,15 +264,20 @@ internal sealed class OperationLowerer
                 Add(InstructionKind.Suspend, awaitOperation, description: "await suspension point");
                 if (value is not null)
                 {
+                    if (IsValueTaskType(awaitOperation.Operation.Type))
+                        Add(InstructionKind.ConsumeValueTask, awaitOperation, source: value, description: "consume ValueTask once before completion can fault");
                     Add(InstructionKind.CompleteAsyncDispose, awaitOperation, source: value, description: "observe awaited disposal completion");
-                    if (IsFrameworkAwaitableType(awaitOperation.Operation.Type) && SymbolFacts.IsTracked(awaitOperation.Type))
-                        Add(InstructionKind.ObserveAsyncFactory, awaitOperation, source: value,
+                    if (IsFrameworkAwaitableType(awaitOperation.Operation.Type))
+                        Add(TracksOwnershipValue(awaitOperation.Type) ? InstructionKind.ObserveAsyncFactory : InstructionKind.ObserveAsyncComposition, awaitOperation, source: value,
                             description: "observe factory completion before a possible asynchronous fault");
                 }
                 // Observing a faulted completion still fulfills the obligation to await it. The fault
                 // may then propagate, before a successful factory result becomes available.
                 MarkMayThrow(awaitOperation);
-                var result = ReceiveAwaitedResult(awaitOperation, value, IsFrameworkAwaitableType(awaitOperation.Operation.Type));
+                if (IsFrameworkAwaitableType(awaitOperation.Operation.Type)) CompleteComposition(awaitOperation, value);
+                var result = IsFrameworkAwaitableType(awaitOperation.Operation.Type)
+                    ? ReceiveAwaitedResult(awaitOperation, value, true)
+                    : ReceiveCustomAwaitedResult(awaitOperation, value);
                 ForgetTemporary(value, awaitOperation);
                 return result;
             }
@@ -267,18 +285,14 @@ internal sealed class OperationLowerer
             {
                 var owner = Evaluate(field.Instance);
                 var place = field.Field.IsStatic ? Place(field.Field) : (owner ?? "this") + "." + field.Field.Name;
-                if (SymbolFacts.IsTracked(field.Type) || HasOwnershipContract(field.Field))
+                if (TracksOwnershipValue(field.Type) || IsValueTaskType(field.Type) || HasOwnershipContract(field.Field))
                     Seed(place, field.Type, SymbolFacts.HasAttribute(field.Field, "Borrowed") ? ResourceOwnership.Borrowed : ResourceOwnership.External, field.Syntax.GetLocation());
                 return Use(place, field, read);
             }
             case IPropertyReferenceOperation property:
                 return Property(property, read);
             case IArrayElementReferenceOperation element:
-            {
-                var owner = Evaluate(element.ArrayReference);
-                foreach (var index in element.Indices) Evaluate(index);
-                return owner is null ? null : Use(owner + "[" + string.Join(",", element.Indices.Select(i => i.ConstantValue.HasValue ? i.ConstantValue.Value?.ToString() ?? "null" : "*")) + "]", element, read);
-            }
+                return ReadArrayElement(element, read);
             case IIsNullOperation isNull:
                 Evaluate(isNull.Operand, false); return null;
             case IBinaryOperation binary when binary.OperatorKind is BinaryOperatorKind.Equals or BinaryOperatorKind.NotEquals &&
@@ -311,6 +325,9 @@ internal sealed class OperationLowerer
 
     private string? Assign(ISimpleAssignmentOperation assignment)
     {
+        if (!assignment.IsRef && assignment.Target is IArrayElementReferenceOperation element && TracksOwnershipValue(element.Type))
+            return AssignArrayElement(assignment, element);
+        if (assignment.IsRef) return RebindReference(assignment);
         var target = Address(assignment.Target, writeReceiver: true);
         var source = Evaluate(assignment.Value, false);
         if (target is null) return source;
@@ -333,7 +350,7 @@ internal sealed class OperationLowerer
         {
             case ILocalReferenceOperation local: return Place(local.Local);
             case IParameterReferenceOperation parameter: return Place(parameter.Parameter);
-            case IFlowCaptureReferenceOperation capture: return Capture(capture.Id);
+            case IFlowCaptureReferenceOperation capture: return ReferenceCapture(capture.Id);
             case IDiscardOperation: return "$discard:" + operation.Syntax.SpanStart;
             case IFieldReferenceOperation field:
             {
@@ -341,6 +358,8 @@ internal sealed class OperationLowerer
                 if (owner is not null && writeReceiver) Add(InstructionKind.Write, field, source: owner);
                 return field.Field.IsStatic ? Place(field.Field) : (owner ?? "this") + "." + field.Field.Name;
             }
+            case IPropertyReferenceOperation property when property.Property.ReturnsByRef || property.Property.ReturnsByRefReadonly:
+                return Property(property, false);
             case IPropertyReferenceOperation property:
             {
                 var owner = Evaluate(property.Instance, false);
@@ -349,12 +368,7 @@ internal sealed class OperationLowerer
                 return (owner ?? "static:" + property.Property.ContainingType.ToDisplayString()) + "." + property.Property.Name;
             }
             case IArrayElementReferenceOperation element:
-            {
-                var owner = Evaluate(element.ArrayReference, false);
-                foreach (var index in element.Indices) Evaluate(index);
-                if (owner is not null && writeReceiver) Add(InstructionKind.Write, element, source: owner);
-                return owner is null ? null : owner + "[" + string.Join(",", element.Indices.Select(i => i.ConstantValue.HasValue ? i.ConstantValue.Value?.ToString() ?? "null" : "*")) + "]";
-            }
+                return AddressArrayElement(element, writeReceiver);
             default: return Evaluate(operation, false);
         }
     }
@@ -366,8 +380,11 @@ internal sealed class OperationLowerer
         if (owner is not null && property.Property.Name == "Result" && property.Arguments.IsEmpty && getter is not null &&
             IsFrameworkAwaitableMethod(getter) && OwnedAwaitablePayload(property.Instance?.Type) is not null)
         {
+            if (IsValueTaskType(property.Instance?.Type))
+                Add(InstructionKind.ConsumeValueTask, property, source: owner, description: "consume ValueTask through Result");
             Add(InstructionKind.ObserveAsyncFactory, property, source: owner, description: "observe factory completion before reading Result");
             MarkMayThrow(property);
+            CompleteComposition(property, owner);
             return ReleaseReceiverSnapshot(owner, property, ReceiveAwaitedResult(property, owner, true));
         }
         var contract = getter is not null ? _summaries.Get(getter, _cancellationToken) : null;
@@ -384,12 +401,14 @@ internal sealed class OperationLowerer
             Add(InstructionKind.ActivateBorrow, property, source: receiverLoan, description: "activate mutable receiver at getter call");
         ActivateArguments(arguments);
         if (receiverLoan is not null) Add(InstructionKind.Write, property, source: receiverLoan);
+        InvalidateCallAggregates(property, getter, arguments, owner, property.Instance?.Type);
         MarkMayThrow(property);
         TouchArguments(arguments);
         if (receiverLoan is not null) Add(InstructionKind.Read, property, source: receiverLoan);
 
         string? Finish(string? result)
         {
+            result = TrackProducedValueTask(property, result, preserveExisting: result is not null);
             EndArguments(arguments);
             if (receiverLoan is not null) Add(InstructionKind.ReleaseLoan, property, target: receiverLoan);
             return ReleaseReceiverSnapshot(owner, property, result);
@@ -397,6 +416,10 @@ internal sealed class OperationLowerer
 
         if (property.Property.Name == "ServiceProvider" && owner is not null && SymbolFacts.Implements(property.Type, "System.IServiceProvider"))
             return Finish(Use(owner, property, read));
+        if (getter is not null && contract is not null && ReturnedReference(property, getter, contract, arguments) is { } reference)
+            return Finish(reference);
+        if (getter is not null && contract is not null && ReconstructAsyncReturn(property, getter, contract, receiverLoan ?? owner, arguments) is { } nested)
+            return Finish(nested);
         if (contract?.ReturnsOwned == true)
         {
             var target = Temporary(property);
@@ -414,7 +437,7 @@ internal sealed class OperationLowerer
                 property, target: target, source: receiverLoan ?? owner, description: "borrow framework view " + property.Property.Name);
             return Finish(target);
         }
-        if (!SymbolFacts.IsTracked(property.Type)) return Finish(null);
+        if (!TracksOwnershipValue(property.Type)) return Finish(null);
         // An opaque getter may compute an unrelated value. A textual receiver.member projection
         // would invent a lifetime dependency, especially after a local receiver is reassigned.
         var external = Temporary(property);
@@ -443,23 +466,36 @@ internal sealed class OperationLowerer
                 resourceId: "async-dispose:" + invocation.Syntax.SpanStart,
                 flags: InstructionFlags.DisposalAlreadyInvoked | (invocation.IsImplicit ? InstructionFlags.Implicit : InstructionFlags.None),
                 description: "track asynchronous disposal completion");
-            return ReleaseReceiverSnapshot(instance, invocation, completion);
+            return ReleaseReceiverSnapshot(instance, invocation, TrackProducedValueTask(invocation, completion));
         }
         if (IsCompletionWrapper(method))
         {
             foreach (var argument in invocation.Arguments) Evaluate(argument.Value);
             if (instance is not null) Add(InstructionKind.Read, invocation, source: instance);
+            var reusable = instance is not null && IsValueTaskType(method.ContainingType) && method.Name is "AsTask" or "Preserve";
+            if (reusable) Add(InstructionKind.ConsumeValueTask, invocation, source: instance!,
+                description: "consume original ValueTask when converting to a reusable awaitable");
             MarkMayThrow(invocation);
+            if (reusable)
+            {
+                var result = Temporary(invocation);
+                Add(InstructionKind.PreserveAwaitable, invocation, target: result, source: instance!,
+                    description: "retain carrier and payload identity in reusable " + method.Name + " result");
+                return ReleaseReceiverSnapshot(instance, invocation, result);
+            }
             return ReleaseReceiverSnapshot(instance, invocation, instance);
         }
         if (IsCompletionObservation(method))
         {
+            if (instance is not null && IsValueTaskType(method.ContainingType))
+                Add(InstructionKind.ConsumeValueTask, invocation, source: instance, description: "consume ValueTask through GetResult");
             if (instance is not null) Add(InstructionKind.CompleteAsyncDispose, invocation, source: instance,
                 description: "observe disposal completion through " + method.Name);
-            var producesResult = instance is not null && method.Name == "GetResult" && SymbolFacts.IsTracked(invocation.Type);
-            if (producesResult) Add(InstructionKind.ObserveAsyncFactory, invocation, source: instance,
+            var producesResult = instance is not null && method.Name == "GetResult" && TracksOwnershipValue(invocation.Type);
+            if (instance is not null) Add(producesResult ? InstructionKind.ObserveAsyncFactory : InstructionKind.ObserveAsyncComposition, invocation, source: instance,
                 description: "observe factory completion before GetResult returns or faults");
             MarkMayThrow(invocation);
+            CompleteComposition(invocation, instance);
             return ReleaseReceiverSnapshot(instance, invocation, producesResult ? ReceiveAwaitedResult(invocation, instance, true) : null);
         }
         var summary = _summaries.Get(method, _cancellationToken);
@@ -487,19 +523,24 @@ internal sealed class OperationLowerer
         ActivateArguments(arguments);
         if (receiverLoan is not null) Add(InstructionKind.Write, invocation, source: receiverLoan);
         TransferCallbackCaptures(invocation);
-        MarkMayThrow(invocation);
+        InvalidateCallAggregates(invocation, method, arguments, instance, invocation.Instance?.Type);
+        MarkCallMayThrow(invocation, invocation.Arguments, arguments);
         ApplyOutputArguments(invocation.Arguments, arguments.Values, summary);
         TouchArguments(arguments);
         if (receiverLoan is not null) Add(InstructionKind.Read, invocation, source: receiverLoan);
 
         string? Finish(string? result)
         {
+            result = TrackProducedValueTask(invocation, result, preserveExisting: result is not null);
             EndArguments(arguments);
             if (receiverLoan is not null) Add(InstructionKind.ReleaseLoan, invocation, target: receiverLoan);
             return ReleaseReceiverSnapshot(instance, invocation, result);
         }
 
-        if (IsKnownResultProducer(method) && OwnedAwaitablePayload(invocation.Type) is { } producedType && SymbolFacts.IsTracked(producedType))
+        if (ComposeAsync(invocation, instance, arguments) is { } composition) return Finish(composition);
+
+        if (IsKnownResultProducer(method) && OwnedAwaitablePayload(invocation.Type) is { } producedType &&
+            (TracksOwnershipValue(producedType) || IsValueTaskType(producedType)))
         {
             arguments.Values.TryGetValue(0, out var result);
             return Finish(BindAwaitableResult(invocation, result));
@@ -526,26 +567,30 @@ internal sealed class OperationLowerer
                 description: "resolve container-owned service");
             return Finish(target);
         }
+        if (ReturnedReference(invocation, method, summary, arguments) is { } reference)
+            return Finish(reference);
+        if (ReconstructAsyncReturn(invocation, method, summary, receiverLoan ?? instance, arguments) is { } nested)
+            return Finish(nested);
         if (ReturnedBorrow(invocation, method, summary, receiverLoan ?? instance, arguments) is { } borrowed)
             return Finish(borrowed);
         // The contract describes T, not Task<T>'s IDisposable implementation. Preserve the
         // carrier through ordinary places and aliases; only successful result reception owns T.
         if (summary.ReturnsOwned && OwnedAwaitablePayload(invocation.Type) is { } payload)
         {
-            if (!SymbolFacts.IsTracked(payload)) return Finish(null);
+            if (!TracksOwnershipValue(payload)) return Finish(null);
             var target = Temporary(invocation);
             Add(InstructionKind.BeginAsyncFactory, invocation, target: target, resourceId: "async-factory:" + invocation.Syntax.SpanStart,
                 flags: ResourceFlags(payload), description: "track deferred owned result of " + method.ToDisplayString());
             return Finish(target);
         }
-        if (summary.ReturnsOwned && SymbolFacts.IsTracked(invocation.Type))
+        if (summary.ReturnsOwned && TracksOwnershipValue(invocation.Type))
         {
             var target = Temporary(invocation);
             Add(InstructionKind.Allocate, invocation, target: target, resourceId: "factory:" + invocation.Syntax.SpanStart, flags: ResourceFlags(invocation.Type),
                 description: "acquire result of " + method.ToDisplayString());
             return Finish(target);
         }
-        if (SymbolFacts.IsTracked(invocation.Type))
+        if (TracksOwnershipValue(invocation.Type))
         {
             var target = Temporary(invocation);
             Add(InstructionKind.Allocate, invocation, target: target, resourceId: "external-call:" + invocation.Syntax.SpanStart,
@@ -564,6 +609,7 @@ internal sealed class OperationLowerer
         internal List<(string Place, IOperation Site, string Description, int Order)> Disposals { get; } = new();
         internal List<(string Place, IOperation Site, string Description)> Transfers { get; } = new();
         internal List<(string Place, IOperation Site)> Snapshots { get; } = new();
+        internal List<(string Place, IOperation Site)> ReferenceSnapshots { get; } = new();
     }
 
     private string? SnapshotCallValue(string? source, IOperation operation, string role)
@@ -609,7 +655,7 @@ internal sealed class OperationLowerer
         var union = "$return-origins:" + operation.Syntax.SpanStart;
         Add(InstructionKind.Alias, operation, target: union, source: origins[0]);
         foreach (var source in origins.Skip(1)) Add(InstructionKind.MergeAlias, operation, target: union, source: source);
-        var asyncPayload = summary.ReturnsAsyncPayload && OwnedAwaitablePayload(operation.Type) is { } payload && SymbolFacts.IsTracked(payload);
+        var asyncPayload = summary.ReturnsAsyncPayload && OwnedAwaitablePayload(operation.Type) is { } payload && TracksOwnershipValue(payload);
         var target = asyncPayload ? "$async-return-payload:" + operation.Syntax.SpanStart : Temporary(operation);
         Add(summary.MutableBorrow ? InstructionKind.BorrowExclusive : InstructionKind.BorrowShared,
             operation, target: target, source: union, description: "returned borrow bounded by " + string.Join(", ", summary.BorrowedSources));
@@ -630,6 +676,7 @@ internal sealed class OperationLowerer
         var arguments = new CallArguments();
         if (source is not null) AddArgument(arguments, source, method.Parameters.FirstOrDefault(), conversion, method, summary);
         ActivateArguments(arguments);
+        InvalidateCallAggregates(conversion, method, arguments);
         MarkMayThrow(conversion);
         TouchArguments(arguments);
         string? result = null;
@@ -637,13 +684,13 @@ internal sealed class OperationLowerer
         {
             result = borrowed;
         }
-        else if (summary.ReturnsOwned && OwnedAwaitablePayload(conversion.Type) is { } payload && SymbolFacts.IsTracked(payload))
+        else if (summary.ReturnsOwned && OwnedAwaitablePayload(conversion.Type) is { } payload && TracksOwnershipValue(payload))
         {
             result = Temporary(conversion);
             Add(InstructionKind.BeginAsyncFactory, conversion, target: result, resourceId: "conversion-factory:" + conversion.Syntax.SpanStart,
                 flags: ResourceFlags(payload), description: "receive an owned-result carrier from " + method.ToDisplayString());
         }
-        else if (SymbolFacts.IsTracked(conversion.Type))
+        else if (TracksOwnershipValue(conversion.Type))
         {
             result = Temporary(conversion);
             Add(InstructionKind.Allocate, conversion, target: result, resourceId: "conversion:" + conversion.Syntax.SpanStart,
@@ -660,7 +707,7 @@ internal sealed class OperationLowerer
         var result = new CallArguments();
         foreach (var argument in arguments)
         {
-            var source = Evaluate(argument.Value, false);
+            var source = EvaluateReferenceArgument(argument, result);
             if (source is null) continue;
             AddArgument(result, source, argument.Parameter, argument, method, summary);
         }
@@ -733,9 +780,27 @@ internal sealed class OperationLowerer
     {
         foreach (var loan in arguments.Loans) Add(InstructionKind.ReleaseLoan, loan.Site, target: loan.Place);
         foreach (var snapshot in arguments.Snapshots) ReleaseCallSnapshot(snapshot.Place, snapshot.Site);
+        EndReferenceArguments(arguments);
     }
 
     private static bool IsFrameworkAwaitableMethod(IMethodSymbol method) => IsFrameworkAwaitableType(method.ContainingType);
+
+    private static bool IsValueTaskType(ITypeSymbol? symbol)
+    {
+        if (symbol is not INamedTypeSymbol type || !IsFrameworkAwaitableType(type)) return false;
+        while (type.ContainingType is { } containing) type = containing;
+        return type.Name is "ValueTask" or "ConfiguredValueTaskAwaitable" or "ValueTaskAwaiter";
+    }
+
+    private string? TrackProducedValueTask(IOperation operation, string? target, bool preserveExisting = false, string? carrier = null)
+    {
+        if (!IsValueTaskType(operation.Type)) return target;
+        target ??= Temporary(operation);
+        Add(InstructionKind.TrackValueTask, operation, target: target, source: target, owner: carrier, resourceId: "value-task:" + operation.Syntax.SpanStart,
+            flags: preserveExisting ? InstructionFlags.PreserveExistingCapability : InstructionFlags.None,
+            description: "track single-consumption ValueTask result");
+        return target;
+    }
 
     private static bool IsFrameworkAwaitableType(ITypeSymbol? symbol)
     {
@@ -772,8 +837,16 @@ internal sealed class OperationLowerer
 
     private string? KnownAwaitableCreation(IObjectCreationOperation creation, CallArguments arguments)
     {
+        if (IsValueTaskType(creation.Type) && creation.Constructor is { Parameters.Length: 1 } taskConstructor &&
+            taskConstructor.Parameters[0].Type is INamedTypeSymbol { Name: "Task" } && IsFrameworkAwaitableType(taskConstructor.Parameters[0].Type) &&
+            arguments.Values.TryGetValue(0, out var task))
+        {
+            var target = Temporary(creation);
+            Add(InstructionKind.Alias, creation, target: target, source: task, description: "preserve Task completion identity through ValueTask construction");
+            return target;
+        }
         if (creation.Type is not INamedTypeSymbol { Name: "ValueTask" } || creation.Constructor is not { Parameters.Length: 1 } constructor ||
-            OwnedAwaitablePayload(creation.Type) is not { } payload || !SymbolFacts.IsTracked(payload)) return null;
+            OwnedAwaitablePayload(creation.Type) is not { } payload || !TracksOwnershipValue(payload)) return null;
         arguments.Values.TryGetValue(0, out var source);
         if (SymbolEqualityComparer.Default.Equals(constructor.Parameters[0].Type, payload))
             return BindAwaitableResult(creation, source);
@@ -788,7 +861,7 @@ internal sealed class OperationLowerer
 
     private string? ReceiveAwaitedResult(IOperation operation, string? carrier, bool knownFrameworkAwaitable)
     {
-        if (!SymbolFacts.IsTracked(operation.Type)) return null;
+        if (!TracksOwnershipValue(operation.Type) && !IsValueTaskType(operation.Type)) return null;
         var target = Temporary(operation);
         if (carrier is not null && knownFrameworkAwaitable)
             Add(InstructionKind.ReceiveAsyncResult, operation, target: target, source: carrier, resourceId: "external-await:" + operation.Syntax.SpanStart,
@@ -796,12 +869,13 @@ internal sealed class OperationLowerer
         else
             Add(InstructionKind.Allocate, operation, target: target, resourceId: "external-await:" + operation.Syntax.SpanStart,
                 ownership: ResourceOwnership.External, flags: ResourceFlags(operation.Type), description: "receive opaque awaitable result without assuming ownership or aliases");
-        return target;
+        return TrackProducedValueTask(operation, target, preserveExisting: true, carrier: knownFrameworkAwaitable ? carrier : null);
     }
 
     private void ApplyOutputArguments(System.Collections.Immutable.ImmutableArray<IArgumentOperation> arguments,
         Dictionary<int, string> values, MethodSummary? summary)
     {
+        ApplyKnownReferenceOutputs(arguments, values, summary);
         foreach (var argument in arguments.Where(argument => argument.Parameter?.RefKind == RefKind.Out))
         {
             var parameter = argument.Parameter!;
@@ -811,10 +885,11 @@ internal sealed class OperationLowerer
                 Add(InstructionKind.Allocate, argument, target: target, resourceId: "out-owned:" + argument.Syntax.SpanStart,
                     flags: ResourceFlags(parameter.Type) | (nullable ? InstructionFlags.MayBeNull : InstructionFlags.None),
                     description: "receive owned out parameter " + parameter.Name);
-            else if (SymbolFacts.IsTracked(parameter.Type))
+            else if (TracksOwnershipValue(parameter.Type))
                 Add(InstructionKind.Allocate, argument, target: target, resourceId: "out-external:" + argument.Syntax.SpanStart,
                     ownership: ResourceOwnership.External, flags: ResourceFlags(parameter.Type), description: "receive uncontracted out parameter " + parameter.Name);
         }
+        ApplyUnknownReferenceOutputs(arguments, values, summary);
     }
 
     private string Use(string place, IOperation operation, bool read)
@@ -831,8 +906,9 @@ internal sealed class OperationLowerer
 
     private void Add(InstructionKind kind, IOperation operation, string? target = null, string? source = null,
         string? resourceId = null, ResourceOwnership ownership = ResourceOwnership.Owned, string? owner = null,
-        InstructionFlags flags = InstructionFlags.None, string? description = null) =>
-        _instructions.Add(new FlowInstruction(kind, Site(operation.Syntax.GetLocation()), target, source, resourceId, ownership, owner, flags, description));
+        InstructionFlags flags = InstructionFlags.None, string? description = null, int asyncResultDepth = 1,
+        AsyncCompositionKind asyncComposition = AsyncCompositionKind.None, string? projection = null) =>
+        _instructions.Add(new FlowInstruction(kind, Site(operation.Syntax.GetLocation()), target, source, resourceId, ownership, owner, flags, description, asyncResultDepth, asyncComposition, projection));
 
     public static SourceSite Site(Location location)
     {

@@ -14,7 +14,9 @@ internal sealed class LifetimeContractModel
     private readonly ConcurrentDictionary<(int Regions, int Constraints, int Steps), RegionSolution> solutions = new();
     internal LifetimeContractModel(IMethodSymbol method, ImmutableArray<string?> parameters, string? returned,
         ImmutableArray<RegionConstraint> constraints, ImmutableArray<LifetimeDeclarationIssue> issues,
-        ImmutableArray<Location> locations, string? borrowedSource, bool mutableBorrow, bool returnsOwned)
+        ImmutableArray<Location> locations, string? borrowedSource, bool mutableBorrow, bool returnsOwned,
+        ImmutableArray<LifetimeTypePosition> typePositions = default, ImmutableArray<LifetimeTypeBound> typeBounds = default,
+        ImmutableArray<string> additionalRootRegions = default)
     {
         Method = method;
         ParameterRegions = parameters;
@@ -25,9 +27,17 @@ internal sealed class LifetimeContractModel
         BorrowedSource = borrowedSource;
         MutableBorrow = mutableBorrow;
         ReturnsOwned = returnsOwned;
+        TypePositions = typePositions.IsDefault ? ImmutableArray<LifetimeTypePosition>.Empty : typePositions;
+        TypeBounds = typeBounds.IsDefault ? ImmutableArray<LifetimeTypeBound>.Empty : typeBounds;
+        TypeScopes = TypePositions.SelectMany(position => position.Scopes).GroupBy(scope => scope.Key, StringComparer.Ordinal)
+            .Select(group => group.First()).OrderBy(scope => scope.Key, StringComparer.Ordinal).ToImmutableArray();
         var names = parameters.Where(name => name is not null).Select(name => name!).ToList();
         if (returned is not null) names.Add(returned);
         if (HasReceiver(method)) names.Add("this");
+        names.AddRange(TypePositions.Where(position => position.RegionScope.Length == 0).Select(position => position.Region));
+        if (!additionalRootRegions.IsDefault) names.AddRange(additionalRootRegions);
+        RootRegionNames = names.Distinct(StringComparer.Ordinal).OrderBy(name => name, StringComparer.Ordinal).ToImmutableArray();
+        names.AddRange(TypePositions.Select(position => position.Region));
         RegionNames = names.Distinct(StringComparer.Ordinal).OrderBy(name => name, StringComparer.Ordinal).ToImmutableArray();
     }
 
@@ -35,13 +45,17 @@ internal sealed class LifetimeContractModel
     internal ImmutableArray<string?> ParameterRegions { get; }
     internal string? ReturnRegion { get; }
     internal ImmutableArray<string> RegionNames { get; }
+    internal ImmutableArray<string> RootRegionNames { get; }
+    internal ImmutableArray<LifetimeTypePosition> TypePositions { get; }
+    internal ImmutableArray<LifetimeTypeScope> TypeScopes { get; }
+    internal ImmutableArray<LifetimeTypeBound> TypeBounds { get; }
     internal ImmutableArray<RegionConstraint> Constraints { get; }
     internal ImmutableArray<LifetimeDeclarationIssue> DeclarationIssues { get; }
     internal ImmutableArray<Location> DeclarationLocations { get; }
     internal string? BorrowedSource { get; }
     internal bool MutableBorrow { get; }
     internal bool ReturnsOwned { get; }
-    internal bool HasRegions => ReturnRegion is not null || ParameterRegions.Any(name => name is not null) || !Constraints.IsEmpty;
+    internal bool HasRegions => ReturnRegion is not null || ParameterRegions.Any(name => name is not null) || !Constraints.IsEmpty || !TypePositions.IsEmpty || !TypeBounds.IsEmpty;
     internal static bool HasReceiver(IMethodSymbol method) => !method.IsStatic && method.MethodKind != MethodKind.DelegateInvoke;
 
     internal RegionSolution Solve(RegionSolverOptions options, CancellationToken cancellationToken)
@@ -61,19 +75,25 @@ internal sealed class LifetimeDeclarationIssue
 }
 
 /// <summary>Compilation-local contract resolution. Parameter and region renaming is positional, never text-only.</summary>
-internal sealed class LifetimeContractProvider
+internal sealed partial class LifetimeContractProvider
 {
     private readonly INamedTypeSymbol? lifetimeAttribute;
     private readonly INamedTypeSymbol? outlivesAttribute;
+    private readonly INamedTypeSymbol? typeLifetimeAttribute;
+    private readonly INamedTypeSymbol? typeOutlivesAttribute;
     private readonly ConcurrentDictionary<IMethodSymbol, LifetimeContractModel> cache = new(SymbolEqualityComparer.Default);
 
     internal LifetimeContractProvider(Compilation compilation)
     {
+        Compilation = compilation;
         lifetimeAttribute = compilation.GetTypeByMetadataName("SafeSharp.LifetimeAttribute");
         outlivesAttribute = compilation.GetTypeByMetadataName("SafeSharp.OutlivesAttribute");
+        typeLifetimeAttribute = compilation.GetTypeByMetadataName("SafeSharp.TypeLifetimeAttribute");
+        typeOutlivesAttribute = compilation.GetTypeByMetadataName("SafeSharp.TypeOutlivesAttribute");
     }
 
     internal bool Available => lifetimeAttribute is not null && outlivesAttribute is not null;
+    internal Compilation Compilation { get; }
 
     internal LifetimeContractModel Get(IMethodSymbol method, CancellationToken cancellationToken)
     {
@@ -155,6 +175,15 @@ internal sealed class LifetimeContractProvider
                     if (original != "this" && !renamedRegions.ContainsKey(original) && Name(parameterAttributes[index]) is { } renamed)
                         renamedRegions.Add(original, renamed);
                 }
+                foreach (var position in inheritedContract.TypePositions.Where(position => position.RegionScope.Length == 0))
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    if (position.Parameter >= 0) inputNames.Add(position.Name);
+                    if (position.Name == "this" || renamedRegions.ContainsKey(position.Name)) continue;
+                    var positionAttribute = TypeLifetimes(method, position.Parameter).FirstOrDefault(attribute => Argument(attribute, 1) == position.Path);
+                    if (Name(positionAttribute)?.TrimStart('^') is { } typeName && (position.Parameter >= 0 || !inputNames.Contains(position.Name)))
+                        renamedRegions.Add(position.Name, typeName);
+                }
                 if (inheritedContract.ReturnRegion is { } originalReturn && originalReturn != "this" && !inputNames.Contains(originalReturn) && Name(directReturn) is { } returnName)
                     renamedRegions[originalReturn] = returnName;
                 translations.Add(declaration, renamedRegions);
@@ -201,6 +230,8 @@ internal sealed class LifetimeContractProvider
         var names = new HashSet<string>(parameters.Where(name => name is not null).Select(name => name!), StringComparer.Ordinal);
         if (returned is not null) names.Add(returned);
         if (LifetimeContractModel.HasReceiver(method)) names.Add("this");
+        var types = BuildTypes(method, inherited, parameters.ToImmutable(), returned, Translate, issues, locations, cancellationToken);
+        foreach (var position in types.Positions.Where(position => position.RegionScope.Length == 0)) names.Add(position.Region);
         var boundsSource = method;
         var bounds = Outlives(method).ToArray();
         if (bounds.Length == 0)
@@ -210,15 +241,30 @@ internal sealed class LifetimeContractProvider
                 if (candidates.Length != 0) { bounds = candidates; boundsSource = declaration; break; }
             }
         var constraints = ImmutableArray.CreateBuilder<RegionConstraint>();
+        constraints.AddRange(types.Constraints);
         foreach (var attribute in bounds)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var longer = Translate(Argument(attribute, 0), boundsSource);
-            var shorter = Translate(Argument(attribute, 1), boundsSource);
+            var scope = attribute.NamedArguments.FirstOrDefault(argument => argument.Key == "Scope").Value.Value as string;
+            var scoped = !string.IsNullOrEmpty(scope);
+            var longer = scoped ? TranslateScopedTypeRegion(Argument(attribute, 0), boundsSource, method, scope!, cancellationToken) : Translate(Argument(attribute, 0), boundsSource);
+            var shorter = scoped ? TranslateScopedTypeRegion(Argument(attribute, 1), boundsSource, method, scope!, cancellationToken) : Translate(Argument(attribute, 1), boundsSource);
             var location = Site(attribute, method, cancellationToken);
             locations.Add(location);
             if (!ValidName(longer, method) || !ValidName(shorter, method))
             { issues.Add(new LifetimeDeclarationIssue(location, "outlives endpoints must be valid named regions")); continue; }
+            if (scoped)
+            {
+                if (!types.Positions.Any(position => position.Scopes.Any(binder => binder.Key == scope)))
+                { issues.Add(new LifetimeDeclarationIssue(location, "outlives scope must name a nested callable binder introduced by TypeLifetime paths")); continue; }
+                var scopedLonger = LifetimeTypePosition.Identity(scope!, longer!);
+                var scopedShorter = LifetimeTypePosition.Identity(scope!, shorter!);
+                if (!types.Positions.Any(position => position.Region == scopedLonger && position.RegionScope == scope) ||
+                    !types.Positions.Any(position => position.Region == scopedShorter && position.RegionScope == scope))
+                { issues.Add(new LifetimeDeclarationIssue(location, "scoped outlives endpoints must be declared in that callable binder")); continue; }
+                constraints.Add(new RegionConstraint(scopedLonger, scopedShorter, Source(location), "Declared " + longer + " : " + shorter + " in '" + scope + "'."));
+                continue;
+            }
             if (!names.Contains(longer!) || !names.Contains(shorter!))
             { issues.Add(new LifetimeDeclarationIssue(location, "outlives constraint references a region absent from the signature: " + longer + " : " + shorter)); continue; }
             constraints.Add(new RegionConstraint(longer!, shorter!, Source(location), "Declared " + longer + " : " + shorter));
@@ -247,7 +293,7 @@ internal sealed class LifetimeContractProvider
                 ? directSourceContract.ConstructorArguments.Length > 1 && directSourceContract.ConstructorArguments[1].Value is true
                 : borrowed?.ConstructorArguments.Length > 1 && borrowed.ConstructorArguments[1].Value is true || SymbolFacts.HasReturnAttribute(method, "BorrowedMut"));
         return new LifetimeContractModel(method, parameters.ToImmutable(), returned, constraints.ToImmutable(), issues.ToImmutable(),
-            locations.Distinct().ToImmutableArray(), borrowedSource, mutable, returnsOwned);
+            locations.Distinct().ToImmutableArray(), borrowedSource, mutable, returnsOwned, types.Positions, types.Bounds);
     }
 
     private static void ValidateName(string? name, Location location, IMethodSymbol method, ImmutableArray<LifetimeDeclarationIssue>.Builder issues)

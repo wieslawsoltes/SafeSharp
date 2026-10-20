@@ -69,6 +69,10 @@ internal sealed class MethodSummaryProvider
                     mutable = lifetime.MutableBorrow;
                 }
             }
+            var returnOrigins = ImmutableArray<MethodReturnOrigin>.Empty;
+            ReferenceReturnSummary? referenceReturn = null;
+            var preservedRefParameters = ImmutableHashSet<int>.Empty;
+            var referenceOutputs = ImmutableDictionary<int, ImmutableHashSet<string>>.Empty;
             var disposed = ImmutableArray.CreateBuilder<int>();
             var outputs = ImmutableDictionary.CreateBuilder<int, bool>();
             foreach (var parameter in method.Parameters.Where(parameter => parameter.RefKind == RefKind.Out && SymbolFacts.HasAttribute(parameter, "Owned")))
@@ -88,6 +92,13 @@ internal sealed class MethodSummaryProvider
                     Compute(callee.OriginalDefinition, cancellationToken, path);
                 var origins = MethodOriginAnalysis.Analyze(method, model.GetOperation(operationNode, cancellationToken), Callee, AsyncResults, cancellationToken);
                 returnsAsyncPayload |= origins.ReturnsAsyncPayload;
+                referenceReturn = origins.ReferenceReturn;
+                preservedRefParameters = origins.PreservedRefParameters;
+                referenceOutputs = origins.Outputs.Where(output => method.Parameters[output.Key].RefKind == RefKind.Ref)
+                    .ToImmutableDictionary(output => output.Key, output => output.Value);
+                // Explicit contracts remain authoritative. Inference exports the entire bounded
+                // carrier shape only when no signature already promises a different result.
+                if (!owned && sources.Count == 0 && lifetime.ReturnRegion is null) returnOrigins = origins.ReturnOrigins;
                 static bool IsFresh(ImmutableHashSet<string> values) => values.Contains(MethodOriginAnalysis.Fresh) &&
                     values.All(value => value is MethodOriginAnalysis.Fresh or MethodOriginAnalysis.Null);
                 if (sources.Count == 0 && lifetime.ReturnRegion is null && IsFresh(origins.Returns))
@@ -100,8 +111,14 @@ internal sealed class MethodSummaryProvider
                     if (candidates.Length > 0 && candidates.All(candidate => candidate is not null))
                         sources.AddRange(candidates.Select(candidate => candidate!).OrderBy(candidate => candidate, StringComparer.Ordinal));
                 }
+                // A single fresh ref output of a void/ref-returning helper has one caller owner.
+                // Multiple fresh outputs or a separate by-value result require an allocation identity
+                // relation; do not invent unrelated owners for what may be the same object.
+                var singleRefOwner = method.Parameters.Count(parameter => parameter.RefKind is RefKind.Ref or RefKind.Out) == 1 &&
+                    (method.ReturnsVoid || method.ReturnsByRef || method.ReturnsByRefReadonly);
                 foreach (var output in origins.Outputs.Where(output => IsFresh(output.Value)))
-                    outputs[output.Key] = output.Value.Contains(MethodOriginAnalysis.Null);
+                    if (method.Parameters[output.Key].RefKind == RefKind.Out || singleRefOwner)
+                        outputs[output.Key] = output.Value.Contains(MethodOriginAnalysis.Null);
                 // Only straight-line direct disposal is inferred. A call hidden in a conditional, nested
                 // closure, virtual override or finally with multiple exits requires an explicit contract.
                 var body = source switch
@@ -124,7 +141,7 @@ internal sealed class MethodSummaryProvider
                     }
                 }
             }
-            return new MethodSummary(owned, sources.ToImmutable(), mutable, disposed.ToImmutable(), outputs.ToImmutable(), returnsAsyncPayload);
+            return new MethodSummary(owned, sources.ToImmutable(), mutable, disposed.ToImmutable(), outputs.ToImmutable(), returnsAsyncPayload, returnOrigins, referenceReturn, preservedRefParameters, referenceOutputs);
         }
         finally { path.Remove(method.OriginalDefinition); }
     }
@@ -148,7 +165,9 @@ internal sealed class MethodSummary
 
     public MethodSummary(bool returnsOwned, ImmutableArray<string> borrowedSources, bool mutableBorrow,
         ImmutableArray<int> parameterDisposalOrder, ImmutableDictionary<int, bool> ownedOutputParameters,
-        bool returnsAsyncPayload = false)
+        bool returnsAsyncPayload = false, ImmutableArray<MethodReturnOrigin> returnOrigins = default,
+        ReferenceReturnSummary? referenceReturn = null, ImmutableHashSet<int>? preservedRefParameters = null,
+        ImmutableDictionary<int, ImmutableHashSet<string>>? referenceOutputs = null)
     {
         ReturnsOwned = returnsOwned;
         BorrowedSources = borrowedSources;
@@ -157,8 +176,16 @@ internal sealed class MethodSummary
         DisposedParameters = parameterDisposalOrder.ToImmutableHashSet();
         OwnedOutputParameters = ownedOutputParameters;
         ReturnsAsyncPayload = returnsAsyncPayload;
+        ReturnOrigins = returnOrigins.IsDefault ? ImmutableArray<MethodReturnOrigin>.Empty : returnOrigins;
+        ReferenceReturn = referenceReturn;
+        PreservedRefParameters = preservedRefParameters ?? ImmutableHashSet<int>.Empty;
+        ReferenceOutputs = referenceOutputs ?? ImmutableDictionary<int, ImmutableHashSet<string>>.Empty;
     }
 
+    internal ImmutableArray<MethodReturnOrigin> ReturnOrigins { get; }
+    internal ReferenceReturnSummary? ReferenceReturn { get; }
+    internal ImmutableHashSet<int> PreservedRefParameters { get; }
+    internal ImmutableDictionary<int, ImmutableHashSet<string>> ReferenceOutputs { get; }
     public bool ReturnsOwned { get; }
     /// <summary>
     /// Whether the returned ownership/provenance describes one Task&lt;T&gt;/ValueTask&lt;T&gt; result

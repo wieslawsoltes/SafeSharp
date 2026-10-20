@@ -1,4 +1,4 @@
-// Frozen SafeSharp fd66dc0 implementation: independent correctness and benchmark oracle.
+// SafeSharp fd66dc0 HashSet solver with explicit reference-address uses: independent correctness and benchmark oracle.
 // Keep this HashSet solver separate from the optimized solver's indexed transfer helpers.
 using System;
 using System.Collections.Generic;
@@ -23,6 +23,9 @@ internal sealed class HashSetLivenessOracle
         IReadOnlyDictionary<int, List<int>> predecessors, int budget, CancellationToken cancellationToken)
     {
         var result = new HashSetLivenessOracle();
+        var references = blocks.Values.SelectMany(block => block.Instructions)
+            .Where(instruction => instruction.Kind is InstructionKind.BindReference or InstructionKind.MergeReference or InstructionKind.BindAggregateElementReference)
+            .Select(instruction => instruction.Target!).Distinct(StringComparer.Ordinal).ToArray();
         foreach (var id in blocks.Keys)
         {
             result.LiveIn[id] = new HashSet<string>(StringComparer.Ordinal);
@@ -42,7 +45,7 @@ internal sealed class HashSetLivenessOracle
             foreach (var successor in block.Successors)
                 if (result.LiveIn.TryGetValue(successor, out var successorLive)) live.UnionWith(successorLive);
             result.LiveOut[id] = new HashSet<string>(live, StringComparer.Ordinal);
-            for (var index = block.Instructions.Length - 1; index >= 0; index--) Transfer(block.Instructions[index], live);
+            for (var index = block.Instructions.Length - 1; index >= 0; index--) Transfer(block.Instructions[index], live, references);
             if (result.LiveIn[id].SetEquals(live)) continue;
             result.LiveIn[id] = live;
             foreach (var predecessor in predecessors[id])
@@ -57,7 +60,7 @@ internal sealed class HashSetLivenessOracle
             for (var index = block.Instructions.Length - 1; index >= 0; index--)
             {
                 after[index] = new HashSet<string>(live, StringComparer.Ordinal);
-                Transfer(block.Instructions[index], live);
+                Transfer(block.Instructions[index], live, references);
                 before[index] = new HashSet<string>(live, StringComparer.Ordinal);
             }
             result.Before[pair.Key] = before;
@@ -66,7 +69,7 @@ internal sealed class HashSetLivenessOracle
         return result;
     }
 
-    private static void Transfer(FlowInstruction instruction, HashSet<string> live)
+    private static void Transfer(FlowInstruction instruction, HashSet<string> live, string[] references)
     {
         if (instruction.Target is not null && instruction.Kind != InstructionKind.Nop)
         {
@@ -74,7 +77,9 @@ internal sealed class HashSetLivenessOracle
             live.RemoveWhere(place => IsStrictDescendant(place, instruction.Target));
         }
         if (instruction.Source is not null && instruction.Kind != InstructionKind.Nop) live.Add(instruction.Source);
-        if (instruction.Kind == InstructionKind.MergeAlias && instruction.Target is not null) live.Add(instruction.Target);
+        if (instruction.Target is { } target && (instruction.Kind is InstructionKind.MergeAlias or InstructionKind.MergeReference ||
+            instruction.Kind is not (InstructionKind.Nop or InstructionKind.BindReference or InstructionKind.BindAggregateElementReference or InstructionKind.ReleaseReference) &&
+            references.Any(reference => reference == target || IsStrictDescendant(target, reference)))) live.Add(target);
         if (instruction.Owner is not null) live.Add(instruction.Owner);
     }
 

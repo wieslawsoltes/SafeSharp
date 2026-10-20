@@ -40,8 +40,9 @@ public sealed class OwnershipAnalysisEngine
 
         var resourceCount = blocks.Values.Sum(block => block.Instructions.Sum(instruction => instruction.Kind switch
         {
-            InstructionKind.BeginAsyncFactory => 2, // carrier and its possible materialized result
-            InstructionKind.Allocate or InstructionKind.BeginAsyncDispose or InstructionKind.ReceiveAsyncResult or InstructionKind.BindAsyncResult => 1,
+            InstructionKind.BeginAsyncComposition => 3, // proxy, captured inputs, and result aggregate
+            InstructionKind.BeginAsyncFactory => instruction.AsyncResultDepth + 1, // carrier layers and possible terminal result
+            InstructionKind.Allocate or InstructionKind.BeginAsyncDispose or InstructionKind.ReceiveAsyncResult or InstructionKind.BindAsyncResult or InstructionKind.TrackValueTask or InstructionKind.CreateAggregate or InstructionKind.ReadAggregateElement => 1,
             _ => 0
         }));
         if (resourceCount > options.MaxTrackedResources) return BudgetResult(graph, "tracked-resource", 0);
@@ -65,6 +66,8 @@ public sealed class OwnershipAnalysisEngine
             var incoming = predecessors[id].Where(outputs.ContainsKey).Select(predecessor => outputs[predecessor]).ToList();
             if (id == graph.EntryId) incoming.Add(new AbstractState());
             var input = AbstractState.Join(incoming);
+            if (input.ReferenceStorage.BudgetExceeded) return BudgetResult(graph, "reference-storage", iterations);
+            if (input.Resources.Count > options.MaxTrackedResources) return BudgetResult(graph, "tracked-resource", iterations);
             input.ExpireLoans(liveness.LiveIn[id]);
             inputs[id] = input;
             var output = input.Clone();
@@ -75,6 +78,8 @@ public sealed class OwnershipAnalysisEngine
                 output.ExpireLoans(liveness.Before[id][index]);
                 transfer.Apply(output, block.Instructions[index], id, index, liveness.After[id][index], null);
                 output.ExpireLoans(liveness.After[id][index]);
+                if (output.ReferenceStorage.BudgetExceeded) return BudgetResult(graph, "reference-storage", iterations);
+                if (output.Resources.Count > options.MaxTrackedResources) return BudgetResult(graph, "tracked-resource", iterations);
             }
             if (outputs.TryGetValue(id, out var oldOutput) && oldOutput.Equals(output)) continue;
             outputs[id] = output;
@@ -97,6 +102,8 @@ public sealed class OwnershipAnalysisEngine
                 var before = options.CaptureSnapshots ? state.Snapshot() : null;
                 transfer.Apply(state, block.Instructions[index], block.Id, index, liveness.After[block.Id][index], collector);
                 state.ExpireLoans(liveness.After[block.Id][index]);
+                if (state.ReferenceStorage.BudgetExceeded) return BudgetResult(graph, "reference-storage", iterations);
+                if (state.Resources.Count > options.MaxTrackedResources) return BudgetResult(graph, "tracked-resource", iterations);
                 if (options.CaptureSnapshots)
                     steps.Add(new InstructionSnapshot(index, block.Instructions[index], before!, state.Snapshot(),
                         Sorted(liveness.Before[block.Id][index]), Sorted(liveness.After[block.Id][index])));
@@ -110,6 +117,8 @@ public sealed class OwnershipAnalysisEngine
         if (exits.Length != 0)
         {
             var exitState = AbstractState.Join(exits.Select(block => outputs[block.Id]));
+            if (exitState.ReferenceStorage.BudgetExceeded) return BudgetResult(graph, "reference-storage", iterations);
+            if (exitState.Resources.Count > options.MaxTrackedResources) return BudgetResult(graph, "tracked-resource", iterations);
             foreach (var resource in exitState.Resources.Values.OrderBy(resource => resource.Id, StringComparer.Ordinal))
             {
                 if (resource.Ownership != ResourceOwnership.Owned || (resource.Flags & InstructionFlags.SuppressLeak) != 0
@@ -158,21 +167,26 @@ internal sealed class IssueCollector
     {
         var ids = instruction.Kind switch
         {
-            InstructionKind.Allocate or InstructionKind.BeginAsyncFactory => new[] { "SS0011", "SS0017" },
-            InstructionKind.Alias or InstructionKind.MergeAlias => new[] { "SS0004", "SS0011", "SS0017" },
-            InstructionKind.Move => new[] { "SS0001", "SS0004", "SS0005", "SS0008", "SS0011", "SS0012", "SS0017" },
+            InstructionKind.Allocate or InstructionKind.BeginAsyncFactory or InstructionKind.CreateAggregate => new[] { "SS0011", "SS0017" },
+            InstructionKind.Alias or InstructionKind.MergeAlias or InstructionKind.PreserveAwaitable => new[] { "SS0004", "SS0011", "SS0017" },
+            InstructionKind.Move => new[] { "SS0001", "SS0004", "SS0005", "SS0008", "SS0011", "SS0012", "SS0017", "SS0048" },
             InstructionKind.BorrowShared or InstructionKind.BorrowExclusive or InstructionKind.ReserveExclusiveBorrow => new[] { "SS0001", "SS0004", "SS0006", "SS0011", "SS0012", "SS0017" },
             InstructionKind.ActivateBorrow => new[] { "SS0001", "SS0004", "SS0006", "SS0012" },
+            InstructionKind.Read when (instruction.Flags & InstructionFlags.ValidateReturnedResult) != 0 => new[] { "SS0001", "SS0004", "SS0012", "SS0013", "SS0048" },
             InstructionKind.Read => new[] { "SS0001", "SS0004", "SS0012", "SS0013" },
             InstructionKind.Write => new[] { "SS0001", "SS0004", "SS0007", "SS0012" },
             InstructionKind.Dispose => new[] { "SS0002", "SS0004", "SS0009", "SS0012", "SS0014" },
             InstructionKind.BeginAsyncDispose when (instruction.Flags & InstructionFlags.DisposalAlreadyInvoked) != 0 => new[] { "SS0011", "SS0017" },
             InstructionKind.BeginAsyncDispose => new[] { "SS0002", "SS0004", "SS0009", "SS0011", "SS0012", "SS0014", "SS0017" },
             InstructionKind.CompleteAsyncDispose => new[] { "SS0004" },
-            InstructionKind.ObserveAsyncFactory => new[] { "SS0004" },
+            InstructionKind.ObserveAsyncFactory or InstructionKind.ObserveAsyncComposition => new[] { "SS0004" },
+            InstructionKind.BeginAsyncComposition or InstructionKind.CompleteAsyncComposition => new[] { "SS0004", "SS0011", "SS0017" },
+            InstructionKind.ReadAggregateElement => new[] { "SS0001", "SS0004", "SS0011", "SS0012", "SS0017" },
+            InstructionKind.SetAggregateElement => new[] { "SS0001", "SS0004", "SS0005", "SS0008", "SS0011", "SS0012", "SS0017", "SS0048" },
             InstructionKind.ReceiveAsyncResult => new[] { "SS0004", "SS0011", "SS0017" },
             InstructionKind.BindAsyncResult => new[] { "SS0004", "SS0011", "SS0017" },
-            InstructionKind.Escape or InstructionKind.Return => new[] { "SS0001", "SS0004", "SS0005", "SS0008", "SS0012" },
+            InstructionKind.Escape or InstructionKind.Return => new[] { "SS0001", "SS0004", "SS0005", "SS0008", "SS0012", "SS0048" },
+            InstructionKind.ConsumeValueTask => new[] { "SS0048" },
             InstructionKind.Suspend => new[] { "SS0010", "SS0016" },
             InstructionKind.Forget => new[] { "SS0011", "SS0017" },
             _ => Array.Empty<string>()
@@ -181,13 +195,16 @@ internal sealed class IssueCollector
         currentIssues = new HashSet<string>(StringComparer.Ordinal);
         if (ids.Length == 0) return;
         var checkedReferences = references.Concat(state.Resolve(instruction.Target));
-        if (instruction.Kind is InstructionKind.Move or InstructionKind.Escape or InstructionKind.Return or InstructionKind.ReceiveAsyncResult ||
+        if (instruction.Kind is InstructionKind.Move or InstructionKind.Escape or InstructionKind.Return or InstructionKind.ReceiveAsyncResult or
+            InstructionKind.ReadAggregateElement or InstructionKind.SetAggregateElement or InstructionKind.BeginAsyncComposition or InstructionKind.CompleteAsyncComposition ||
             instruction.Kind == InstructionKind.Read && (instruction.Flags & InstructionFlags.ValidateReturnedResult) != 0)
             checkedReferences = OwnershipTransfer.IncludingFactoryResults(state, checkedReferences);
         var resources = instruction.Kind == InstructionKind.Suspend ? state.Resources.Keys.AsEnumerable()
             : checkedReferences.Select(reference => reference.ResourceId);
         foreach (var resource in resources.Distinct(StringComparer.Ordinal))
         foreach (var id in ids) currentChecks.Add(Key(id, instruction.Site, resource));
+        if (ids.Contains("SS0048"))
+            foreach (var id in state.ValueTasks.Ids(instruction.Source, state)) currentChecks.Add(Key("SS0048", instruction.Site, id));
     }
 
     internal void EndInstruction()

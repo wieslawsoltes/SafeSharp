@@ -19,12 +19,14 @@ internal sealed class PlaceSetBuilder
     internal ulong[] Occupancy { get; }
     internal int Count { get; private set; }
     internal int OccupiedWords { get; private set; }
+    // XOR gives the sole occupied word in O(1) whenever OccupiedWords == 1.
+    internal int OccupiedWordXor { get; private set; }
 
     internal void Clear()
     {
         Array.Clear(Words, 0, Words.Length);
         Array.Clear(Occupancy, 0, Occupancy.Length);
-        Count = OccupiedWords = 0;
+        Count = OccupiedWords = OccupiedWordXor = 0;
     }
 
     internal bool SetWord(int index, ulong value)
@@ -36,18 +38,53 @@ internal sealed class PlaceSetBuilder
         if (previous == 0)
         {
             OccupiedWords++;
+            OccupiedWordXor ^= index;
             Occupancy[index >> 6] |= 1UL << (index & 63);
         }
         else if (value == 0)
         {
             OccupiedWords--;
+            OccupiedWordXor ^= index;
             Occupancy[index >> 6] &= ~(1UL << (index & 63));
         }
         return true;
     }
 
-    internal bool Add(int index) => index >= 0 && SetWord(index >> 6, Words[index >> 6] | (1UL << (index & 63)));
-    internal bool Remove(int index) => SetWord(index >> 6, Words[index >> 6] & ~(1UL << (index & 63)));
+    internal bool Add(int index)
+    {
+        if (index < 0) return false;
+        var word = index >> 6;
+        var previous = Words[word];
+        var bit = 1UL << (index & 63);
+        if ((previous & bit) != 0) return false;
+        Words[word] = previous | bit;
+        Count++;
+        if (previous == 0)
+        {
+            OccupiedWords++;
+            OccupiedWordXor ^= word;
+            Occupancy[word >> 6] |= 1UL << (word & 63);
+        }
+        return true;
+    }
+
+    internal bool Remove(int index)
+    {
+        var word = index >> 6;
+        var previous = Words[word];
+        var bit = 1UL << (index & 63);
+        if ((previous & bit) == 0) return false;
+        var value = previous & ~bit;
+        Words[word] = value;
+        Count--;
+        if (value == 0)
+        {
+            OccupiedWords--;
+            OccupiedWordXor ^= word;
+            Occupancy[word >> 6] &= ~(1UL << (word & 63));
+        }
+        return true;
+    }
 
     internal bool SetRange(int first, int end, bool value, CancellationToken cancellationToken)
     {

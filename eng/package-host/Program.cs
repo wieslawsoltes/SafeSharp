@@ -1,6 +1,8 @@
 using System.Collections.Immutable;
 using System.Composition.Hosting;
 using System.Reflection;
+using System.Reflection.Metadata;
+using System.Reflection.PortableExecutable;
 using System.Runtime.Loader;
 using System.Text.Json;
 using Microsoft.CodeAnalysis;
@@ -12,12 +14,24 @@ using Microsoft.CodeAnalysis.Text;
 using SafeSharp.Core;
 using SafeSharp.Core.Regions;
 using SafeSharp.Reporting;
+using ReportDiagnostic = SafeSharp.Reporting.ReportDiagnostic;
 
 if (args.Length != 2)
     throw new ArgumentException("Expected the packaged analyzer and code-fix assembly paths.");
 
 Require(typeof(Compilation).Assembly.GetName().Version is { Major: 4, Minor: 14 },
     "The package compatibility host must use Roslyn 4.14.");
+
+// The fixture itself runs on .NET 10, which can unify older assembly references
+// to newer platform assemblies. Inspect the actual shipped binaries before
+// loading them so that unification cannot hide an accidental host API increase.
+// Core is read beside the analyzer, independently of the Core asset NuGet chose
+// for this .NET 10 fixture.
+var analyzerPath = Path.GetFullPath(args[0]);
+var codeFixPath = Path.GetFullPath(args[1]);
+AssertCompilerHostReferences(analyzerPath);
+AssertCompilerHostReferences(Path.Combine(Path.GetDirectoryName(analyzerPath)!, "SafeSharp.Core.dll"));
+AssertCompilerHostReferences(codeFixPath);
 
 // These references are resolved by NuGet from the isolated local package feed.
 // An actual ownership result exercises Core's immutable-collection dependency and
@@ -42,18 +56,30 @@ Require(universal.IsComplete && !universal.IsCompatible && universal.Failures.Le
     universal.Failures[0].Proof.Steps.Length == 2,
     "Packaged universal solver did not retain the shortest unpromised relation proof.");
 
+var higherRanked = new HigherRankedRegionSolver().Solve(new HigherRankedRegionProblem(
+    [new RegionBinder("root"), new RegionBinder("inner", "root")],
+    [new RegionVariable("a", "root", RegionVariableKind.Universal),
+     new RegionVariable("input", "root", RegionVariableKind.Inference),
+     new RegionVariable("fresh", "inner", RegionVariableKind.Placeholder)],
+    requirements:
+    [new RegionConstraint("a", "input", site, "input shortening"),
+     new RegionConstraint("input", "fresh", site, "unnameable nested output")]));
+Require(higherRanked.IsComplete && !higherRanked.IsCompatible && !higherRanked.Failures.IsEmpty &&
+    !higherRanked.Promotions.IsEmpty && higherRanked.Promotions.All(promotion => promotion.Proof.Steps.Length > 0),
+    "Packaged higher-ranked solver lost the nested placeholder leak or its original visibility evidence.");
+
 var loader = new PackageAssemblyLoader();
-var reference = new AnalyzerFileReference(Path.GetFullPath(args[0]), loader);
+var reference = new AnalyzerFileReference(analyzerPath, loader);
 var loadFailures = new List<string>();
 reference.AnalyzerLoadFailed += (_, failure) => loadFailures.Add(failure.Message);
 var analyzers = reference.GetAnalyzers(LanguageNames.CSharp);
 Require(loadFailures.Count == 0 && !analyzers.IsEmpty,
     "Packaged analyzers did not load on Roslyn 4.14: " + string.Join("; ", loadFailures));
 var declaredRules = analyzers.SelectMany(analyzer => analyzer.SupportedDiagnostics).Select(rule => rule.Id).ToHashSet(StringComparer.Ordinal);
-Require(new[] { "SS0001", "SS0017", "SS0021", "SS0024", "SS0041", "SS0044", "SS0045", "SS0047" }.All(declaredRules.Contains),
+Require(new[] { "SS0001", "SS0017", "SS0021", "SS0024", "SS0041", "SS0044", "SS0045", "SS0047", "SS0048", "SS0049", "SS0050" }.All(declaredRules.Contains),
     "Packaged analyzer discovery lost an analyzer family.");
 
-var codeFixAssembly = loader.LoadFromPath(Path.GetFullPath(args[1]));
+var codeFixAssembly = loader.LoadFromPath(codeFixPath);
 using var composition = new ContainerConfiguration().WithAssembly(codeFixAssembly).CreateContainer();
 var provider = composition.GetExports<CodeFixProvider>().Single(candidate => candidate.FixableDiagnosticIds.Contains("SS0024"));
 var export = provider.GetType().GetCustomAttribute<ExportCodeFixProviderAttribute>();
@@ -163,14 +189,168 @@ Require(repeated.Any(diagnostic => diagnostic.Id == "SS0001" &&
     repeated.All(diagnostic => diagnostic.Id != "SS0003"),
     "Packaged Roslyn 4.14 analysis did not retain disposal of the same output across repeated awaits.");
 
-Console.WriteLine("Package host: Roslyn 4.14 discovered every analyzer family and checked delegate method groups/lambdas and stored/repeated async results; MEF exported the code fix; SS0024 was fixed in a live compilation; Core ownership/universal proofs and Reporting packages executed.");
+// Keep this fixture on C# 13/Roslyn 4.14 APIs. The contracts remain netstandard2.0;
+// a plain object gate exercises Monitor without depending on System.Threading.Lock.
+var boundarySource = CSharpSyntaxTree.ParseText("""
+    using System;
+    using System.Collections.Generic;
+    using System.IO;
+    using System.Threading;
+    using System.Threading.Tasks;
+    using SafeSharp;
+    [return: TypeLifetime("fresh", "return")]
+    delegate Func<object> UniversalFactory([Lifetime("a")] object value);
+    [return: TypeLifetime("^a", "return")]
+    delegate Func<object> TiedFactory([Lifetime("a")] object value);
+    static class BoundaryContracts
+    {
+        [return: TypeLifetime("^x", "return")]
+        static Func<object> Capture([Lifetime("x")] object value) => () => value;
+        static UniversalFactory NestedLeak() => Capture;
+        static TiedFactory SafeCapture() => Capture;
+        static async Task RepeatValueTask()
+        {
+            var pending = new ValueTask<int>(Task.FromResult(1));
+            _ = await pending;
+            _ = await pending;
+        }
+        static async Task ReusableValueTask()
+        {
+            var pending = new ValueTask<int>(Task.FromResult(1));
+            var task = pending.AsTask();
+            _ = await task;
+            _ = await task;
+        }
+        static void RequireContents([TypeLifetime("item", "arg0")] List<object> values) { }
+        static void SafeCall([TypeLifetime("a", "arg0")] List<object> values) { RequireContents(values); }
+        static void UnknownCall(List<object> values) { RequireContents(values); }
+        static void SafeArrayReference()
+        {
+            var values = new[] { new MemoryStream() };
+            ref MemoryStream cell = ref values[0];
+            cell.Dispose();
+        }
+        static void DisposedArrayReference()
+        {
+            var values = new[] { new MemoryStream() };
+            ref MemoryStream cell = ref values[0];
+            cell.Dispose();
+            _ = values[0].Length;
+        }
+    }
+    sealed class GuardedCounter
+    {
+        private readonly object gate = new object();
+        [GuardedBy(nameof(gate))] private int value;
+        public void Safe() { lock (gate) value++; }
+        public void Unsafe() { value++; }
+    }
+    sealed class GuardedAsyncCounter
+    {
+        private readonly SemaphoreSlim gate = new(1, 1);
+        [GuardedBy(nameof(gate))] private int value;
+        public async Task Safe()
+        {
+            await gate.WaitAsync().ConfigureAwait(false);
+            try { value++; await Task.Yield(); value++; }
+            finally { gate.Release(); }
+        }
+        public void Unsafe() { value++; }
+    }
+    """, CSharpParseOptions.Default.WithLanguageVersion(LanguageVersion.CSharp13), "BoundaryContracts.cs");
+var boundaries = compilation.RemoveAllSyntaxTrees().AddSyntaxTrees(boundarySource);
+AssertCompiles(boundaries);
+var boundaryDiagnostics = await AnalyzeAsync(boundaries, analyzers);
+foreach (var method in new[] { "SafeCapture", "ReusableValueTask", "SafeCall", "SafeArrayReference" })
+    Require(MethodDiagnostics(boundaries, boundaryDiagnostics, "BoundaryContracts", method).Length == 0,
+        "Packaged Roslyn 4.14 analysis rejected the valid boundary fixture " + method + ".");
+Require(MethodDiagnostics(boundaries, boundaryDiagnostics, "GuardedCounter", "Safe").Length == 0,
+    "Packaged Roslyn 4.14 analysis rejected access protected by its declared Monitor gate.");
+Require(MethodDiagnostics(boundaries, boundaryDiagnostics, "GuardedAsyncCounter", "Safe").Length == 0,
+    "Packaged Roslyn 4.14 analysis rejected a proven binary semaphore permit across suspension.");
+var directCall = MethodDiagnostics(boundaries, boundaryDiagnostics, "BoundaryContracts", "UnknownCall").Single();
+Require(directCall.Id == "SS0050" && directCall.AdditionalLocations.Count > 0 &&
+    new[] { "SafeSharp.CallTarget", "SafeSharp.CallReason", "SafeSharp.CallEvidence" }
+        .All(key => directCall.Properties.TryGetValue(key, out var value) && !string.IsNullOrWhiteSpace(value)),
+    "Packaged Roslyn 4.14 analysis lost direct-call lifetime obligations or their missing-evidence explanation.");
+var arrayReference = MethodDiagnostics(boundaries, boundaryDiagnostics, "BoundaryContracts", "DisposedArrayReference");
+Require(arrayReference.Any(diagnostic => diagnostic.Id == "SS0001") && arrayReference.All(diagnostic => diagnostic.Id != "SS0003"),
+    "Packaged Roslyn 4.14 ref access did not retain the ordinary array element's disposal identity.");
+var nested = MethodDiagnostics(boundaries, boundaryDiagnostics, "BoundaryContracts", "NestedLeak").Single();
+Require(nested.Id == "SS0047" && nested.AdditionalLocations.Count > 0 &&
+    new[] { "SafeSharp.RegionUniverses", "SafeSharp.RegionUniversePromotions", "SafeSharp.RegionVisibilityProofs" }
+        .All(key => nested.Properties.TryGetValue(key, out var value) && !string.IsNullOrWhiteSpace(value)),
+    "Packaged Roslyn 4.14 nested capture analysis lost its universe leak evidence.");
+var repeatedValueTask = MethodDiagnostics(boundaries, boundaryDiagnostics, "BoundaryContracts", "RepeatValueTask").Single();
+Require(repeatedValueTask.Id == "SS0048" && repeatedValueTask.AdditionalLocations.Count > 0 &&
+    repeatedValueTask.Properties.TryGetValue("SafeSharp.Certainty", out var consumptionCertainty) && consumptionCertainty == "Definite",
+    "Packaged Roslyn 4.14 analysis did not retain single-consumption ValueTask identity.");
+var unguarded = MethodDiagnostics(boundaries, boundaryDiagnostics, "GuardedCounter", "Unsafe").Single();
+Require(unguarded.Id == "SS0049" && unguarded.AdditionalLocations.Count > 0 &&
+    unguarded.Properties.TryGetValue("SafeSharp.SynchronizationRequired", out var requiredGuard) && requiredGuard == "gate" &&
+    unguarded.Properties.TryGetValue("SafeSharp.SynchronizationProtocol", out var protocol) && protocol == "Monitor" &&
+    unguarded.Properties.ContainsKey("SafeSharp.SynchronizationHeld"),
+    "Packaged Roslyn 4.14 analysis lost the unheld guard's contract or protocol evidence.");
+var semaphore = MethodDiagnostics(boundaries, boundaryDiagnostics, "GuardedAsyncCounter", "Unsafe").Single();
+Require(semaphore.Id == "SS0049" && semaphore.AdditionalLocations.Count > 0 &&
+    semaphore.Properties.TryGetValue("SafeSharp.SynchronizationProtocol", out var semaphoreProtocol) && semaphoreProtocol == "SemaphoreSlim",
+    "Packaged Roslyn 4.14 analysis lost the unheld semaphore's protocol evidence.");
+var nestedReport = new AnalysisReport([], [new ReportDiagnostic(nested.Id, nested.GetMessage(),
+    new SourceSite("BoundaryContracts.cs", nested.Location.SourceSpan.Start, nested.Location.SourceSpan.Length),
+    properties: nested.Properties)]);
+var nestedHtml = AnalysisReportRenderer.Render(nestedReport, ReportFormat.Html);
+Require(nestedHtml.Contains("data-region=\"$static\"", StringComparison.Ordinal) &&
+    nestedHtml.Contains("SafeSharp.RegionVisibilityProofs", StringComparison.Ordinal) &&
+    !nestedHtml.Contains("Region graph omitted", StringComparison.OrdinalIgnoreCase),
+    "Packaged Reporting omitted the computed higher-ranked graph or its visibility proof.");
+var guardReport = new AnalysisReport([], [new ReportDiagnostic(unguarded.Id, unguarded.GetMessage(),
+    new SourceSite("BoundaryContracts.cs", unguarded.Location.SourceSpan.Start, unguarded.Location.SourceSpan.Length),
+    properties: unguarded.Properties)]);
+var guardHtml = AnalysisReportRenderer.Render(guardReport, ReportFormat.Html);
+Require(guardHtml.Contains("class=\"synchronization-graph\"", StringComparison.Ordinal) &&
+    guardHtml.Contains("No capability records", StringComparison.Ordinal) &&
+    !guardHtml.Contains("Synchronization graph omitted", StringComparison.Ordinal),
+    "Packaged Reporting lost the computed Monitor guard requirement or invented an observed capability.");
+
+Console.WriteLine("Package host: shipped analyzer, code-fix and bundled Core references preserve the .NET Standard 2.0/Roslyn 4.14 host contract; Roslyn 4.14 discovered every analyzer family; checked direct-call and delegate lifetime obligations, nested lifetime leaks, canonical array references, stored/repeated async results, ValueTask consumption, Monitor and asynchronous semaphore guards; MEF fixed SS0024 in a live compilation; packaged Core ownership/universal/higher-ranked solvers and Reporting executed.");
+
+static void AssertCompilerHostReferences(string path)
+{
+    using var stream = File.OpenRead(path);
+    using var image = new PEReader(stream);
+    var metadata = image.GetMetadataReader();
+    Require(metadata.IsAssembly, "Expected a packaged managed assembly: " + path);
+    var references = metadata.AssemblyReferences
+        .Select(handle => metadata.GetAssemblyReference(handle))
+        .Select(reference => (Name: metadata.GetString(reference.Name), reference.Version))
+        .ToArray();
+    Require(references.Any(reference => reference.Name == "netstandard" &&
+        reference.Version <= new Version(2, 0, 0, 0)),
+        Path.GetFileName(path) + " must retain the .NET Standard 2.0 compiler-host target.");
+
+    foreach (var reference in references)
+    {
+        // These assemblies are supplied by Roslyn/the IDE, not bundled with our
+        // analyzers. Keep their compile-time API requirements within the 4.14
+        // host family even when the tests or standalone tool use newer versions.
+        Version? ceiling = reference.Name.StartsWith("Microsoft.CodeAnalysis", StringComparison.Ordinal)
+            ? new Version(4, 14, 0, 0)
+            : reference.Name.StartsWith("System.Composition", StringComparison.Ordinal) ||
+              reference.Name is "System.Collections.Immutable" or "System.Reflection.Metadata"
+                ? new Version(9, 0, 0, 0)
+                : null;
+        Require(ceiling is null || reference.Version <= ceiling,
+            Path.GetFileName(path) + " references " + reference.Name + " " + reference.Version +
+            ", above the supported compiler-host version " + ceiling + ".");
+    }
+}
 
 static Diagnostic[] MethodDiagnostics(Compilation compilation, ImmutableArray<Diagnostic> diagnostics, string typeName, string methodName)
 {
     var methods = compilation.GetTypeByMetadataName(typeName)?.GetMembers(methodName).OfType<IMethodSymbol>()
-        .Where(method => method.Parameters.IsEmpty).ToArray() ?? [];
+        .ToArray() ?? [];
     Require(methods.Length == 1 && methods[0].DeclaringSyntaxReferences.Length == 1,
-        "The package-host fixture must contain one exact method: " + typeName + "." + methodName + "().");
+        "The package-host fixture must contain one exact method: " + typeName + "." + methodName + ".");
     var declaration = methods[0].DeclaringSyntaxReferences[0];
     return diagnostics.Where(diagnostic => diagnostic.Location.SourceTree == declaration.SyntaxTree &&
         declaration.Span.Contains(diagnostic.Location.SourceSpan)).ToArray();
