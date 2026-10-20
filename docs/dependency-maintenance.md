@@ -18,7 +18,7 @@ The [Roslyn team's compatibility guidance](https://github.com/dotnet/roslyn/disc
 3. Run the normal build, unit tests, CLI checks, semantic benchmark smoke checks, and all package checks. The ordinary test host exercises newer Roslyn APIs; the independent package host exercises Roslyn 4.14.
 4. Inspect the exact branch-head CI result before merging. A passing test on a newer host does not establish that a compiled analyzer will load in the minimum supported host.
 
-The two original Roslyn update pull requests proposed the same version changes. The accepted update uses Roslyn 5.9 in the test host and its required System.Composition 10.0.1 dependency while preserving the analyzer and code-fix compile references at 4.14/9. The tool already uses Roslyn 5.9. Keeping the minimum fixture on 4.14 means both supported API generations remain exercised.
+The two original Roslyn update pull requests proposed the same version changes. The accepted update uses Roslyn 5.9 in the test host and the compatible System.Composition 10.0.13 servicing dependency while preserving the analyzer and code-fix compile references at 4.14/9. The tool already uses Roslyn 5.9. Keeping the minimum fixture on 4.14 means both supported API generations remain exercised.
 
 ## Checks against the shipped assemblies
 
@@ -36,6 +36,22 @@ The check covers the named host-owned dependency families and the exercised anal
 
 ## Dependabot policy
 
-The repository keeps weekly NuGet and GitHub Actions update proposals enabled. Roslyn and System.Composition updates share a group to make dependency-family changes reviewable together. There is no blanket ignore rule for compiler packages and no excluded shipping manifest: dependency and security maintenance remain visible. An automatically proposed version change still needs to satisfy the host-compatibility gates above.
+The repository keeps weekly NuGet and GitHub Actions updates enabled, with separate policies for compiler-host dependencies and modern application/test dependencies:
+
+| Update scope | Automatic version-update policy |
+| --- | --- |
+| Tool, tests, Contracts, Reporting, benchmarks, and sample project directories | All version levels remain eligible. Roslyn and System.Composition share a group so related changes can be reviewed together. |
+| `src/SafeSharp.Analyzers`, `src/SafeSharp.CodeFixes`, and `eng/package-host` | Ignore major/minor version proposals for Microsoft.CodeAnalysis and System.Composition. Compatible patch releases remain eligible. Other dependencies are unrestricted. |
+| `src/SafeSharp.Core` | Ignore major/minor version proposals for System.Collections.Immutable; patch releases remain eligible. Other dependencies are unrestricted. |
+
+The [configuration](../.github/dependabot.yml) enumerates all ten current project directories in disjoint entries. It avoids an overlapping recursive root scan and does not exclude a shipping manifest. Shared `Directory.Build.props` dependencies remain visible through project imports; the upstream NuGet updater has [discovery tests for parent build properties and their package references](https://github.com/dependabot/dependabot-core/blob/main/nuget/helpers/lib/NuGetUpdater/NuGetUpdater.Core.Test/Discover/DiscoveryWorkerTests.Project.cs). Modern tool and test-host dependencies can advance independently of the deliberate shipping API floor.
+
+When adding or moving a project, add its manifest directory to the appropriate entry and confirm the Dependabot update job discovers it. A standalone dependency manifest that no project imports needs its own applicable ecosystem/directory entry. Review shared build-property changes across all affected projects even when a single update job proposes them.
+
+These `ignore.update-types` rules apply to **version updates**. GitHub documents that [enabled security updates still propose the minimum patched version](https://github.blog/changelog/2021-05-21-dependabot-version-updates-can-now-ignore-major-minor-patch-releases/). This configuration does not enable or disable the repository's security-update setting. A security fix that also raises the minimum supported host requires an explicit compatibility decision; the package gate continues to prevent an unreviewed host-contract change.
+
+Core has conditional references to different versions of the same package ID for its two target frameworks. The policy is scoped to that project, not independently to each target framework. The native updater [groups discovered dependencies by package name](https://github.com/dependabot/dependabot-core/blob/main/nuget/helpers/lib/NuGetUpdater/NuGetUpdater.Core/Discover/SdkProjectDiscovery.cs), and its optional [root-directory discovery](https://github.com/dependabot/dependabot-core/blob/main/nuget/helpers/lib/NuGetUpdater/NuGetUpdater.Core/Run/RunWorker.cs) can expand a project scope to a parent solution. Inspect generated diffs and update-job results after configuration changes. The emitted assembly metadata and package dependency checks remain the compatibility authority; this version-update policy does not replace them.
+
+A follow-up grouped update demonstrated the need for this distinction: it proposed raising shipping Roslyn/MEF references while also offering a valid test-host MEF servicing update. The test-host update to 10.0.13 is accepted; the shipping 4.14/9 API contract is preserved.
 
 See GitHub's [Dependabot group and update configuration reference](https://docs.github.com/en/code-security/reference/supply-chain-security/dependabot-options-reference) and the [installation and validation guide](integration.md).
