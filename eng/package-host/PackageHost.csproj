@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- Exercise the documented analyzer/code-fix host API floor independently
+         from the newer Workspaces assemblies bundled with SafeSharp.Tool. -->
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp.Workspaces" Version="4.14.0" />
+    <PackageReference Include="System.Composition" Version="9.0.0" />
+    <PackageReference Include="SafeSharp.Contracts" Version="$(SafeSharpPackageVersion)" />
+    <PackageReference Include="SafeSharp.Core" Version="$(SafeSharpPackageVersion)" />
+    <PackageReference Include="SafeSharp.Reporting" Version="$(SafeSharpPackageVersion)" />
+  </ItemGroup>
+</Project>

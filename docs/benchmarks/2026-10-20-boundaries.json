@@ -1,0 +1,188 @@
+{
+  "generatedAtUtc": "2026-10-20T10:02:24.4340166+00:00",
+  "runtime": ".NET 10.0.13",
+  "operatingSystem": "Ubuntu 24.04.3 LTS",
+  "architecture": "X64",
+  "logicalProcessors": 8,
+  "optimizedCoreSha256": "549b1b101f9de73fde9895c8e55a093986c607dc3be93baa3076b103fa72d2b9",
+  "baselineCoreSha256": null,
+  "Suite": "all",
+  "Warmup": 5,
+  "Iterations": 15,
+  "Filter": null,
+  "tieredCompilation": "0",
+  "notes": "Medians of alternating baseline/optimized synchronous samples; construction excluded, solve and requested outputs included. Allocated bytes are per current thread. Microbenchmarks are not whole-project build speedups.",
+  "results": [
+    {
+      "Name": "liveness/tiny",
+      "Details": "4 blocks, 32 instructions, 16 places; small-method setup included",
+      "BaselineMilliseconds": 0.2516,
+      "OptimizedMilliseconds": 0.1138,
+      "Speedup": 2.210896309314587,
+      "BaselineAllocatedBytes": 37408,
+      "OptimizedAllocatedBytes": 12640
+    },
+    {
+      "Name": "liveness/dense-joins",
+      "Details": "64 blocks, 4096 instructions, 127 distinct places with dense live boundaries",
+      "BaselineMilliseconds": 13.4351,
+      "OptimizedMilliseconds": 0.7943,
+      "Speedup": 16.914390028956316,
+      "BaselineAllocatedBytes": 26743480,
+      "OptimizedAllocatedBytes": 333536
+    },
+    {
+      "Name": "liveness/projection-loop",
+      "Details": "96 blocks, 3072 instructions, projected places and backward edges",
+      "BaselineMilliseconds": 183.4701,
+      "OptimizedMilliseconds": 2.6398,
+      "Speedup": 69.50151526630805,
+      "BaselineAllocatedBytes": 106275312,
+      "OptimizedAllocatedBytes": 596256
+    },
+    {
+      "Name": "liveness/sparse-temporaries",
+      "Details": "1 block, 8192 instructions, 4096 short-lived distinct temporaries",
+      "BaselineMilliseconds": 7.5847,
+      "OptimizedMilliseconds": 9.0612,
+      "Speedup": 0.8370524875292455,
+      "BaselineAllocatedBytes": 3016632,
+      "OptimizedAllocatedBytes": 1626368
+    },
+    {
+      "Name": "liveness/unchanged-boundaries",
+      "Details": "32 blocks, 4096 no-op boundaries and one live input",
+      "BaselineMilliseconds": 8.6922,
+      "OptimizedMilliseconds": 1.1112,
+      "Speedup": 7.822354211663067,
+      "BaselineAllocatedBytes": 1738296,
+      "OptimizedAllocatedBytes": 254840
+    },
+    {
+      "Name": "regions/chain-64/queries",
+      "Details": "64 named regions, 63 edges; solve plus two relation queries and one shortest proof",
+      "BaselineMilliseconds": null,
+      "OptimizedMilliseconds": 0.6046,
+      "Speedup": null,
+      "BaselineAllocatedBytes": null,
+      "OptimizedAllocatedBytes": 66288
+    },
+    {
+      "Name": "regions/cycle-64/queries",
+      "Details": "64 named regions, 64 edges; solve plus two relation queries and one shortest proof",
+      "BaselineMilliseconds": null,
+      "OptimizedMilliseconds": 0.0664,
+      "Speedup": null,
+      "BaselineAllocatedBytes": null,
+      "OptimizedAllocatedBytes": 47760
+    },
+    {
+      "Name": "regions/disconnected-64/queries",
+      "Details": "64 named regions, 56 edges; solve plus two relation queries and one shortest proof",
+      "BaselineMilliseconds": null,
+      "OptimizedMilliseconds": 0.0532,
+      "Speedup": null,
+      "BaselineAllocatedBytes": null,
+      "OptimizedAllocatedBytes": 64616
+    },
+    {
+      "Name": "regions/chain-128/queries",
+      "Details": "128 named regions, 127 edges; solve plus two relation queries and one shortest proof",
+      "BaselineMilliseconds": null,
+      "OptimizedMilliseconds": 0.5483,
+      "Speedup": null,
+      "BaselineAllocatedBytes": null,
+      "OptimizedAllocatedBytes": 163528
+    },
+    {
+      "Name": "regions/cycle-128/queries",
+      "Details": "128 named regions, 128 edges; solve plus two relation queries and one shortest proof",
+      "BaselineMilliseconds": null,
+      "OptimizedMilliseconds": 0.8065,
+      "Speedup": null,
+      "BaselineAllocatedBytes": null,
+      "OptimizedAllocatedBytes": 126056
+    },
+    {
+      "Name": "regions/disconnected-128/queries",
+      "Details": "128 named regions, 112 edges; solve plus two relation queries and one shortest proof",
+      "BaselineMilliseconds": null,
+      "OptimizedMilliseconds": 0.2312,
+      "Speedup": null,
+      "BaselineAllocatedBytes": null,
+      "OptimizedAllocatedBytes": 160488
+    },
+    {
+      "Name": "regions/chain-256/queries",
+      "Details": "256 named regions, 255 edges; solve plus two relation queries and one shortest proof",
+      "BaselineMilliseconds": null,
+      "OptimizedMilliseconds": 2.2103,
+      "Speedup": null,
+      "BaselineAllocatedBytes": null,
+      "OptimizedAllocatedBytes": 458400
+    },
+    {
+      "Name": "regions/cycle-256/queries",
+      "Details": "256 named regions, 256 edges; solve plus two relation queries and one shortest proof",
+      "BaselineMilliseconds": null,
+      "OptimizedMilliseconds": 1.7153,
+      "Speedup": null,
+      "BaselineAllocatedBytes": null,
+      "OptimizedAllocatedBytes": 383040
+    },
+    {
+      "Name": "regions/disconnected-256/queries",
+      "Details": "256 named regions, 224 edges; solve plus two relation queries and one shortest proof",
+      "BaselineMilliseconds": null,
+      "OptimizedMilliseconds": 0.617,
+      "Speedup": null,
+      "BaselineAllocatedBytes": null,
+      "OptimizedAllocatedBytes": 452648
+    },
+    {
+      "Name": "regions/chain-128/all-proofs",
+      "Details": "128 named regions, 127 edges; solve plus every shortest proof path",
+      "BaselineMilliseconds": null,
+      "OptimizedMilliseconds": 25.0444,
+      "Speedup": null,
+      "BaselineAllocatedBytes": null,
+      "OptimizedAllocatedBytes": 9883104
+    },
+    {
+      "Name": "regions/cycle-128/all-proofs",
+      "Details": "128 named regions, 128 edges; solve plus every shortest proof path",
+      "BaselineMilliseconds": null,
+      "OptimizedMilliseconds": 123.3986,
+      "Speedup": null,
+      "BaselineAllocatedBytes": null,
+      "OptimizedAllocatedBytes": 23575328
+    },
+    {
+      "Name": "boundaries/reference-storage/128",
+      "Details": "128 local storage bindings and disposals through references; Core IR, snapshots excluded",
+      "BaselineMilliseconds": null,
+      "OptimizedMilliseconds": 8.2245,
+      "Speedup": null,
+      "BaselineAllocatedBytes": null,
+      "OptimizedAllocatedBytes": 1416480
+    },
+    {
+      "Name": "boundaries/valuetask-whenall/128",
+      "Details": "128 stable ValueTask identities carried through Task.WhenAll result elements and consumed once; Core IR, snapshots excluded",
+      "BaselineMilliseconds": null,
+      "OptimizedMilliseconds": 78.8557,
+      "Speedup": null,
+      "BaselineAllocatedBytes": null,
+      "OptimizedAllocatedBytes": 9734408
+    },
+    {
+      "Name": "boundaries/higher-ranked/64",
+      "Details": "64 independent nested binders, 128 variables, and same-universe placeholder/inference equivalence constraints",
+      "BaselineMilliseconds": null,
+      "OptimizedMilliseconds": 1.9699,
+      "Speedup": null,
+      "BaselineAllocatedBytes": null,
+      "OptimizedAllocatedBytes": 324672
+    }
+  ]
+}

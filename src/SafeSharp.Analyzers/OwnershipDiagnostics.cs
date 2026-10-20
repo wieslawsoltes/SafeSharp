@@ -27,9 +27,11 @@ public static class OwnershipDiagnostics
     public static readonly DiagnosticDescriptor DisposeWhileBorrowed = Rule("SS0014", "Disposal conflicts with an active borrow");
     public static readonly DiagnosticDescriptor BudgetExceeded = Rule("SS0015", "Ownership analysis budget exhausted");
     public static readonly DiagnosticDescriptor NoSuspend = Rule("SS0016", "Resource must not cross suspension");
+    public static readonly DiagnosticDescriptor UnobservedAsyncDisposal = Rule("SS0017", "Asynchronous disposal completion is not observed");
+    public static readonly DiagnosticDescriptor InvalidValueTaskConsumption = Rule("SS0048", "ValueTask is consumed more than once");
 
     public static readonly ImmutableArray<DiagnosticDescriptor> All = ImmutableArray.Create(
-        UseAfterDispose, DoubleDispose, ResourceLeak, UseAfterMove, MoveWhileBorrowed, BorrowConflict, MutationWhileBorrowed, BorrowEscape, DisposeBorrowed, BorrowAcrossSuspend, OverwriteOwner, ScopeLifetime, ReadWhileExclusive, DisposeWhileBorrowed, BudgetExceeded, NoSuspend);
+        UseAfterDispose, DoubleDispose, ResourceLeak, UseAfterMove, MoveWhileBorrowed, BorrowConflict, MutationWhileBorrowed, BorrowEscape, DisposeBorrowed, BorrowAcrossSuspend, OverwriteOwner, ScopeLifetime, ReadWhileExclusive, DisposeWhileBorrowed, BudgetExceeded, NoSuspend, UnobservedAsyncDisposal, InvalidValueTaskConsumption);
 
     public static DiagnosticDescriptor Get(string id) => All.First(descriptor => descriptor.Id == id);
 }

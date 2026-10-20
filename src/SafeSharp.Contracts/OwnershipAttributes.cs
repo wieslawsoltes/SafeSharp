@@ -47,7 +47,7 @@ public sealed class ReturnsBorrowedAttribute : Attribute
 [AttributeUsage(AttributeTargets.Method, Inherited = false)]
 public sealed class MutatesAttribute : Attribute { }
 
-/// <summary>Declares that a callee does not retain the argument after returning.</summary>
+/// <summary>Declares that a callee does not retain, return, or explicitly transfer ownership of the argument.</summary>
 [AttributeUsage(AttributeTargets.Parameter, Inherited = false)]
 public sealed class DoesNotEscapeAttribute : Attribute { }
 
