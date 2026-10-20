@@ -8,7 +8,7 @@ import zipfile
 root = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "artifacts/packages")
 expected = {
     "SafeSharp.Contracts": {"lib/netstandard2.0/SafeSharp.Contracts.dll"},
-    "SafeSharp.Core": {"lib/netstandard2.0/SafeSharp.Core.dll"},
+    "SafeSharp.Core": {"lib/netstandard2.0/SafeSharp.Core.dll", "lib/net10.0/SafeSharp.Core.dll"},
     "SafeSharp.Analyzers": {"analyzers/dotnet/cs/SafeSharp.Analyzers.dll", "analyzers/dotnet/cs/SafeSharp.Core.dll", "buildTransitive/SafeSharp.Analyzers.props"},
     "SafeSharp.Reporting": {"lib/netstandard2.0/SafeSharp.Reporting.dll"},
     "SafeSharp.CodeFixes": {"analyzers/dotnet/cs/SafeSharp.CodeFixes.dll"},
@@ -64,6 +64,20 @@ for path in sorted(root.glob("*.nupkg")):
                             for dependency in metadata.findall(".//{*}dependency")}
             if any(name.startswith(("Microsoft.CodeAnalysis", "Microsoft.Build")) for name in dependencies):
                 raise SystemExit(identity + ": reusable runtime libraries must not depend on Roslyn or MSBuild")
+            if identity == "SafeSharp.Core":
+                groups = {group.attrib.get("targetFramework", ""): {
+                    dependency.attrib["id"]: dependency.attrib.get("version", "")
+                    for dependency in group.findall("{*}dependency")}
+                    for group in metadata.findall(".//{*}dependencies/{*}group")}
+                if groups.get(".NETStandard2.0", {}).get("System.Collections.Immutable") != "9.0.0":
+                    raise SystemExit(identity + ": .NETStandard2.0 must preserve its Immutable 9.0.0 dependency contract")
+                # .NET 10 prunes framework-provided references from the nuspec.
+                # An explicit native group is still required to prevent NuGet
+                # from falling back to the .NET Standard dependency group.
+                if "net10.0" not in groups:
+                    raise SystemExit(identity + ": an explicit net10.0 dependency group is required")
+                if groups["net10.0"].get("System.Collections.Immutable") not in (None, "10.0.13"):
+                    raise SystemExit(identity + ": net10.0 must use platform-provided Immutable or the selected 10.0.13 package")
             if identity == "SafeSharp.Reporting" and dependencies.get("SafeSharp.Core") != version:
                 raise SystemExit(identity + ": reporting must depend on the matching Core release")
         if identity == "SafeSharp.Tool":
@@ -79,7 +93,7 @@ for path in sorted(root.glob("*.nupkg")):
         for name in names:
             filename = pathlib.PurePosixPath(name).name
             if filename.startswith("SafeSharp.") and filename.endswith(".dll"):
-                assemblies[(identity, filename)] = hashlib.sha256(package.read(name)).digest()
+                assemblies[(identity, name)] = hashlib.sha256(package.read(name)).digest()
         symbols_path = path.with_suffix(".snupkg")
         if not symbols_path.is_file():
             raise SystemExit(identity + ": matching portable symbol package is required")
@@ -99,9 +113,22 @@ if expected.keys() - found:
     raise SystemExit("Missing packages: " + ", ".join(sorted(expected.keys() - found)))
 if len(versions) != 1:
     raise SystemExit("All SafeSharp packages must have the same release version: " + ", ".join(sorted(versions)))
-for bundle, component in (("SafeSharp.Analyzers", "SafeSharp.Core"),
-                          *(("SafeSharp.Tool", name) for name in ("SafeSharp.Analyzers", "SafeSharp.Contracts", "SafeSharp.Core", "SafeSharp.Reporting"))):
-    filename = component + ".dll"
-    if assemblies.get((bundle, filename)) != assemblies.get((component, filename)):
-        raise SystemExit(f"{bundle}: bundled {filename} differs from its matching package build")
-print("Package family: one release version, matching bundled binaries, isolated analyzer dependencies, and SDK-owned MSBuild resolution.")
+# A bundled binary must match the library asset selected by that host's TFM.
+# In particular the compiler-host Core remains netstandard2.0/Immutable 9,
+# while the .NET 10 tool selects the Core asset built against Immutable 10.
+bundled_assets = (
+    ("SafeSharp.Analyzers", "analyzers/dotnet/cs/SafeSharp.Core.dll",
+     "SafeSharp.Core", "lib/netstandard2.0/SafeSharp.Core.dll"),
+    ("SafeSharp.Tool", "tools/net10.0/any/SafeSharp.Analyzers.dll",
+     "SafeSharp.Analyzers", "analyzers/dotnet/cs/SafeSharp.Analyzers.dll"),
+    ("SafeSharp.Tool", "tools/net10.0/any/SafeSharp.Contracts.dll",
+     "SafeSharp.Contracts", "lib/netstandard2.0/SafeSharp.Contracts.dll"),
+    ("SafeSharp.Tool", "tools/net10.0/any/SafeSharp.Core.dll",
+     "SafeSharp.Core", "lib/net10.0/SafeSharp.Core.dll"),
+    ("SafeSharp.Tool", "tools/net10.0/any/SafeSharp.Reporting.dll",
+     "SafeSharp.Reporting", "lib/netstandard2.0/SafeSharp.Reporting.dll"),
+)
+for bundle, bundled_path, component, component_path in bundled_assets:
+    if assemblies.get((bundle, bundled_path)) != assemblies.get((component, component_path)):
+        raise SystemExit(f"{bundle}: bundled {bundled_path} differs from {component}'s {component_path}")
+print("Package family: one release version, matching TFM-specific bundled binaries, isolated analyzer dependencies, and SDK-owned MSBuild resolution.")

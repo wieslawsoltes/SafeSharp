@@ -7,9 +7,10 @@
   <ItemGroup>
     <ProjectReference Include="../../src/SafeSharp.Analyzers/SafeSharp.Analyzers.csproj" />
     <ProjectReference Include="../../src/SafeSharp.Contracts/SafeSharp.Contracts.csproj" />
+    <ProjectReference Include="../../src/SafeSharp.Core/SafeSharp.Core.csproj" />
     <ProjectReference Include="../../src/SafeSharp.Reporting/SafeSharp.Reporting.csproj" />
     <ProjectReference Include="../../src/SafeSharp.CodeFixes/SafeSharp.CodeFixes.csproj" />
-    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.11.0" />
     <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="5.9.0" />
     <PackageReference Include="Microsoft.CodeAnalysis.CSharp.Workspaces" Version="5.9.0" />
     <PackageReference Include="System.Composition.AttributedModel" Version="10.0.1" />
